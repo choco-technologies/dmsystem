@@ -39,7 +39,7 @@ dmod_setup_external_module()
 set(DMOD_MODULE_NAME        dmsystem)
 
 # Author (should be string)
-set(DMOD_AUTHOR_NAME        "John Doe")
+set(DMOD_AUTHOR_NAME        "Patryk Kubiak")
 
 # Stack size for the module (should be integer)
 set(DMOD_STACK_SIZE         4096)
