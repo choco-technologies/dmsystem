@@ -56,6 +56,7 @@ dmsystem/
 │   └── dmsystem_test.c
 ├── CMakeLists.txt
 ├── Makefile
+├── dmsystem.dmr
 └── manifest.dmm
 ```
 
