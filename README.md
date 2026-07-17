@@ -29,6 +29,7 @@ the unit:
 ```
 /etc/dmsystem/units/
 ├── networking.ini
+├── storage.ini
 ├── webserver.ini
 └── migrate-db.ini
 ```
@@ -57,7 +58,8 @@ stderr=/var/log/webserver.log
 # migrate-db.ini
 description=One-shot database migration
 exec=dbmigrate
-after=networking
+after=networking,storage
+requires=networking
 type=oneshot
 ```
 
@@ -69,8 +71,8 @@ Recognized keys:
 | `description` | unit name  | Human-readable description, used in logs |
 | `args`        | (empty)    | Whitespace-separated extra arguments passed to `exec` |
 | `type`        | `simple`   | `simple` (long-running, spawned) or `oneshot` (run to completion) |
-| `after`       | (empty)    | `;`/`,`/whitespace-separated unit names that must start (or complete, if `oneshot`) before this one |
-| `requires`    | (empty)    | Same ordering as `after`, plus: if the dependency fails, this unit is skipped |
+| `after`       | (empty)    | One or more unit names that must start (or complete, if `oneshot`) before this one - separate multiple names with `;`, `,`, or whitespace (freely mixed), up to 8 per key |
+| `requires`    | (empty)    | Same syntax and ordering as `after`, plus: if the dependency fails, this unit is skipped |
 | `restart`     | `no`       | `no` or `always` - whether the supervise loop respawns a terminated `simple` unit |
 | `stdin`       | (unset)    | Path to a file to redirect the unit's stdin from |
 | `stdout`      | (unset)    | Path to a file to redirect the unit's stdout to |
@@ -110,12 +112,12 @@ dmod_loader /path/to/dmsystem.dmf /path/to/units-directory
 for inspecting and controlling the units a running dmsystem is managing:
 
 ```bash
-dmod_loader /path/to/service.dmf list                 # name/type/exec of every unit
-dmod_loader /path/to/service.dmf status               # live state/pid/exit code of every unit
-dmod_loader /path/to/service.dmf status webserver      # one unit
-dmod_loader /path/to/service.dmf stop webserver
-dmod_loader /path/to/service.dmf start webserver
-dmod_loader /path/to/service.dmf restart webserver
+service list                 # name/type/exec of every unit
+service status               # live state/pid/exit code of every unit
+service status webserver      # one unit
+service stop webserver
+service start webserver
+service restart webserver
 ```
 
 `service` does not talk to dmsystem over any socket or file - it calls
