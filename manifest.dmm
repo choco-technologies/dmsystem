@@ -3,3 +3,10 @@ $include https://github.com/choco-technologies/dmsystem/releases/download/vlates
 
 # Module entry with version placeholder - expanded by $version-available
 dmsystem https://github.com/choco-technologies/dmsystem/releases/download/v<version>/dmsystem-v<version>-<arch_name>.zip
+
+# dmsystem's own orchestration logic - required by dmsystem at runtime, packaged
+# and released as its own zip (see .github/workflows/release.yml).
+dmsystem_core https://github.com/choco-technologies/dmsystem/releases/download/v<version>/dmsystem_core-v<version>-<arch_name>.zip
+
+# Unit model + dependency-graph ordering - required by dmsystem_core at runtime.
+dmsystem_unit https://github.com/choco-technologies/dmsystem/releases/download/v<version>/dmsystem_unit-v<version>-<arch_name>.zip

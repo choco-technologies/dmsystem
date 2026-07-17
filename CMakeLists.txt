@@ -53,6 +53,18 @@ set(DMOD_DMR_PATH           ${CMAKE_CURRENT_SOURCE_DIR}/dmsystem.dmr)
 # List of MAL interfaces implemented by this module (leave empty if none)
 set(DMOD_MAL_IMPLS          )
 
+# dmsystem's own orchestration logic lives in two separate DMOD library modules
+# rather than being baked directly into this executable, so it is real, testable
+# DMOD module API:
+#   - dmsystem_unit:  unit model + dependency-graph ordering (no dmini/dmosi dependency)
+#   - dmsystem_core:  INI loading (dmini) + process supervision (dmosi) + orchestration,
+#                     built on top of dmsystem_unit
+# See lib/dmsystem_unit/CMakeLists.txt and lib/dmsystem_core/CMakeLists.txt.
+if(DMOD_MODE STREQUAL "DMOD_MODULE")
+    add_subdirectory(lib/dmsystem_unit)
+    add_subdirectory(lib/dmsystem_core)
+endif()
+
 #
 #   dmod_add_executable - create an executable module
 #   it has the same signature as add_executable,
@@ -64,9 +76,9 @@ dmod_add_executable(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
     src/dmsystem.c
 )
 
-# To depend on another module's headers, use:
-#   dmod_link_modules(${DMOD_MODULE_NAME}
-#       other_module@1.0
-#   )
+# dmsystem only ever calls dmsystem_core's single dmsystem_core_run() entry point -
+# everything else is dmsystem_core's own concern (see the comment above).
+target_link_libraries(${DMOD_MODULE_NAME} dmsystem_core_if)
 
+enable_testing()
 add_subdirectory(tests)

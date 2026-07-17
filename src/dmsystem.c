@@ -1,35 +1,37 @@
 #include "dmod.h"
+#include "dmsystem_core.h"
+#include <errno.h>
 
 /**
  * @brief Pre-initialization function for the module.
- * 
- * @note This function is optional. You can remove it if you don't need it.
- * 
- * This function is called when the module enabling is in progress.
- * 
- * You can use this function to load the required dependencies, such as 
- * other modules. Please be aware that the module is not fully initialized, 
- * so not all the API functions are available - you can check if the API
- * is connected by calling the Dmod_IsFunctionConnected() function.
+ *
+ * Called while the module is still being enabled - just used here to confirm
+ * that the dmsystem_core module dmsystem depends on is actually connected.
  */
 void dmod_preinit(void)
 {
-    if(Dmod_IsFunctionConnected( Dmod_Printf ))
+    if (Dmod_IsFunctionConnected((void*)dmsystem_core_run))
     {
-        Dmod_Printf("API is connected!\n");
+        Dmod_Printf("dmsystem: dmsystem_core API is connected\n");
     }
 }
 
 /**
- * @brief Main function of the application
- * 
+ * @brief Entry point: scans the unit directory given as argv[1] and runs it
+ *
  * @param argc Number of arguments
- * @param argv Array of arguments
- * 
- * @return 0 if success, error code otherwise
+ * @param argv argv[1] must be the path to the directory containing unit (*.ini) files
+ *
+ * @return 0 if every started unit succeeded, a positive count of failed units,
+ *         or a negative errno-style code if the units directory could not be opened
  */
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
-    Dmod_Printf("Hello, World!\n");
-    return 0;
+    if (argc < 2)
+    {
+        DMOD_LOG_ERROR("Usage: dmsystem <path-to-units-directory>\n");
+        return -EINVAL;
+    }
+
+    return dmsystem_core_run(argv[1]);
 }
