@@ -6,7 +6,7 @@
 # (see lib/dmsystem_core/dmsystem_core.h) - not by talking to dmsystem itself.
 set(DMOD_MODULE_NAME        service)
 set(DMOD_MODULE_VERSION     "0.1")
-set(DMOD_AUTHOR_NAME        "John Doe")
+set(DMOD_AUTHOR_NAME        "Patryk Kubiak")
 set(DMOD_STACK_SIZE         2048)
 set(DMOD_PRIORITY           0)
 
