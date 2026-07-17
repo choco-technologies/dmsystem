@@ -10,3 +10,6 @@ dmsystem_core https://github.com/choco-technologies/dmsystem/releases/download/v
 
 # Unit model + dependency-graph ordering - required by dmsystem_core at runtime.
 dmsystem_unit https://github.com/choco-technologies/dmsystem/releases/download/v<version>/dmsystem_unit-v<version>-<arch_name>.zip
+
+# systemctl-alike CLI for inspecting/controlling units in an already running dmsystem.
+service https://github.com/choco-technologies/dmsystem/releases/download/v<version>/service-v<version>-<arch_name>.zip

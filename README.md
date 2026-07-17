@@ -104,6 +104,33 @@ instead of fetching `develop` from GitHub.
 dmod_loader /path/to/dmsystem.dmf /path/to/units-directory
 ```
 
+### Controlling units with `service`
+
+`service` is a small `systemctl`/`service`-alike CLI, built alongside dmsystem,
+for inspecting and controlling the units a running dmsystem is managing:
+
+```bash
+dmod_loader /path/to/service.dmf list                 # name/type/exec of every unit
+dmod_loader /path/to/service.dmf status               # live state/pid/exit code of every unit
+dmod_loader /path/to/service.dmf status webserver      # one unit
+dmod_loader /path/to/service.dmf stop webserver
+dmod_loader /path/to/service.dmf start webserver
+dmod_loader /path/to/service.dmf restart webserver
+```
+
+`service` does not talk to dmsystem over any socket or file - it calls
+dmsystem_core's query/control API directly. Because DMOD loads a given
+Library module at most once and shares that single instance across every
+Application that requires it, `service` (which requires dmsystem_core just
+like dmsystem does) reaches the exact in-memory unit list dmsystem's
+supervise loop is managing. If dmsystem is not currently running, `service`
+simply reports zero units.
+
+`start`/`stop`/`restart` act only on the named unit - they do not cascade to
+its dependencies. A unit stopped this way is marked `stopped` and is not
+auto-restarted even if it declares `restart=always` (that only applies to a
+unit terminating on its own).
+
 ## Documentation
 
 See the `docs/` directory:
@@ -114,20 +141,24 @@ View documentation using `dmf-man dmsystem`.
 
 ## Project Structure
 
-dmsystem is split across three DMOD modules, each its own loadable `.dmf`:
+dmsystem is split across four DMOD modules, each its own loadable `.dmf`:
 
 - **dmsystem** (`src/`) - the executable entry point. Parses argv and calls
   `dmsystem_core_run()`.
 - **dmsystem_core** (`lib/dmsystem_core/`) - orchestration: scans the units directory
   and parses each unit file (via [dmini](https://github.com/choco-technologies/dmini)),
   asks dmsystem_unit for the dependency order, starts/supervises units (via
-  [dmosi](https://github.com/choco-technologies/dmosi)). Exposes a single DMOD
-  API function, `dmsystem_core_run`.
+  [dmosi](https://github.com/choco-technologies/dmosi)). Exposes `dmsystem_core_run`
+  plus a query/control API (`dmsystem_core_get_unit_count`, `..._get_unit_status`,
+  `..._find_unit_status`, `..._start_unit`, `..._stop_unit`, `..._restart_unit`) used
+  by `service`.
 - **dmsystem_unit** (`lib/dmsystem_unit/`) - the unit model and dependency-graph
   ordering (`dmsystem_unit_list_add`, `dmsystem_unit_topo_sort`, ...). Has no
   dependency on dmini/dmosi, so it can be loaded and tested standalone - this is
   what `tests/dmsystem_test.c` links against and calls as real, dynamically
   resolved DMOD module API, rather than embedding its source into the test.
+- **service** (`service/`) - the `systemctl`-alike CLI described above. Calls
+  dmsystem_core's query/control API directly; does not talk to dmsystem itself.
 
 ```
 dmsystem/
@@ -136,15 +167,19 @@ dmsystem/
 │   ├── dmsystem_unit/
 │   │   ├── CMakeLists.txt
 │   │   ├── dmsystem_unit.dmr
-│   │   ├── dmsystem_unit_types.h  # Plain unit/list struct + enum definitions
+│   │   ├── dmsystem_unit_types.h  # Plain unit/list/status struct + enum definitions
 │   │   ├── dmsystem_unit.c/.h     # Unit model API (list add/find, argv/dep parsing)
 │   │   └── dmsystem_graph.c/.h    # Dependency-tree topological sort API
 │   └── dmsystem_core/
 │       ├── CMakeLists.txt
 │       ├── dmsystem_core.dmr
-│       ├── dmsystem_core.c/.h     # dmsystem_core_run: load, order, start, supervise
+│       ├── dmsystem_core.c/.h     # dmsystem_core_run + service's query/control API
 │       ├── dmsystem_config.c/.h   # Units directory scan -> unit list (via dmini)
-│       └── dmsystem_proc.c/.h     # Dmod_SpawnModule/Dmod_RunModule + dmosi wrapper
+│       └── dmsystem_proc.c/.h     # Dmod_SpawnModule + dmosi wrapper
+├── service/
+│   ├── CMakeLists.txt
+│   ├── service.dmr
+│   └── service.c                  # `service status|start|stop|restart [unit]`
 ├── src/
 │   └── dmsystem.c                 # Entry point (argv parsing, dmod_preinit)
 ├── tests/

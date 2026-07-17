@@ -29,8 +29,17 @@ void dmsystem_unit_list_init(dmsystem_unit_list_t* list)
 
 dmsystem_unit_t* dmsystem_unit_list_add(dmsystem_unit_list_t* list, const char* name)
 {
-    if (!list || !name || name[0] == '\0' || list->count >= DMSYSTEM_MAX_UNITS)
+    if (!list || !name || name[0] == '\0')
+    {
+        DMOD_LOG_ERROR("Cannot add unit: invalid list or name\n");
         return NULL;
+    }
+
+    if (list->count >= DMSYSTEM_MAX_UNITS)
+    {
+        DMOD_LOG_ERROR("Cannot add unit '%s': list is full (max %d)\n", name, DMSYSTEM_MAX_UNITS);
+        return NULL;
+    }
 
     dmsystem_unit_t* unit = &list->units[list->count];
     memset(unit, 0, sizeof(*unit));
@@ -107,7 +116,10 @@ static bool is_arg_separator(char c)
 int dmsystem_unit_build_argv(dmsystem_unit_t* unit, const char* exec, const char* args)
 {
     if (!unit)
+    {
+        DMOD_LOG_ERROR("Cannot build argv: unit is NULL\n");
         return 0;
+    }
 
     strncpy(unit->exec, exec ? exec : "", sizeof(unit->exec) - 1);
     unit->exec[sizeof(unit->exec) - 1] = '\0';

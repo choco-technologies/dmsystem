@@ -53,6 +53,7 @@ typedef enum
     DMSYSTEM_UNIT_STATE_DONE,      /*!< Terminated/ran with a zero exit status */
     DMSYSTEM_UNIT_STATE_FAILED,    /*!< Failed to start, or terminated with a non-zero status */
     DMSYSTEM_UNIT_STATE_SKIPPED,   /*!< Never started: a required dependency failed, or it is part of a cycle */
+    DMSYSTEM_UNIT_STATE_STOPPED,   /*!< Manually stopped via dmsystem_core_stop_unit/restart_unit */
 } dmsystem_unit_state_t;
 
 /**
@@ -107,5 +108,25 @@ typedef struct
     dmsystem_unit_t units[DMSYSTEM_MAX_UNITS];
     size_t          count;
 } dmsystem_unit_list_t;
+
+/**
+ * @brief Read-only snapshot of one unit's status, for external inspection/control tools
+ *
+ * Returned by dmsystem_core_get_unit_status/dmsystem_core_find_unit_status (see
+ * dmsystem_core.h) - deliberately smaller than dmsystem_unit_t, carrying only what a
+ * tool like `service` (the systemctl-alike CLI in service/service.c) needs to display,
+ * not dmsystem_core's own bookkeeping (argv, dependency lists, stream paths, ...).
+ */
+typedef struct
+{
+    char                   name[DMOD_MAX_MODULE_NAME_LENGTH];
+    char                   description[DMSYSTEM_MAX_DESC_LENGTH];
+    char                   exec[DMOD_MAX_MODULE_NAME_LENGTH];
+    dmsystem_unit_type_t   type;
+    dmsystem_restart_policy_t restart;
+    dmsystem_unit_state_t  state;
+    Dmod_Pid_t             pid;
+    int                    exit_status;
+} dmsystem_unit_status_t;
 
 #endif /* DMSYSTEM_UNIT_TYPES_H */

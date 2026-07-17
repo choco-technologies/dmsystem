@@ -25,8 +25,20 @@ dmod_add_library(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
 # dmsystem_unit is a local module (built in this same repo) - consumed the same way
 # dmell links dmell_core_if, via the auto-generated _if INTERFACE target, not via
 # dmod_link_modules (that's reserved for genuinely external, separately-released
-# modules such as dmini/dmosi below).
+# modules such as dmini/dmosi below). This link is private to dmsystem_core's own
+# sources (they need the full dmsystem_unit.h/dmsystem_graph.h API + generated defs).
 target_link_libraries(${DMOD_MODULE_NAME} dmsystem_unit_if)
+
+# dmsystem_core.h (a public header, exposed via dmsystem_core_if) includes
+# dmsystem_unit_types.h for dmsystem_unit_status_t - unlike the internal link above,
+# this needs to reach dmsystem_core's own consumers (service, dmsystem, test_dmsystem)
+# too, so it is added directly to dmsystem_core_if's own INTERFACE include path rather
+# than relying on transitive propagation (target_link_libraries above uses the plain,
+# private-by-default signature already used elsewhere for this target, and mixing it
+# with a PUBLIC-keyword call on the same target is not allowed).
+target_include_directories(${DMOD_MODULE_NAME}_if INTERFACE
+    ${CMAKE_SOURCE_DIR}/lib/dmsystem_unit
+)
 
 # dmini (config parsing) and dmosi (process supervision) are external DMOD
 # modules - link their headers via dmf-get instead of vendoring their source,

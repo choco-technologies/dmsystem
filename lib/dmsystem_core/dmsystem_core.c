@@ -8,9 +8,33 @@
 #include "dmsystem_proc.h"
 #include "dmosi.h"
 #include <errno.h>
+#include <string.h>
 
 /** @brief How often the supervise loop polls running units for termination */
 #define DMSYSTEM_POLL_INTERVAL_MS 1000
+
+/**
+ * @brief The unit list dmsystem_core_run is currently supervising, or NULL if it
+ *        has not been started (or has already finished)
+ *
+ * Set/cleared under g_lock by dmsystem_core_run itself; read and mutated under
+ * g_lock by the get/find/start/stop/restart_unit query/control API, which runs on
+ * whatever thread/process `service` (or any other caller) happens to be on.
+ */
+static dmsystem_unit_list_t* g_units = NULL;
+
+/**
+ * @brief Guards all access to g_units
+ *
+ * @note dmsystem_proc_start() blocks for the duration of a oneshot unit's entire
+ *       run (see dmsystem_proc.h), and every path that calls it here does so with
+ *       g_lock held - so a slow oneshot unit (whether started by dmsystem_core_run's
+ *       own startup pass, or manually via dmsystem_core_start_unit/restart_unit)
+ *       delays the supervise loop and any concurrent `service` call for as long as
+ *       it runs. Acceptable for oneshot units, which are expected to be quick
+ *       (migrations and the like), not for general use.
+ */
+static dmosi_mutex_t g_lock = NULL;
 
 /**
  * @brief Module initialization (required for a Library-type DMOD module)
@@ -18,6 +42,14 @@
 int dmod_init(const Dmod_Config_t* Config)
 {
     (void)Config;
+
+    g_lock = dmosi_mutex_create(false);
+    if (!g_lock)
+    {
+        DMOD_LOG_ERROR("Failed to create dmsystem_core's unit-list mutex\n");
+        return -ENOMEM;
+    }
+
     return 0;
 }
 
@@ -26,6 +58,12 @@ int dmod_init(const Dmod_Config_t* Config)
  */
 int dmod_deinit(void)
 {
+    if (g_lock)
+    {
+        dmosi_mutex_destroy(g_lock);
+        g_lock = NULL;
+    }
+
     return 0;
 }
 
@@ -161,15 +199,178 @@ int dmsystem_core_run(const char* units_dir)
     if (order_count < list->count)
         mark_skipped_by_cycle(list, order, order_count);
 
+    /* Published before starting anything, so `service status` can already see
+     * PENDING units while startup is still in progress. */
+    dmosi_mutex_lock(g_lock);
+    g_units = list;
     size_t running = start_units_in_order(list, order, order_count);
+    dmosi_mutex_unlock(g_lock);
 
     while (running > 0)
     {
         dmosi_thread_sleep(DMSYSTEM_POLL_INTERVAL_MS);
+
+        dmosi_mutex_lock(g_lock);
         running = supervise_pass(list);
+        dmosi_mutex_unlock(g_lock);
     }
 
+    dmosi_mutex_lock(g_lock);
     int failed = count_failed(list);
+    g_units = NULL;
+    dmosi_mutex_unlock(g_lock);
+
     Dmod_Free(list);
     return failed;
+}
+
+/**
+ * @brief Copies the externally-relevant fields of @p unit into a status snapshot
+ */
+static void copy_status(const dmsystem_unit_t* unit, dmsystem_unit_status_t* out)
+{
+    memcpy(out->name, unit->name, sizeof(out->name));
+    memcpy(out->description, unit->description, sizeof(out->description));
+    memcpy(out->exec, unit->exec, sizeof(out->exec));
+    out->type = unit->type;
+    out->restart = unit->restart;
+    out->state = unit->state;
+    out->pid = unit->pid;
+    out->exit_status = unit->exit_status;
+}
+
+/**
+ * @brief Kills @p unit's currently-running process, if dmosi can still find it
+ *
+ * Leaves unit->state untouched - callers set the appropriate state themselves.
+ */
+static void kill_running_process(const dmsystem_unit_t* unit)
+{
+    dmosi_process_t proc = dmosi_process_find_by_id((dmosi_process_id_t)unit->pid);
+    if (proc)
+    {
+        dmosi_process_kill(proc, 0);
+        dmosi_process_destroy(proc);
+    }
+}
+
+size_t dmsystem_core_get_unit_count(void)
+{
+    size_t count = 0;
+
+    dmosi_mutex_lock(g_lock);
+    if (g_units)
+        count = g_units->count;
+    dmosi_mutex_unlock(g_lock);
+
+    return count;
+}
+
+bool dmsystem_core_get_unit_status(size_t index, dmsystem_unit_status_t* out)
+{
+    if (!out)
+        return false;
+
+    bool found = false;
+
+    dmosi_mutex_lock(g_lock);
+    if (g_units && index < g_units->count)
+    {
+        copy_status(&g_units->units[index], out);
+        found = true;
+    }
+    dmosi_mutex_unlock(g_lock);
+
+    return found;
+}
+
+bool dmsystem_core_find_unit_status(const char* name, dmsystem_unit_status_t* out)
+{
+    if (!out || !name)
+        return false;
+
+    bool found = false;
+
+    dmosi_mutex_lock(g_lock);
+    if (g_units)
+    {
+        dmsystem_unit_t* unit = dmsystem_unit_list_find(g_units, name);
+        if (unit)
+        {
+            copy_status(unit, out);
+            found = true;
+        }
+    }
+    dmosi_mutex_unlock(g_lock);
+
+    return found;
+}
+
+bool dmsystem_core_start_unit(const char* name)
+{
+    if (!name)
+        return false;
+
+    bool ok = false;
+
+    dmosi_mutex_lock(g_lock);
+    if (g_units)
+    {
+        dmsystem_unit_t* unit = dmsystem_unit_list_find(g_units, name);
+        if (unit)
+            ok = (unit->state == DMSYSTEM_UNIT_STATE_RUNNING) || dmsystem_proc_start(unit);
+    }
+    dmosi_mutex_unlock(g_lock);
+
+    return ok;
+}
+
+bool dmsystem_core_stop_unit(const char* name)
+{
+    if (!name)
+        return false;
+
+    bool ok = false;
+
+    dmosi_mutex_lock(g_lock);
+    if (g_units)
+    {
+        dmsystem_unit_t* unit = dmsystem_unit_list_find(g_units, name);
+        if (unit && unit->state == DMSYSTEM_UNIT_STATE_RUNNING)
+        {
+            kill_running_process(unit);
+            unit->state = DMSYSTEM_UNIT_STATE_STOPPED;
+            unit->exit_status = 0;
+            DMOD_LOG_INFO("Stopped unit '%s'\n", name);
+            ok = true;
+        }
+    }
+    dmosi_mutex_unlock(g_lock);
+
+    return ok;
+}
+
+bool dmsystem_core_restart_unit(const char* name)
+{
+    if (!name)
+        return false;
+
+    bool ok = false;
+
+    dmosi_mutex_lock(g_lock);
+    if (g_units)
+    {
+        dmsystem_unit_t* unit = dmsystem_unit_list_find(g_units, name);
+        if (unit)
+        {
+            if (unit->state == DMSYSTEM_UNIT_STATE_RUNNING)
+                kill_running_process(unit);
+
+            DMOD_LOG_INFO("Restarting unit '%s'\n", name);
+            ok = dmsystem_proc_start(unit);
+        }
+    }
+    dmosi_mutex_unlock(g_lock);
+
+    return ok;
 }

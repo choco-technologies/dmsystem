@@ -80,5 +80,11 @@ dmod_add_executable(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
 # everything else is dmsystem_core's own concern (see the comment above).
 target_link_libraries(${DMOD_MODULE_NAME} dmsystem_core_if)
 
+# `service` - a systemctl-alike CLI for inspecting/controlling units in an already
+# running dmsystem, via dmsystem_core's query/control API. See service/CMakeLists.txt.
+if(DMOD_MODE STREQUAL "DMOD_MODULE")
+    add_subdirectory(service)
+endif()
+
 enable_testing()
 add_subdirectory(tests)
