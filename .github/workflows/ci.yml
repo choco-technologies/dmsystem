@@ -38,4 +38,4 @@ jobs:
       - name: Run tests with dmod_loader
         run: |
           export DMOD_DMF_DIR=$(pwd)/build/dmf
-          dmod_loader build/dmf/test_dmsystem.dmf
+          dmod_loader build/dmf/test_systemd.dmf
