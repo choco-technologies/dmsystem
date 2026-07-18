@@ -15,3 +15,9 @@ dmod_systemd_api_declaration(1.0, int, _status, ( const char* unit_name, systemd
 {
     return -ENOSYS;
 }
+
+dmod_systemd_api_declaration(1.0, dmlist_context_t*, _list, (void))
+{
+    return NULL;
+}
+
