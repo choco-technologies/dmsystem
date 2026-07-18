@@ -6,9 +6,9 @@
 /**
  * @brief Sanity check that this test module links against libsystemd's API successfully
  *
- * `systemd` itself is a thin CLI (argument parsing + one call into
- * libsystemd_scan()); the substantial logic it delegates to is already
- * covered end-to-end by libsystemd's own test suite
+ * `service` itself is a thin CLI (subcommand dispatch over libsystemd's
+ * control API); the substantial logic it calls into is already covered
+ * end-to-end by libsystemd's own test suite
  * (app/libsystemd/tests/libsystemd_test.c). This simply confirms the
  * build/link wiring against `libsystemd` is intact from this module too.
  */

@@ -1,58 +1,58 @@
-#include "systemd.h"
+#include "libsystemd.h"
 #include <errno.h>
 #include <string.h>
 #include "dmini.h"
 #include "dmosi.h"
 
 /**
- * @brief Full definition of the opaque @ref systemd_service_t handle
+ * @brief Full definition of the opaque @ref libsystemd_service_t handle
  *
  * The public API only ever hands out this structure behind the opaque
- * `systemd_service_t` pointer declared in systemd_types.h, so callers outside
+ * `libsystemd_service_t` pointer declared in libsystemd_types.h, so callers outside
  * this file cannot read or modify its fields directly - they must go through
- * systemd_start_service()/systemd_stop_service()/systemd_status()/systemd_list().
+ * libsystemd_start_service()/libsystemd_stop_service()/libsystemd_status()/libsystemd_list().
  *
- * An instance is created by systemd_parse_file() (called from systemd_parse_dir())
+ * An instance is created by libsystemd_parse_file() (called from libsystemd_parse_dir())
  * and lives inside the global service registry (@ref g_services) until it is
- * replaced by a new systemd_scan() or the module is unloaded (systemd_serviceapi_deinit()).
+ * replaced by a new libsystemd_scan() or the module is unloaded (libsystemd_serviceapi_deinit()).
  */
-struct systemd_service
+struct libsystemd_service
 {
     char* unit_name;                    //!< Unit name, derived from the ini file name (without the ".ini" suffix). Owned copy.
     char* exec;                         //!< Module name (or file path) to spawn, from the "exec" key. Owned copy.
     int argc;                           //!< Number of entries in argv (always >= 1, argv[0] == exec).
     char** argv;                        //!< NULL-terminated argument vector (argc+1 entries, each an owned copy).
     Dmod_StreamRedirections_t streams;  //!< Stream redirections built from the optional "stdin"/"stdout"/"stderr" keys.
-    int starting_order;                 //!< Relative start order computed by systemd_resolve_starting_order() (lower starts first).
+    int starting_order;                 //!< Relative start order computed by libsystemd_resolve_starting_order() (lower starts first).
     dmlist_context_t* required;         //!< List of owned `char*` unit names this service requires (from "requires").
     dmlist_context_t* after;            //!< List of owned `char*` unit names this service must start after (from "after").
     Dmod_Pid_t pid;                     //!< PID returned by the last successful start, or <= 0 if never started/not running.
 };
 
 /**
- * @brief Full definition of the opaque @ref systemd_services_t handle
+ * @brief Full definition of the opaque @ref libsystemd_services_t handle
  *
- * A thin wrapper around a dmlist of `systemd_service_t` pointers. Kept as its
+ * A thin wrapper around a dmlist of `libsystemd_service_t` pointers. Kept as its
  * own type (rather than exposing the dmlist directly) so the public API
- * surface in systemd.h never needs to depend on dmlist.h.
+ * surface in libsystemd.h never needs to depend on dmlist.h.
  */
-struct systemd_services
+struct libsystemd_services
 {
-    dmlist_context_t* services;         //!< List of `systemd_service_t` entries (list data pointers are systemd_service_t).
+    dmlist_context_t* services;         //!< List of `libsystemd_service_t` entries (list data pointers are libsystemd_service_t).
 };
 
 /**
- * @brief Global service registry populated by systemd_scan()
+ * @brief Global service registry populated by libsystemd_scan()
  *
- * Owns every `systemd_service_t` currently known to this module instance.
- * Allocated by systemd_serviceapi_init() (called automatically from dmod_init()
- * when the module is loaded), repopulated on every successful systemd_scan(),
- * and released by systemd_serviceapi_deinit() (called automatically from
+ * Owns every `libsystemd_service_t` currently known to this module instance.
+ * Allocated by libsystemd_serviceapi_init() (called automatically from dmod_init()
+ * when the module is loaded), repopulated on every successful libsystemd_scan(),
+ * and released by libsystemd_serviceapi_deinit() (called automatically from
  * dmod_deinit() when the module is unloaded).
  *
  * NULL before the module has finished initializing, or after it has been
- * deinitialized - every API entry point that reads it (systemd_start_service(),
- * systemd_stop_service(), systemd_status(), systemd_list()) tolerates that and
+ * deinitialized - every API entry point that reads it (libsystemd_start_service(),
+ * libsystemd_stop_service(), libsystemd_status(), libsystemd_list()) tolerates that and
  * reports "not found" rather than crashing.
  *
  * @note This module is not designed for concurrent access from multiple
@@ -60,40 +60,40 @@ struct systemd_services
  *       run their own worker threads must serialize their own calls into this
  *       module's API.
  */
-static systemd_services_t g_services = NULL;
+static libsystemd_services_t g_services = NULL;
 
 /**
- * @brief Closure passed to systemd_dependency_order_visitor() while walking one service's dependency lists
+ * @brief Closure passed to libsystemd_dependency_order_visitor() while walking one service's dependency lists
  */
 typedef struct
 {
     dmlist_context_t* services;  //!< The full service list, searched by unit name for each dependency.
     int max_order;               //!< Highest `(dependency->starting_order + 1)` seen so far.
-} systemd_order_ctx_t;
+} libsystemd_order_ctx_t;
 
 /**
- * @brief Closure passed to systemd_resolve_service_order_visitor() while walking the whole service list
+ * @brief Closure passed to libsystemd_resolve_service_order_visitor() while walking the whole service list
  */
 typedef struct
 {
-    dmlist_context_t* services;  //!< The full service list (forwarded into @ref systemd_order_ctx_t for each service).
+    dmlist_context_t* services;  //!< The full service list (forwarded into @ref libsystemd_order_ctx_t for each service).
     bool changed;                //!< Set to true if any service's starting_order was raised during this pass.
-} systemd_pass_ctx_t;
+} libsystemd_pass_ctx_t;
 
 /**
- * @brief Closure passed to systemd_list_visitor() while walking the service list for systemd_list()
+ * @brief Closure passed to libsystemd_list_visitor() while walking the service list for libsystemd_list()
  */
 typedef struct
 {
-    systemd_visitor_t visitor;  //!< Caller-supplied visitor to invoke for each service.
+    libsystemd_visitor_t visitor;  //!< Caller-supplied visitor to invoke for each service.
     void* user_ptr;             //!< Caller-supplied opaque pointer, forwarded verbatim to the visitor.
-} systemd_list_ctx_t;
+} libsystemd_list_ctx_t;
 
 /**
  * @brief Free every element of a dependency name list and then the list itself
  *
- * Used to tear down the `required`/`after` lists of a `systemd_service_t`, both
- * of which hold heap-allocated `char*` unit names (see systemd_parse_name_list()).
+ * Used to tear down the `required`/`after` lists of a `libsystemd_service_t`, both
+ * of which hold heap-allocated `char*` unit names (see libsystemd_parse_name_list()).
  *
  * @param list List of owned `char*` entries to free, or NULL (no-op).
  *
@@ -103,11 +103,11 @@ typedef struct
  *
  * @par Example
  * @code
- * systemd_destroy_name_list(service->required);
+ * libsystemd_destroy_name_list(service->required);
  * service->required = NULL;
  * @endcode
  */
-static void systemd_destroy_name_list(dmlist_context_t* list)
+static void libsystemd_destroy_name_list(dmlist_context_t* list)
 {
     if (list == NULL)
     {
@@ -130,9 +130,9 @@ static void systemd_destroy_name_list(dmlist_context_t* list)
  * Releases `unit_name`, `exec`, every `argv` entry and the `argv` array itself,
  * every stream redirection path and the `streams.Entries` array, and both the
  * `required` and `after` dependency lists, before finally freeing the
- * `systemd_service_t` itself. Does **not** stop the service's process first -
+ * `libsystemd_service_t` itself. Does **not** stop the service's process first -
  * callers that may be destroying a running service should call
- * systemd_stop_service_internal() beforehand (see systemd_stop_all_services()).
+ * libsystemd_stop_service_internal() beforehand (see libsystemd_stop_all_services()).
  *
  * @param service Service to destroy, or NULL (no-op).
  *
@@ -143,15 +143,15 @@ static void systemd_destroy_name_list(dmlist_context_t* list)
  *
  * @par Example
  * @code
- * systemd_service_t service = NULL;
- * if (systemd_parse_file("/etc/services/foo.ini", &service) != 0) {
+ * libsystemd_service_t service = NULL;
+ * if (libsystemd_parse_file("/etc/services/foo.ini", &service) != 0) {
  *     // parsing failed, nothing to destroy
  * } else if (some_validation_failed) {
- *     systemd_destroy_service(service);
+ *     libsystemd_destroy_service(service);
  * }
  * @endcode
  */
-static void systemd_destroy_service(systemd_service_t service)
+static void libsystemd_destroy_service(libsystemd_service_t service)
 {
     if (service == NULL)
     {
@@ -179,8 +179,8 @@ static void systemd_destroy_service(systemd_service_t service)
         Dmod_Free((void*)service->streams.Entries);
     }
 
-    systemd_destroy_name_list(service->required);
-    systemd_destroy_name_list(service->after);
+    libsystemd_destroy_name_list(service->required);
+    libsystemd_destroy_name_list(service->after);
 
     Dmod_Free(service);
 }
@@ -188,27 +188,27 @@ static void systemd_destroy_service(systemd_service_t service)
 /**
  * @brief Free every service in a registry and then the registry itself
  *
- * Pops and destroys (via systemd_destroy_service()) every entry from
+ * Pops and destroys (via libsystemd_destroy_service()) every entry from
  * `services->services`, destroys the now-empty dmlist, and finally frees the
- * `systemd_services_t` wrapper.
+ * `libsystemd_services_t` wrapper.
  *
  * @param services Registry to destroy, or NULL (no-op).
  *
  * @return Nothing.
  *
  * @note This does **not** stop any running processes associated with the
- *       services first - see systemd_stop_all_services(), which callers such
- *       as systemd_serviceapi_deinit() and systemd_scan() call beforehand.
+ *       services first - see libsystemd_stop_all_services(), which callers such
+ *       as libsystemd_serviceapi_deinit() and libsystemd_scan() call beforehand.
  *
  * @par Example
  * @code
- * systemd_services_t parsed = NULL;
- * systemd_parse_dir("/etc/services", &parsed);
+ * libsystemd_services_t parsed = NULL;
+ * libsystemd_parse_dir("/etc/services", &parsed);
  * // ... use parsed ...
- * systemd_destroy_services(parsed);
+ * libsystemd_destroy_services(parsed);
  * @endcode
  */
-static void systemd_destroy_services(systemd_services_t services)
+static void libsystemd_destroy_services(libsystemd_services_t services)
 {
     if (services == NULL)
     {
@@ -217,11 +217,11 @@ static void systemd_destroy_services(systemd_services_t services)
 
     if (services->services != NULL)
     {
-        systemd_service_t service = (systemd_service_t)dmlist_pop_front(services->services);
+        libsystemd_service_t service = (libsystemd_service_t)dmlist_pop_front(services->services);
         while (service != NULL)
         {
-            systemd_destroy_service(service);
-            service = (systemd_service_t)dmlist_pop_front(services->services);
+            libsystemd_destroy_service(service);
+            service = (libsystemd_service_t)dmlist_pop_front(services->services);
         }
         dmlist_destroy(services->services);
     }
@@ -234,10 +234,10 @@ static void systemd_destroy_services(systemd_services_t services)
  *
  * Intended for use with dmlist_find()/dmlist_find_next(), which invoke the
  * comparator as `compare_func(node_data, query_data)` - so @p data1 is always
- * a `systemd_service_t` taken from the list, and @p data2 is always the
+ * a `libsystemd_service_t` taken from the list, and @p data2 is always the
  * `const char*` unit name being searched for.
  *
- * @param data1 Node data, actually a `systemd_service_t` (`const struct systemd_service*`).
+ * @param data1 Node data, actually a `libsystemd_service_t` (`const struct libsystemd_service*`).
  * @param data2 Query data, actually a `const char*` unit name.
  *
  * @retval 0    The service's unit_name equals the queried name.
@@ -246,11 +246,11 @@ static void systemd_destroy_services(systemd_services_t services)
  *
  * @note Not meant to be called directly - pass it as the `compare_func`
  *       argument to dmlist_find()/dmlist_find_next(), as done in
- *       systemd_find_service() and systemd_dependency_order_visitor().
+ *       libsystemd_find_service() and libsystemd_dependency_order_visitor().
  */
-static int systemd_compare_by_unit_name(const void* data1, const void* data2)
+static int libsystemd_compare_by_unit_name(const void* data1, const void* data2)
 {
-    const struct systemd_service* service = (const struct systemd_service*)data1;
+    const struct libsystemd_service* service = (const struct libsystemd_service*)data1;
     const char* name = (const char*)data2;
     return strcmp(service->unit_name, name);
 }
@@ -260,22 +260,22 @@ static int systemd_compare_by_unit_name(const void* data1, const void* data2)
  *
  * Intended for use with dmlist_sort(), which sorts ascending - services with
  * a smaller starting_order end up earlier in the list, which is exactly what
- * systemd_scan() relies on when it starts services in list order.
+ * libsystemd_scan() relies on when it starts services in list order.
  *
- * @param data1 First service, actually a `systemd_service_t` (`const struct systemd_service*`).
- * @param data2 Second service, actually a `systemd_service_t` (`const struct systemd_service*`).
+ * @param data1 First service, actually a `libsystemd_service_t` (`const struct libsystemd_service*`).
+ * @param data2 Second service, actually a `libsystemd_service_t` (`const struct libsystemd_service*`).
  *
  * @retval <0 `data1` should be started before `data2`.
  * @retval 0  `data1` and `data2` have the same starting_order.
  * @retval >0 `data1` should be started after `data2`.
  *
  * @note Not meant to be called directly - pass it as the `compare_func`
- *       argument to dmlist_sort(), as done in systemd_scan().
+ *       argument to dmlist_sort(), as done in libsystemd_scan().
  */
-static int systemd_compare_by_starting_order(const void* data1, const void* data2)
+static int libsystemd_compare_by_starting_order(const void* data1, const void* data2)
 {
-    const struct systemd_service* service1 = (const struct systemd_service*)data1;
-    const struct systemd_service* service2 = (const struct systemd_service*)data2;
+    const struct libsystemd_service* service1 = (const struct libsystemd_service*)data1;
+    const struct libsystemd_service* service2 = (const struct libsystemd_service*)data2;
     return service1->starting_order - service2->starting_order;
 }
 
@@ -285,41 +285,41 @@ static int systemd_compare_by_starting_order(const void* data1, const void* data
  * @param services  Registry to search, may be NULL.
  * @param unit_name Unit name to search for (e.g. "webserver"), must not be NULL.
  *
- * @return Matching `systemd_service_t`, or NULL if @p services is NULL/empty
+ * @return Matching `libsystemd_service_t`, or NULL if @p services is NULL/empty
  *         or no service with that unit name exists.
  *
  * @note The returned pointer is borrowed from the registry - it stays valid
  *       until the registry is replaced/destroyed (e.g. by the next
- *       systemd_scan()), and must not be freed by the caller.
+ *       libsystemd_scan()), and must not be freed by the caller.
  *
  * @par Example
  * @code
- * systemd_service_t service = systemd_find_service(g_services, "webserver");
+ * libsystemd_service_t service = libsystemd_find_service(g_services, "webserver");
  * if (service != NULL) {
  *     // service->exec, service->pid, ... are readable here
  * }
  * @endcode
  */
-static systemd_service_t systemd_find_service(systemd_services_t services, const char* unit_name)
+static libsystemd_service_t libsystemd_find_service(libsystemd_services_t services, const char* unit_name)
 {
     if (services == NULL || services->services == NULL)
     {
         return NULL;
     }
 
-    return (systemd_service_t)dmlist_find(services->services, unit_name, systemd_compare_by_unit_name);
+    return (libsystemd_service_t)dmlist_find(services->services, unit_name, libsystemd_compare_by_unit_name);
 }
 
 /**
  * @brief dmlist_foreach() visitor that folds one dependency name into the running max starting_order
  *
  * Called once per entry of a service's `required`/`after` list (see
- * systemd_resolve_service_order_visitor()). Looks the dependency up by name in
+ * libsystemd_resolve_service_order_visitor()). Looks the dependency up by name in
  * the full service list and, if found, raises `ctx->max_order` to
  * `dependency->starting_order + 1` when that is higher than what was seen so far.
  *
  * @param data      Dependency unit name, actually a `char*`/`const char*` list entry.
- * @param user_data Fold state, actually a `systemd_order_ctx_t*`.
+ * @param user_data Fold state, actually a `libsystemd_order_ctx_t*`.
  *
  * @retval true Always - every dependency in the list must be inspected.
  *
@@ -327,12 +327,12 @@ static systemd_service_t systemd_find_service(systemd_services_t services, const
  *       "requires"/"after", or a unit that was never scanned) are silently
  *       ignored rather than treated as an error.
  */
-static bool systemd_dependency_order_visitor(void* data, void* user_data)
+static bool libsystemd_dependency_order_visitor(void* data, void* user_data)
 {
     const char* dep_name = (const char*)data;
-    systemd_order_ctx_t* ctx = (systemd_order_ctx_t*)user_data;
+    libsystemd_order_ctx_t* ctx = (libsystemd_order_ctx_t*)user_data;
 
-    systemd_service_t dependency = (systemd_service_t)dmlist_find(ctx->services, dep_name, systemd_compare_by_unit_name);
+    libsystemd_service_t dependency = (libsystemd_service_t)dmlist_find(ctx->services, dep_name, libsystemd_compare_by_unit_name);
     if (dependency != NULL)
     {
         int candidate = dependency->starting_order + 1;
@@ -349,33 +349,33 @@ static bool systemd_dependency_order_visitor(void* data, void* user_data)
  * @brief dmlist_foreach() visitor that recomputes one service's starting_order for a single relaxation pass
  *
  * Folds over `service->required` and `service->after` (via
- * systemd_dependency_order_visitor()) to find the highest
+ * libsystemd_dependency_order_visitor()) to find the highest
  * `(dependency->starting_order + 1)` among this service's dependencies, and
  * raises `service->starting_order` to that value if it is currently lower.
  *
- * @param data      Service being processed, actually a `systemd_service_t`.
- * @param user_data Pass state, actually a `systemd_pass_ctx_t*`.
+ * @param data      Service being processed, actually a `libsystemd_service_t`.
+ * @param user_data Pass state, actually a `libsystemd_pass_ctx_t*`.
  *
  * @retval true Always - every service in the list must be visited each pass.
  *
  * @note Sets `pass_ctx->changed = true` whenever it actually raises a
- *       starting_order, which is how systemd_resolve_starting_order() detects
+ *       starting_order, which is how libsystemd_resolve_starting_order() detects
  *       that fixed point has not yet been reached.
  */
-static bool systemd_resolve_service_order_visitor(void* data, void* user_data)
+static bool libsystemd_resolve_service_order_visitor(void* data, void* user_data)
 {
-    systemd_service_t service = (systemd_service_t)data;
-    systemd_pass_ctx_t* pass_ctx = (systemd_pass_ctx_t*)user_data;
+    libsystemd_service_t service = (libsystemd_service_t)data;
+    libsystemd_pass_ctx_t* pass_ctx = (libsystemd_pass_ctx_t*)user_data;
 
-    systemd_order_ctx_t order_ctx = { .services = pass_ctx->services, .max_order = 0 };
+    libsystemd_order_ctx_t order_ctx = { .services = pass_ctx->services, .max_order = 0 };
 
     if (service->required != NULL)
     {
-        dmlist_foreach(service->required, systemd_dependency_order_visitor, &order_ctx);
+        dmlist_foreach(service->required, libsystemd_dependency_order_visitor, &order_ctx);
     }
     if (service->after != NULL)
     {
-        dmlist_foreach(service->after, systemd_dependency_order_visitor, &order_ctx);
+        dmlist_foreach(service->after, libsystemd_dependency_order_visitor, &order_ctx);
     }
 
     if (order_ctx.max_order > service->starting_order)
@@ -393,10 +393,10 @@ static bool systemd_resolve_service_order_visitor(void* data, void* user_data)
  * Runs Bellman-Ford-style relaxation passes over @p services: a dependency may
  * appear later in the list than its dependent, so a single top-to-bottom pass
  * is not enough to fully propagate the order. Each pass calls
- * systemd_resolve_service_order_visitor() for every service; the function
+ * libsystemd_resolve_service_order_visitor() for every service; the function
  * stops early as soon as a pass makes no further changes.
  *
- * @param services List of `systemd_service_t` entries to reorder in place (starting_order is mutated).
+ * @param services List of `libsystemd_service_t` entries to reorder in place (starting_order is mutated).
  *
  * @return Nothing. On return, every service's `starting_order` reflects the
  *         longest dependency chain reachable from it (or a partially-resolved
@@ -410,18 +410,18 @@ static bool systemd_resolve_service_order_visitor(void* data, void* user_data)
  *
  * @par Example
  * @code
- * systemd_resolve_starting_order(g_services->services);
- * dmlist_sort(g_services->services, systemd_compare_by_starting_order);
+ * libsystemd_resolve_starting_order(g_services->services);
+ * dmlist_sort(g_services->services, libsystemd_compare_by_starting_order);
  * @endcode
  */
-static void systemd_resolve_starting_order(dmlist_context_t* services)
+static void libsystemd_resolve_starting_order(dmlist_context_t* services)
 {
     size_t service_count = dmlist_size(services);
 
     for (size_t i = 0; i < service_count; i++)
     {
-        systemd_pass_ctx_t pass_ctx = { .services = services, .changed = false };
-        dmlist_foreach(services, systemd_resolve_service_order_visitor, &pass_ctx);
+        libsystemd_pass_ctx_t pass_ctx = { .services = services, .changed = false };
+        dmlist_foreach(services, libsystemd_resolve_service_order_visitor, &pass_ctx);
         if (!pass_ctx.changed)
         {
             break;
@@ -432,15 +432,15 @@ static void systemd_resolve_starting_order(dmlist_context_t* services)
 /**
  * @brief Actually spawn a service's process, without looking it up by name first
  *
- * Shared by systemd_start_service() (which looks the service up by unit name
- * first) and systemd_start_service_visitor() (which already has a direct
- * pointer while walking the registry in systemd_scan()), so the spawn logic
+ * Shared by libsystemd_start_service() (which looks the service up by unit name
+ * first) and libsystemd_start_service_visitor() (which already has a direct
+ * pointer while walking the registry in libsystemd_scan()), so the spawn logic
  * itself lives in exactly one place.
  *
  * Spawns `service->exec` as a module via `Dmod_SpawnModule()`, passing
  * `service->argc`/`service->argv` and, if any stream redirections were parsed,
  * `&service->streams`. On success, records the returned PID in `service->pid`
- * so later systemd_stop_service()/systemd_status() calls can find the process.
+ * so later libsystemd_stop_service()/libsystemd_status() calls can find the process.
  *
  * @param service Service to start (must not be NULL).
  *
@@ -454,7 +454,7 @@ static void systemd_resolve_starting_order(dmlist_context_t* services)
  *       restart attempt never clobbers the bookkeeping of a still-running
  *       previous instance.
  */
-static int systemd_start_service_internal(systemd_service_t service)
+static int libsystemd_start_service_internal(libsystemd_service_t service)
 {
     if (service->pid > 0 && dmosi_process_find_by_id((dmosi_process_id_t)service->pid) != NULL)
     {
@@ -481,22 +481,22 @@ static int systemd_start_service_internal(systemd_service_t service)
 /**
  * @brief dmlist_foreach() visitor that starts one service, logging (but not propagating) failures
  *
- * Used by systemd_scan() to start every service in the freshly sorted
+ * Used by libsystemd_scan() to start every service in the freshly sorted
  * registry in order. Failures are logged via DMOD_LOG_WARN() and otherwise
  * ignored, so one misconfigured/missing service does not prevent the rest of
  * the registry from starting.
  *
- * @param data      Service to start, actually a `systemd_service_t`.
+ * @param data      Service to start, actually a `libsystemd_service_t`.
  * @param user_data Unused (pass NULL).
  *
  * @retval true Always - iteration continues regardless of whether the start succeeded.
  */
-static bool systemd_start_service_visitor(void* data, void* user_data)
+static bool libsystemd_start_service_visitor(void* data, void* user_data)
 {
     (void)user_data;
 
-    systemd_service_t service = (systemd_service_t)data;
-    int result = systemd_start_service_internal(service);
+    libsystemd_service_t service = (libsystemd_service_t)data;
+    int result = libsystemd_start_service_internal(service);
     if (result != 0)
     {
         DMOD_LOG_WARN("Failed to start service '%s' (%d)\n", service->unit_name, result);
@@ -508,14 +508,14 @@ static bool systemd_start_service_visitor(void* data, void* user_data)
 /**
  * @brief Actually stop a service's process, without looking it up by name first
  *
- * Shared by systemd_stop_service() (which looks the service up by unit name
- * first) and systemd_stop_all_services_visitor() (which already has a direct
+ * Shared by libsystemd_stop_service() (which looks the service up by unit name
+ * first) and libsystemd_stop_all_services_visitor() (which already has a direct
  * pointer while walking a registry that is about to be replaced/torn down).
  *
  * Resolves `service->pid` to a live `dmosi_process_t` and kills it via
  * `dmosi_process_kill()`. Always clears `service->pid` back to the "not
  * running" sentinel (-1) once the process is confirmed gone or killed, so a
- * subsequent systemd_start_service() call is never blocked by stale state.
+ * subsequent libsystemd_start_service() call is never blocked by stale state.
  *
  * @param service Service to stop (must not be NULL).
  *
@@ -528,13 +528,13 @@ static bool systemd_start_service_visitor(void* data, void* user_data)
  *
  * @par Example
  * @code
- * systemd_service_t service = systemd_find_service(g_services, "webserver");
+ * libsystemd_service_t service = libsystemd_find_service(g_services, "webserver");
  * if (service != NULL) {
- *     int result = systemd_stop_service_internal(service);
+ *     int result = libsystemd_stop_service_internal(service);
  * }
  * @endcode
  */
-static int systemd_stop_service_internal(systemd_service_t service)
+static int libsystemd_stop_service_internal(libsystemd_service_t service)
 {
     if (service->pid <= 0)
     {
@@ -562,25 +562,25 @@ static int systemd_stop_service_internal(systemd_service_t service)
 /**
  * @brief dmlist_foreach() visitor that stops one service if it currently looks like it is running
  *
- * Used by systemd_stop_all_services() to shut down every service in a
- * registry that is about to be discarded (a rescan via systemd_scan(), or
- * module teardown via systemd_serviceapi_deinit()). Failures are ignored -
+ * Used by libsystemd_stop_all_services() to shut down every service in a
+ * registry that is about to be discarded (a rescan via libsystemd_scan(), or
+ * module teardown via libsystemd_serviceapi_deinit()). Failures are ignored -
  * there is no registry left afterwards to report status through, and the
  * registry is being destroyed regardless.
  *
- * @param data      Service to stop, actually a `systemd_service_t`.
+ * @param data      Service to stop, actually a `libsystemd_service_t`.
  * @param user_data Unused (pass NULL).
  *
  * @retval true Always - iteration continues regardless of whether the stop succeeded.
  */
-static bool systemd_stop_all_services_visitor(void* data, void* user_data)
+static bool libsystemd_stop_all_services_visitor(void* data, void* user_data)
 {
     (void)user_data;
 
-    systemd_service_t service = (systemd_service_t)data;
+    libsystemd_service_t service = (libsystemd_service_t)data;
     if (service->pid > 0)
     {
-        systemd_stop_service_internal(service);
+        libsystemd_stop_service_internal(service);
     }
 
     return true;
@@ -593,35 +593,35 @@ static bool systemd_stop_all_services_visitor(void* data, void* user_data)
  *
  * @return Nothing.
  *
- * @note Called before a registry is discarded (see systemd_scan() and
- *       systemd_serviceapi_deinit()) so that replacing/unloading the service
+ * @note Called before a registry is discarded (see libsystemd_scan() and
+ *       libsystemd_serviceapi_deinit()) so that replacing/unloading the service
  *       list never leaves orphaned, untracked processes running.
  *
  * @par Example
  * @code
- * systemd_stop_all_services(g_services);
- * systemd_destroy_services(g_services);
+ * libsystemd_stop_all_services(g_services);
+ * libsystemd_destroy_services(g_services);
  * g_services = NULL;
  * @endcode
  */
-static void systemd_stop_all_services(systemd_services_t services)
+static void libsystemd_stop_all_services(libsystemd_services_t services)
 {
     if (services == NULL || services->services == NULL)
     {
         return;
     }
 
-    dmlist_foreach(services->services, systemd_stop_all_services_visitor, NULL);
+    dmlist_foreach(services->services, libsystemd_stop_all_services_visitor, NULL);
 }
 
 /**
  * @brief Compute a service's current status from its tracked PID
  *
- * Shared by systemd_status() and systemd_list_visitor() so both report status
+ * Shared by libsystemd_status() and libsystemd_list_visitor() so both report status
  * identically. If the service has never been started (`pid <= 0`), reports
  * `DMOSI_PROCESS_STATE_CREATED` with a PID of 0. If it was started but its
  * process can no longer be found (it exited on its own, without going through
- * systemd_stop_service()), reports `DMOSI_PROCESS_STATE_TERMINATED` with the
+ * libsystemd_stop_service()), reports `DMOSI_PROCESS_STATE_TERMINATED` with the
  * last known PID. Otherwise reports the live process's actual state and PID.
  *
  * @param service    Service to inspect (must not be NULL).
@@ -631,12 +631,12 @@ static void systemd_stop_all_services(systemd_services_t services)
  *
  * @par Example
  * @code
- * systemd_service_status_t status;
- * systemd_fill_status(service, &status);
+ * libsystemd_service_status_t status;
+ * libsystemd_fill_status(service, &status);
  * if (status.state == DMOSI_PROCESS_STATE_RUNNING) { ... }
  * @endcode
  */
-static void systemd_fill_status(systemd_service_t service, systemd_service_status_t* out_status)
+static void libsystemd_fill_status(libsystemd_service_t service, libsystemd_service_status_t* out_status)
 {
     if (service->pid <= 0)
     {
@@ -658,27 +658,27 @@ static void systemd_fill_status(systemd_service_t service, systemd_service_statu
 }
 
 /**
- * @brief dmlist_foreach() visitor that reports one service to a caller-supplied systemd_visitor_t
+ * @brief dmlist_foreach() visitor that reports one service to a caller-supplied libsystemd_visitor_t
  *
- * Builds a `systemd_service_info_t` (unit name + status, via
- * systemd_fill_status()) for the current service and forwards it to the
- * user's visitor, propagating whatever the visitor returns so systemd_list()
+ * Builds a `libsystemd_service_info_t` (unit name + status, via
+ * libsystemd_fill_status()) for the current service and forwards it to the
+ * user's visitor, propagating whatever the visitor returns so libsystemd_list()
  * can be stopped early exactly like dmlist_foreach() itself supports.
  *
- * @param data      Service being visited, actually a `systemd_service_t`.
- * @param user_data Fold state, actually a `systemd_list_ctx_t*`.
+ * @param data      Service being visited, actually a `libsystemd_service_t`.
+ * @param user_data Fold state, actually a `libsystemd_list_ctx_t*`.
  *
  * @retval true  Continue iterating (the user's visitor returned true).
  * @retval false Stop iterating (the user's visitor returned false).
  */
-static bool systemd_list_visitor(void* data, void* user_data)
+static bool libsystemd_list_visitor(void* data, void* user_data)
 {
-    systemd_service_t service = (systemd_service_t)data;
-    systemd_list_ctx_t* ctx = (systemd_list_ctx_t*)user_data;
+    libsystemd_service_t service = (libsystemd_service_t)data;
+    libsystemd_list_ctx_t* ctx = (libsystemd_list_ctx_t*)user_data;
 
-    systemd_service_info_t info;
+    libsystemd_service_info_t info;
     info.unit_name = service->unit_name;
-    systemd_fill_status(service, &info.status);
+    libsystemd_fill_status(service, &info.status);
 
     return ctx->visitor(&info, ctx->user_ptr);
 }
@@ -702,12 +702,12 @@ static bool systemd_list_visitor(void* data, void* user_data)
  * @code
  * // ini file: exec=dmhttpd
  * //           args=--port 8080
- * systemd_build_argv(service, "dmhttpd", "--port 8080");
+ * libsystemd_build_argv(service, "dmhttpd", "--port 8080");
  * // service->argc == 3
  * // service->argv == { "dmhttpd", "--port", "8080", NULL }
  * @endcode
  */
-static bool systemd_build_argv(systemd_service_t service, const char* exec, const char* args)
+static bool libsystemd_build_argv(libsystemd_service_t service, const char* exec, const char* args)
 {
     int token_count = 0;
     char* args_copy = NULL;
@@ -811,11 +811,11 @@ static bool systemd_build_argv(systemd_service_t service, const char* exec, cons
  * @code
  * // ini file: stdout=/var/log/webserver.log
  * //           stderr=/var/log/webserver.log
- * systemd_build_streams(ctx, service);
+ * libsystemd_build_streams(ctx, service);
  * // service->streams.Count == 2
  * @endcode
  */
-static bool systemd_build_streams(dmini_context_t ctx, systemd_service_t service)
+static bool libsystemd_build_streams(dmini_context_t ctx, libsystemd_service_t service)
 {
     struct
     {
@@ -875,11 +875,11 @@ static bool systemd_build_streams(dmini_context_t ctx, systemd_service_t service
  * @code
  * // ini file: requires=networking
  * dmlist_context_t* required = NULL;
- * systemd_parse_name_list(ctx, "requires", &required);
+ * libsystemd_parse_name_list(ctx, "requires", &required);
  * // dmlist_size(required) == 1, dmlist_front(required) == "networking"
  * @endcode
  */
-static bool systemd_parse_name_list(dmini_context_t ctx, const char* key, dmlist_context_t** out_list)
+static bool libsystemd_parse_name_list(dmini_context_t ctx, const char* key, dmlist_context_t** out_list)
 {
     dmlist_context_t* list = dmlist_create(DMOD_MODULE_NAME);
     if (list == NULL)
@@ -945,11 +945,11 @@ static bool systemd_parse_name_list(dmini_context_t ctx, const char* key, dmlist
  *
  * @par Example
  * @code
- * systemd_has_ini_extension("webserver.ini"); // true
- * systemd_has_ini_extension("README.md");     // false
+ * libsystemd_has_ini_extension("webserver.ini"); // true
+ * libsystemd_has_ini_extension("README.md");     // false
  * @endcode
  */
-static bool systemd_has_ini_extension(const char* file_name)
+static bool libsystemd_has_ini_extension(const char* file_name)
 {
     size_t len = strlen(file_name);
     return (len > 4) && (strcmp(file_name + len - 4, ".ini") == 0);
@@ -959,19 +959,19 @@ static bool systemd_has_ini_extension(const char* file_name)
  * @brief Derive a unit name from a ".ini" file name by stripping the extension
  *
  * @param file_name Bare file name to derive from (e.g. "webserver.ini"); must
- *                    already satisfy systemd_has_ini_extension().
+ *                    already satisfy libsystemd_has_ini_extension().
  *
  * @return Newly heap-allocated, NUL-terminated unit name (e.g. "webserver"),
  *         owned by the caller (free with Dmod_Free()), or NULL if allocation failed.
  *
  * @par Example
  * @code
- * char* unit_name = systemd_make_unit_name("webserver.ini");
+ * char* unit_name = libsystemd_make_unit_name("webserver.ini");
  * // unit_name == "webserver"
  * Dmod_Free(unit_name);
  * @endcode
  */
-static char* systemd_make_unit_name(const char* file_name)
+static char* libsystemd_make_unit_name(const char* file_name)
 {
     size_t len = strlen(file_name) - 4; /* strip trailing ".ini" */
 
@@ -998,12 +998,12 @@ static char* systemd_make_unit_name(const char* file_name)
  *
  * @par Example
  * @code
- * char* path = systemd_join_path("/etc/services", "webserver.ini");
+ * char* path = libsystemd_join_path("/etc/services", "webserver.ini");
  * // path == "/etc/services/webserver.ini"
  * Dmod_Free(path);
  * @endcode
  */
-static char* systemd_join_path(const char* dir_path, const char* file_name)
+static char* libsystemd_join_path(const char* dir_path, const char* file_name)
 {
     size_t dir_len = strlen(dir_path);
     bool needs_separator = (dir_len > 0) && (dir_path[dir_len - 1] != '/');
@@ -1033,7 +1033,7 @@ static char* systemd_join_path(const char* dir_path, const char* file_name)
  *
  * Idempotent: if @ref g_services is already allocated, returns 0 immediately
  * without touching it. Called automatically by dmod_init() when the module is
- * loaded, and defensively by systemd_scan() in case it ever runs before
+ * loaded, and defensively by libsystemd_scan() in case it ever runs before
  * dmod_init() (e.g. from a test harness that calls API functions directly).
  *
  * @return 0 on success (including the "already initialized" case), or a
@@ -1045,20 +1045,20 @@ static char* systemd_join_path(const char* dir_path, const char* file_name)
  *
  * @par Example
  * @code
- * int result = systemd_serviceapi_init();
+ * int result = libsystemd_serviceapi_init();
  * if (result != 0) {
  *     // g_services is still NULL, nothing else in this file will work
  * }
  * @endcode
  */
-static int systemd_serviceapi_init(void)
+static int libsystemd_serviceapi_init(void)
 {
     if (g_services != NULL)
     {
         return 0;
     }
 
-    systemd_services_t services = Dmod_Malloc(sizeof(struct systemd_services));
+    libsystemd_services_t services = Dmod_Malloc(sizeof(struct libsystemd_services));
     if (services == NULL)
     {
         return -ENOMEM;
@@ -1079,10 +1079,10 @@ static int systemd_serviceapi_init(void)
 /**
  * @brief Stop every running service and release the global service registry (@ref g_services)
  *
- * Stops every currently-running service (via systemd_stop_all_services()) so
+ * Stops every currently-running service (via libsystemd_stop_all_services()) so
  * that tearing down the registry never leaves orphaned processes behind,
  * destroys every service and the registry itself (via
- * systemd_destroy_services()), and resets @ref g_services back to NULL. Called
+ * libsystemd_destroy_services()), and resets @ref g_services back to NULL. Called
  * automatically by dmod_deinit() when the module is unloaded.
  *
  * @return Nothing.
@@ -1092,14 +1092,14 @@ static int systemd_serviceapi_init(void)
  *
  * @par Example
  * @code
- * systemd_serviceapi_deinit();
- * // g_services is now NULL again; systemd_start_service() etc. will report -ENOENT
+ * libsystemd_serviceapi_deinit();
+ * // g_services is now NULL again; libsystemd_start_service() etc. will report -ENOENT
  * @endcode
  */
-static void systemd_serviceapi_deinit(void)
+static void libsystemd_serviceapi_deinit(void)
 {
-    systemd_stop_all_services(g_services);
-    systemd_destroy_services(g_services);
+    libsystemd_stop_all_services(g_services);
+    libsystemd_destroy_services(g_services);
     g_services = NULL;
 }
 
@@ -1110,14 +1110,14 @@ static void systemd_serviceapi_deinit(void)
  * every module may optionally define a function with this exact name and
  * signature, and the loader calls it once right after loading the module and
  * before running its `main()`. This module uses it to allocate @ref g_services
- * via systemd_serviceapi_init(), so the registry is always ready before any
- * of systemd_scan()/systemd_start_service()/systemd_stop_service()/
- * systemd_status()/systemd_list() can possibly be called.
+ * via libsystemd_serviceapi_init(), so the registry is always ready before any
+ * of libsystemd_scan()/libsystemd_start_service()/libsystemd_stop_service()/
+ * libsystemd_status()/libsystemd_list() can possibly be called.
  *
  * @param Config Module configuration blob passed by the loader; unused by this module.
  *
  * @retval 0       Initialization succeeded.
- * @retval -ENOMEM Initialization failed (see systemd_serviceapi_init()); the
+ * @retval -ENOMEM Initialization failed (see libsystemd_serviceapi_init()); the
  *                  loader is expected to treat this as a failed module load.
  *
  * @note Not meant to be called directly by application code - it is invoked
@@ -1127,7 +1127,7 @@ int dmod_init(const Dmod_Config_t* Config)
 {
     (void)Config;
 
-    return systemd_serviceapi_init();
+    return libsystemd_serviceapi_init();
 }
 
 /**
@@ -1135,7 +1135,7 @@ int dmod_init(const Dmod_Config_t* Config)
  *
  * Recognized by name by the DMOD loader (see `Dmod_Deinit_t` in
  * dmod_types.h) - called once when the module is being unloaded. Delegates to
- * systemd_serviceapi_deinit(), so no process spawned by this module instance
+ * libsystemd_serviceapi_deinit(), so no process spawned by this module instance
  * is left running untracked after unload.
  *
  * @return 0 always (this hook has no failure mode of its own).
@@ -1145,7 +1145,7 @@ int dmod_init(const Dmod_Config_t* Config)
  */
 int dmod_deinit(void)
 {
-    systemd_serviceapi_deinit();
+    libsystemd_serviceapi_deinit();
 
     return 0;
 }
@@ -1154,49 +1154,49 @@ int dmod_deinit(void)
  * @brief Start a previously scanned service by unit name
  *
  * Looks @p unit_name up in the global registry (@ref g_services, populated by
- * systemd_scan()) and, if found, spawns it via systemd_start_service_internal().
+ * libsystemd_scan()) and, if found, spawns it via libsystemd_start_service_internal().
  *
  * @param unit_name Unit name to start (e.g. "webserver"), as derived by
- *                    systemd_parse_dir() from the ini file name.
+ *                    libsystemd_parse_dir() from the ini file name.
  *
  * @retval 0         The service was found and spawned successfully.
  * @retval -EINVAL   @p unit_name was NULL.
  * @retval -ENOENT   No service with that unit name exists in the registry
- *                     (including the case where systemd_scan() was never called).
+ *                     (including the case where libsystemd_scan() was never called).
  * @retval -EALREADY The service already has a live process associated with it.
  * @retval -ENOSYS   Module spawning is not available on this build/platform.
  * @retval <0        Any other negative value forwarded from `Dmod_SpawnModule`.
  *
  * @par Example
  * @code
- * systemd_scan("/etc/services");
- * int result = systemd_start_service("webserver");
+ * libsystemd_scan("/etc/services");
+ * int result = libsystemd_start_service("webserver");
  * if (result != 0) {
  *     Dmod_Printf("failed to start webserver: %d\n", result);
  * }
  * @endcode
  */
-dmod_systemd_api_declaration(1.0, int, _start_service, ( const char* unit_name ))
+dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_name ))
 {
     if (unit_name == NULL)
     {
         return -EINVAL;
     }
 
-    systemd_service_t service = systemd_find_service(g_services, unit_name);
+    libsystemd_service_t service = libsystemd_find_service(g_services, unit_name);
     if (service == NULL)
     {
         return -ENOENT;
     }
 
-    return systemd_start_service_internal(service);
+    return libsystemd_start_service_internal(service);
 }
 
 /**
  * @brief Stop a previously started service by unit name
  *
  * Looks @p unit_name up in the global registry (@ref g_services) and, if
- * found, kills its tracked process via systemd_stop_service_internal().
+ * found, kills its tracked process via libsystemd_stop_service_internal().
  *
  * @param unit_name Unit name to stop (e.g. "webserver").
  *
@@ -1208,33 +1208,33 @@ dmod_systemd_api_declaration(1.0, int, _start_service, ( const char* unit_name )
  *
  * @par Example
  * @code
- * int result = systemd_stop_service("webserver");
+ * int result = libsystemd_stop_service("webserver");
  * if (result == -ESRCH) {
  *     // webserver was not running
  * }
  * @endcode
  */
-dmod_systemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name ))
+dmod_libsystemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name ))
 {
     if (unit_name == NULL)
     {
         return -EINVAL;
     }
 
-    systemd_service_t service = systemd_find_service(g_services, unit_name);
+    libsystemd_service_t service = libsystemd_find_service(g_services, unit_name);
     if (service == NULL)
     {
         return -ENOENT;
     }
 
-    return systemd_stop_service_internal(service);
+    return libsystemd_stop_service_internal(service);
 }
 
 /**
  * @brief Query the current status of a previously scanned service by unit name
  *
  * Looks @p unit_name up in the global registry (@ref g_services) and, if
- * found, fills in @p out_status via systemd_fill_status().
+ * found, fills in @p out_status via libsystemd_fill_status().
  *
  * @param unit_name  Unit name to query (e.g. "webserver").
  * @param out_status Receives the service's current process state and PID on success.
@@ -1245,26 +1245,26 @@ dmod_systemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name ))
  *
  * @par Example
  * @code
- * systemd_service_status_t status;
- * if (systemd_status("webserver", &status) == 0) {
+ * libsystemd_service_status_t status;
+ * if (libsystemd_status("webserver", &status) == 0) {
  *     Dmod_Printf("webserver pid=%u state=%d\n", status.pid, status.state);
  * }
  * @endcode
  */
-dmod_systemd_api_declaration(1.0, int, _status, ( const char* unit_name, systemd_service_status_t* out_status ))
+dmod_libsystemd_api_declaration(1.0, int, _status, ( const char* unit_name, libsystemd_service_status_t* out_status ))
 {
     if (unit_name == NULL || out_status == NULL)
     {
         return -EINVAL;
     }
 
-    systemd_service_t service = systemd_find_service(g_services, unit_name);
+    libsystemd_service_t service = libsystemd_find_service(g_services, unit_name);
     if (service == NULL)
     {
         return -ENOENT;
     }
 
-    systemd_fill_status(service, out_status);
+    libsystemd_fill_status(service, out_status);
 
     return 0;
 }
@@ -1273,9 +1273,9 @@ dmod_systemd_api_declaration(1.0, int, _status, ( const char* unit_name, systemd
  * @brief Visit every service currently in the global registry
  *
  * Walks the global registry (@ref g_services) in its current order (the
- * dependency-resolved start order after systemd_scan(), unless the registry
+ * dependency-resolved start order after libsystemd_scan(), unless the registry
  * is empty/uninitialized) and calls @p visitor once per service with a
- * `systemd_service_info_t` describing it, until either the registry is
+ * `libsystemd_service_info_t` describing it, until either the registry is
  * exhausted or @p visitor returns false.
  *
  * @param visitor  Callback invoked once per service; return false from it to stop early.
@@ -1288,16 +1288,16 @@ dmod_systemd_api_declaration(1.0, int, _status, ( const char* unit_name, systemd
  *
  * @par Example
  * @code
- * static bool print_service(const systemd_service_info_t* info, void* user_ptr)
+ * static bool print_service(const libsystemd_service_info_t* info, void* user_ptr)
  * {
  *     Dmod_Printf("%s: state=%d\n", info->unit_name, info->status.state);
  *     return true; // keep going
  * }
  *
- * systemd_list(print_service, NULL);
+ * libsystemd_list(print_service, NULL);
  * @endcode
  */
-dmod_systemd_api_declaration(1.0, int, _list, (systemd_visitor_t visitor, void* user_ptr))
+dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, void* user_ptr))
 {
     if (visitor == NULL)
     {
@@ -1309,8 +1309,8 @@ dmod_systemd_api_declaration(1.0, int, _list, (systemd_visitor_t visitor, void* 
         return 0;
     }
 
-    systemd_list_ctx_t ctx = { .visitor = visitor, .user_ptr = user_ptr };
-    dmlist_foreach(g_services->services, systemd_list_visitor, &ctx);
+    libsystemd_list_ctx_t ctx = { .visitor = visitor, .user_ptr = user_ptr };
+    dmlist_foreach(g_services->services, libsystemd_list_visitor, &ctx);
 
     return 0;
 }
@@ -1319,18 +1319,18 @@ dmod_systemd_api_declaration(1.0, int, _list, (systemd_visitor_t visitor, void* 
  * @brief Scan a directory of ".ini" unit files, replace the global registry, and start every service
  *
  * The full pipeline described for this module:
- * 1. Ensures the registry exists (systemd_serviceapi_init(), idempotent).
- * 2. Parses every "*.ini" file in @p path into a fresh registry (systemd_parse_dir()).
+ * 1. Ensures the registry exists (libsystemd_serviceapi_init(), idempotent).
+ * 2. Parses every "*.ini" file in @p path into a fresh registry (libsystemd_parse_dir()).
  * 3. Resolves each service's starting_order from its "requires"/"after"
- *    dependencies (systemd_resolve_starting_order()).
+ *    dependencies (libsystemd_resolve_starting_order()).
  * 4. Sorts the fresh registry by starting_order (dmlist_sort() with
- *    systemd_compare_by_starting_order()).
+ *    libsystemd_compare_by_starting_order()).
  * 5. Stops every service in the *previous* registry and destroys it
- *    (systemd_stop_all_services() + systemd_destroy_services()), so a rescan
+ *    (libsystemd_stop_all_services() + libsystemd_destroy_services()), so a rescan
  *    never leaves the old generation's processes running untracked.
  * 6. Installs the fresh, sorted registry as the new @ref g_services.
  * 7. Starts every service in the new registry, in order
- *    (systemd_start_service_visitor() via dmlist_foreach()) - failures for
+ *    (libsystemd_start_service_visitor() via dmlist_foreach()) - failures for
  *    individual services are logged and do not abort the scan.
  *
  * @param path Directory to scan for "*.ini" unit files (e.g. "/etc/services").
@@ -1340,7 +1340,7 @@ dmod_systemd_api_declaration(1.0, int, _list, (systemd_visitor_t visitor, void* 
  * @retval -EINVAL @p path was NULL.
  * @retval -ENOMEM Registry (re-)initialization or parsing failed to allocate memory.
  * @retval -ENOENT @p path does not exist / cannot be opened.
- * @retval <0      Any other negative value forwarded from systemd_parse_dir().
+ * @retval <0      Any other negative value forwarded from libsystemd_parse_dir().
  *
  * @note Calling this again later is a full reload: unit files that disappeared
  *       since the last scan are dropped, and every service - even ones whose
@@ -1348,40 +1348,40 @@ dmod_systemd_api_declaration(1.0, int, _list, (systemd_visitor_t visitor, void* 
  *
  * @par Example
  * @code
- * int result = systemd_scan("/etc/services");
+ * int result = libsystemd_scan("/etc/services");
  * if (result != 0) {
  *     Dmod_Printf("service scan failed: %d\n", result);
  * }
  * @endcode
  */
-dmod_systemd_api_declaration(1.0, int, _scan, (const char* path))
+dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
 {
     if (path == NULL)
     {
         return -EINVAL;
     }
 
-    int result = systemd_serviceapi_init();
+    int result = libsystemd_serviceapi_init();
     if (result != 0)
     {
         return result;
     }
 
-    systemd_services_t parsed = NULL;
-    result = systemd_parse_dir(path, &parsed);
+    libsystemd_services_t parsed = NULL;
+    result = libsystemd_parse_dir(path, &parsed);
     if (result != 0)
     {
         return result;
     }
 
-    systemd_resolve_starting_order(parsed->services);
-    dmlist_sort(parsed->services, systemd_compare_by_starting_order);
+    libsystemd_resolve_starting_order(parsed->services);
+    dmlist_sort(parsed->services, libsystemd_compare_by_starting_order);
 
-    systemd_stop_all_services(g_services);
-    systemd_destroy_services(g_services);
+    libsystemd_stop_all_services(g_services);
+    libsystemd_destroy_services(g_services);
     g_services = parsed;
 
-    dmlist_foreach(g_services->services, systemd_start_service_visitor, NULL);
+    dmlist_foreach(g_services->services, libsystemd_start_service_visitor, NULL);
 
     return 0;
 }
@@ -1390,11 +1390,11 @@ dmod_systemd_api_declaration(1.0, int, _scan, (const char* path))
  * @brief Parse a single ".ini" unit file into a newly allocated service
  *
  * Reads @p file_path via `dmini` and copies every field this module
- * understands into a fresh `systemd_service_t`: "exec" (required), "args"
+ * understands into a fresh `libsystemd_service_t`: "exec" (required), "args"
  * (optional, tokenized into argv), "stdin"/"stdout"/"stderr" (optional,
  * stream redirections), and "requires"/"after" (optional, dependency name
  * lists). Does **not** set `unit_name` or `starting_order` - those are the
- * responsibility of the caller (see systemd_parse_dir()), since a bare ini
+ * responsibility of the caller (see libsystemd_parse_dir()), since a bare ini
  * file has no notion of its own file name or its place relative to other
  * services. Does not touch the global registry.
  *
@@ -1412,15 +1412,15 @@ dmod_systemd_api_declaration(1.0, int, _scan, (const char* path))
  *
  * @par Example
  * @code
- * systemd_service_t service = NULL;
- * int result = systemd_parse_file("/etc/services/webserver.ini", &service);
+ * libsystemd_service_t service = NULL;
+ * int result = libsystemd_parse_file("/etc/services/webserver.ini", &service);
  * if (result == 0) {
  *     // service->exec, service->argc/argv, service->streams, ... are populated
- *     systemd_destroy_service(service); // if not handed off to a registry
+ *     libsystemd_destroy_service(service); // if not handed off to a registry
  * }
  * @endcode
  */
-dmod_systemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, systemd_service_t* service ))
+dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, libsystemd_service_t* service ))
 {
     if (file_path == NULL || service == NULL)
     {
@@ -1447,7 +1447,7 @@ dmod_systemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, sys
         return -EINVAL;
     }
 
-    systemd_service_t new_service = Dmod_Malloc(sizeof(struct systemd_service));
+    libsystemd_service_t new_service = Dmod_Malloc(sizeof(struct libsystemd_service));
     if (new_service == NULL)
     {
         dmini_destroy(ctx);
@@ -1468,16 +1468,16 @@ dmod_systemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, sys
     const char* args = dmini_get_string(ctx, NULL, "args", NULL);
 
     bool ok = (new_service->exec = Dmod_StrDup(exec)) != NULL;
-    ok = ok && systemd_build_argv(new_service, exec, args);
-    ok = ok && systemd_build_streams(ctx, new_service);
-    ok = ok && systemd_parse_name_list(ctx, "requires", &new_service->required);
-    ok = ok && systemd_parse_name_list(ctx, "after", &new_service->after);
+    ok = ok && libsystemd_build_argv(new_service, exec, args);
+    ok = ok && libsystemd_build_streams(ctx, new_service);
+    ok = ok && libsystemd_parse_name_list(ctx, "requires", &new_service->required);
+    ok = ok && libsystemd_parse_name_list(ctx, "after", &new_service->after);
 
     dmini_destroy(ctx);
 
     if (!ok)
     {
-        systemd_destroy_service(new_service);
+        libsystemd_destroy_service(new_service);
         return -ENOMEM;
     }
 
@@ -1490,12 +1490,12 @@ dmod_systemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, sys
  * @brief Parse every ".ini" unit file in a directory into a newly allocated registry
  *
  * Opens @p dir_path and, for each entry whose name ends in ".ini"
- * (systemd_has_ini_extension()), calls systemd_parse_file() on it and, on
- * success, sets the resulting service's `unit_name` (systemd_make_unit_name())
+ * (libsystemd_has_ini_extension()), calls libsystemd_parse_file() on it and, on
+ * success, sets the resulting service's `unit_name` (libsystemd_make_unit_name())
  * and appends it to the new registry's list. Files that fail to parse are
  * logged via DMOD_LOG_WARN() and skipped rather than aborting the whole scan.
  * Does not resolve `starting_order`, sort, or start anything - see
- * systemd_scan() for the full pipeline built on top of this function.
+ * libsystemd_scan() for the full pipeline built on top of this function.
  *
  * @param dir_path Directory to scan (e.g. "/etc/services").
  * @param services Receives the newly allocated registry on success (must not be NULL).
@@ -1513,14 +1513,14 @@ dmod_systemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, sys
  *
  * @par Example
  * @code
- * systemd_services_t services = NULL;
- * int result = systemd_parse_dir("/etc/services", &services);
+ * libsystemd_services_t services = NULL;
+ * int result = libsystemd_parse_dir("/etc/services", &services);
  * if (result == 0) {
  *     // services now owns every parsed unit; hand it to g_services or destroy it
  * }
  * @endcode
  */
-dmod_systemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, systemd_services_t* services ))
+dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, libsystemd_services_t* services ))
 {
     if (dir_path == NULL || services == NULL)
     {
@@ -1533,7 +1533,7 @@ dmod_systemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, syste
         return -ENOENT;
     }
 
-    systemd_services_t new_services = Dmod_Malloc(sizeof(struct systemd_services));
+    libsystemd_services_t new_services = Dmod_Malloc(sizeof(struct libsystemd_services));
     if (new_services == NULL)
     {
         Dmod_CloseDir(dir);
@@ -1551,19 +1551,19 @@ dmod_systemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, syste
     const Dmod_DirEntry_t* entry = Dmod_ReadDirEx(dir);
     while (entry != NULL)
     {
-        if (systemd_has_ini_extension(entry->name))
+        if (libsystemd_has_ini_extension(entry->name))
         {
-            char* file_path = systemd_join_path(dir_path, entry->name);
+            char* file_path = libsystemd_join_path(dir_path, entry->name);
             if (file_path != NULL)
             {
-                systemd_service_t service = NULL;
-                int result = systemd_parse_file(file_path, &service);
+                libsystemd_service_t service = NULL;
+                int result = libsystemd_parse_file(file_path, &service);
                 if (result == 0)
                 {
-                    service->unit_name = systemd_make_unit_name(entry->name);
+                    service->unit_name = libsystemd_make_unit_name(entry->name);
                     if (service->unit_name == NULL || !dmlist_push_back(new_services->services, service))
                     {
-                        systemd_destroy_service(service);
+                        libsystemd_destroy_service(service);
                     }
                 }
                 else
