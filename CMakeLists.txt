@@ -30,7 +30,7 @@ set(DMOD_BUILD_TEMPLATES OFF CACHE BOOL "Build templates")
 FetchContent_MakeAvailable(dmod)
 
 project(dmsystem VERSION ${DMOD_MODULE_VERSION}
-    DESCRIPTION "dmsystem DMOD application module"
+    DESCRIPTION "dmsystem init/service-manager stack for DMOD (libsystemd, systemd, service)"
     LANGUAGES C CXX)
 
 set(DMOD_DIR ${dmod_SOURCE_DIR} CACHE PATH "DMOD source directory")

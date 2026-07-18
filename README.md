@@ -2,20 +2,42 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-dmsystem DMOD application module.
+An init/service-manager stack for DMOD, similar in spirit to `systemd` on
+Linux.
+
+## Modules in this repository
+
+This repository builds three DMOD modules out of `app/`:
+
+| Module | Type | Role |
+|--------|------|------|
+| [`libsystemd`](app/libsystemd) | Library | Owns the unit registry and all the logic: parsing unit files, resolving `requires`/`after` order, starting/stopping/querying units. See [app/libsystemd/docs](app/libsystemd/docs) for its API. |
+| [`systemd`](app/systemd) | Application | Thin daemon entry point: takes a units directory, calls into `libsystemd` to scan and start everything. |
+| [`service`](app/service) | Application | Thin `systemctl`/`service`-alike CLI for inspecting and controlling the units `libsystemd` is currently tracking. |
+
+`libsystemd` has to be a **Library** module, not an Application: DMOD's
+loader only allows a Library to be enabled as another module's required
+dependency (`Dmod_Enable` rejects anything else - see
+`dmod/src/system/dmod_system.c`), and both `systemd` and `service` - plus
+`libsystemd`'s own tests - need to call into it. Because DMOD loads a given
+Library module at most once per process and shares that single instance
+across every module that requires it, `service` (which also requires
+`libsystemd`) reaches the exact in-memory unit registry `systemd` populated
+with its last scan, **as long as both run in the same process** (e.g. the
+same test binary, or a host loader that keeps the module loaded across
+runs). Two independently invoked `dmod_loader` processes each get their own
+fresh `libsystemd` instance - if `service` is run as a separate process from
+`systemd`, it simply sees an empty registry.
 
 ## Description
 
-`dmsystem` is an init/service-manager module for DMOD, similar in spirit to
-`systemd` on Linux. It is started with the path to a **directory** of *unit*
-files (managed services) - there is no single master config to hand-edit or
-regenerate: each service simply drops its own unit file into that directory.
-dmsystem scans the directory, parses every unit file with
+`libsystemd` is started (via `systemd`) with the path to a **directory** of
+*unit* files (managed services) - there is no single master config to
+hand-edit or regenerate: each service simply drops its own unit file into
+that directory. It scans the directory, parses every unit file with
 [dmini](https://github.com/choco-technologies/dmini), builds a dependency
-tree from each unit's `after`/`requires` keys, starts every unit in
-dependency order via `Dmod_SpawnModule`/`Dmod_RunModule`, and then supervises
-the long-running ones using [dmosi](https://github.com/choco-technologies/dmosi)'s
-process API until they all terminate.
+order from each unit's `after`/`requires` keys, and starts every unit in that
+order via `Dmod_SpawnModule`.
 
 ### Configuration format
 
@@ -29,9 +51,8 @@ the unit:
 ```
 /etc/dmsystem/units/
 ├── networking.ini
-├── storage.ini
 ├── webserver.ini
-└── migrate-db.ini
+└── monitoring.ini
 ```
 
 ```ini
@@ -55,36 +76,44 @@ stderr=/var/log/webserver.log
 ```
 
 ```ini
-# migrate-db.ini
-description=One-shot database migration
-exec=dbmigrate
-after=networking,storage
-requires=networking
-type=oneshot
+# monitoring.ini
+description=Watches networking and the webserver
+exec=dmmonitor
+after=networking,webserver
+requires=networking,webserver
+type=simple
 ```
+
+Runnable copies of these three live in
+[`app/libsystemd/examples/`](app/libsystemd/examples) and double as fixtures
+for `libsystemd`'s own test suite.
 
 Recognized keys:
 
-| Key           | Default    | Meaning |
-|---------------|------------|---------|
-| `exec`        | (required) | Module name to run/spawn |
-| `description` | unit name  | Human-readable description, used in logs |
-| `args`        | (empty)    | Whitespace-separated extra arguments passed to `exec` |
-| `type`        | `simple`   | `simple` (long-running, spawned) or `oneshot` (run to completion) |
-| `after`       | (empty)    | One or more unit names that must start (or complete, if `oneshot`) before this one - separate multiple names with `;`, `,`, or whitespace (freely mixed), up to 8 per key |
-| `requires`    | (empty)    | Same syntax and ordering as `after`, plus: if the dependency fails, this unit is skipped |
-| `restart`     | `no`       | `no` or `always` - whether the supervise loop respawns a terminated `simple` unit |
-| `stdin`       | (unset)    | Path to a file to redirect the unit's stdin from |
-| `stdout`      | (unset)    | Path to a file to redirect the unit's stdout to |
-| `stderr`      | (unset)    | Path to a file to redirect the unit's stderr to |
-| `stdlog`      | (unset)    | Path to a file to redirect the unit's stdlog (DMOD's own log stream) to |
+| Key           | Default    | Status | Meaning |
+|---------------|------------|--------|---------|
+| `exec`        | (required) | Implemented | Module name to run/spawn |
+| `args`        | (empty)    | Implemented | Whitespace-separated extra arguments passed to `exec` |
+| `after`       | (empty)    | Implemented | One or more unit names that must start before this one - separate multiple names with `,` and/or whitespace (freely mixed); no fixed cap |
+| `requires`    | (empty)    | Implemented (same as `after`) | Same syntax as `after`. Currently treated identically - there is no separate "skip on dependency failure" behavior yet |
+| `stdin`       | (unset)    | Implemented | Path to a file to redirect the unit's stdin from |
+| `stdout`      | (unset)    | Implemented | Path to a file to redirect the unit's stdout to |
+| `stderr`      | (unset)    | Implemented | Path to a file to redirect the unit's stderr to |
+| `description` | unit name  | **Not yet implemented** | Parsed by no one - the key is free to set but currently has no effect (not logged, not surfaced by `service`) |
+| `type`        | `simple`   | **Not yet implemented** | Key is not read at all yet - every unit is started the same way (spawned via `Dmod_SpawnModule`); there is no `oneshot` run-to-completion behavior |
+| `restart`     | `no`       | **Not yet implemented** | Key is not read at all yet - there is no supervise loop, so a unit that exits on its own is simply left stopped |
+| `stdlog`      | (unset)    | **Not yet implemented** | Only `stdin`/`stdout`/`stderr` are wired up today |
 
 An unset stream key leaves that stream at whatever default the spawned module
-would otherwise get; `stdout`/`stderr`/`stdlog` may point at the same path (as
-in the `webserver.ini` example above) to interleave everything into one file.
+would otherwise get; `stdout`/`stderr` may point at the same path (as in the
+`webserver.ini` example above) to interleave both into one file.
 
-A unit with dependency-cycle involvement is skipped and logged as such
-instead of blocking the rest of the system from starting.
+Dependency ordering is resolved with a bounded relaxation pass (each unit's
+start order is pushed past everything it requires/comes after, repeated
+until nothing changes or the list has been fully walked once per unit). A
+dependency cycle does not crash or hang anything - it simply stops
+propagating once the pass budget is exhausted - but unlike a real cycle
+detector it is not currently reported or logged as an error.
 
 ## Building
 
@@ -97,41 +126,41 @@ cmake ..
 cmake --build .
 ```
 
+This produces `build/dmf/libsystemd.dmf`, `build/dmf/systemd.dmf` and
+`build/dmf/service.dmf`, plus a `test_<module>.dmf` for each one's test
+suite.
+
 Pass `-DDMOD_DIR=/path/to/local/dmod` to build against a local dmod checkout
 instead of fetching `develop` from GitHub.
 
 ## Usage
 
 ```bash
-dmod_loader /path/to/dmsystem.dmf /path/to/units-directory
+dmod_loader /path/to/systemd.dmf --args "/path/to/units-directory"
 ```
 
 ### Controlling units with `service`
 
-`service` is a small `systemctl`/`service`-alike CLI, built alongside dmsystem,
-for inspecting and controlling the units a running dmsystem is managing:
+`service` is a small `systemctl`/`service`-alike CLI, built alongside
+`systemd`, for inspecting and controlling the units a running `systemd` is
+managing:
 
 ```bash
-service list                 # name/type/exec of every unit
-service status               # live state/pid/exit code of every unit
-service status webserver      # one unit
+service list                  # every unit systemd currently knows about
+service status                # same as `list`
+service status webserver      # one unit's state/pid
 service stop webserver
 service start webserver
 service restart webserver
 ```
 
-`service` does not talk to dmsystem over any socket or file - it calls
-dmsystem_core's query/control API directly. Because DMOD loads a given
-Library module at most once and shares that single instance across every
-Application that requires it, `service` (which requires dmsystem_core just
-like dmsystem does) reaches the exact in-memory unit list dmsystem's
-supervise loop is managing. If dmsystem is not currently running, `service`
-simply reports zero units.
+`service` does not talk to `systemd` over any socket or file - it calls
+`libsystemd`'s control API directly (see "Modules in this repository"
+above for why this only sees a populated registry when both run in the same
+process).
 
 `start`/`stop`/`restart` act only on the named unit - they do not cascade to
-its dependencies. A unit stopped this way is marked `stopped` and is not
-auto-restarted even if it declares `restart=always` (that only applies to a
-unit terminating on its own).
+its dependencies.
 
 ## Author
 

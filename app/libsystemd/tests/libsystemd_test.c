@@ -30,6 +30,7 @@ typedef struct
     int count;
     bool found_networking;
     bool found_webserver;
+    bool found_monitoring;
 } unit_summary_t;
 
 static bool count_units_visitor(const libsystemd_service_info_t* info, void* user_ptr)
@@ -44,6 +45,10 @@ static bool count_units_visitor(const libsystemd_service_info_t* info, void* use
     else if (strcmp(info->unit_name, "webserver") == 0)
     {
         summary->found_webserver = true;
+    }
+    else if (strcmp(info->unit_name, "monitoring") == 0)
+    {
+        summary->found_monitoring = true;
     }
 
     return true;
@@ -112,14 +117,15 @@ DMOD_TEST_STEP(scan_parses_example_units)
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_EXAMPLES_DIR), 0);
 }
 
-DMOD_TEST_STEP(list_reports_both_example_units)
+DMOD_TEST_STEP(list_reports_all_example_units)
 {
     unit_summary_t summary = { 0 };
     DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary), 0);
 
-    DMOD_TEST_EXPECT_EQ(summary.count, 2);
+    DMOD_TEST_EXPECT_EQ(summary.count, 3);
     DMOD_TEST_EXPECT_TRUE(summary.found_networking);
     DMOD_TEST_EXPECT_TRUE(summary.found_webserver);
+    DMOD_TEST_EXPECT_TRUE(summary.found_monitoring);
 }
 
 DMOD_TEST_STEP(list_rejects_null_visitor)

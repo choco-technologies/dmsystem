@@ -30,12 +30,21 @@ jobs:
         run: |
           echo "Checking for module files..."
           ls -lh build/dmf/
+          test -f build/dmf/libsystemd.dmf
+          test -f build/dmf/libsystemd_version.txt
           test -f build/dmf/systemd.dmf
-          test -f build/dmf/systemd_version.txt
+          test -f build/dmf/service.dmf
+          test -f build/dmf/test_libsystemd.dmf
           test -f build/dmf/test_systemd.dmf
+          test -f build/dmf/test_service.dmf
           echo "Module files present"
 
       - name: Run tests with dmod_loader
         run: |
           export DMOD_DMF_DIR=$(pwd)/build/dmf
+          # test_libsystemd carries the substantial coverage (parsing, ordering,
+          # start/stop/status/list); test_systemd/test_service are thin sanity
+          # checks that their own build/link wiring against libsystemd works.
+          dmod_loader build/dmf/test_libsystemd.dmf
           dmod_loader build/dmf/test_systemd.dmf
+          dmod_loader build/dmf/test_service.dmf

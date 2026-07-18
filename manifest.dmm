@@ -1,5 +1,14 @@
 # Include dynamically generated versions list from latest release
 $include https://github.com/choco-technologies/dmsystem/releases/download/vlatest/versions.dmm
 
-# Module entry with version placeholder - expanded by $version-available
-dmsystem https://github.com/choco-technologies/dmsystem/releases/download/v<version>/dmsystem-v<version>-<arch_name>.zip
+# Module entries with version placeholder - expanded by $version-available.
+# This repo builds three modules (see README.md); the release workflow
+# packages and zips each one under its own module name, not the repo name.
+libsystemd https://github.com/choco-technologies/dmsystem/releases/download/v<version>/libsystemd-v<version>-<arch_name>.zip
+systemd https://github.com/choco-technologies/dmsystem/releases/download/v<version>/systemd-v<version>-<arch_name>.zip
+service https://github.com/choco-technologies/dmsystem/releases/download/v<version>/service-v<version>-<arch_name>.zip
+
+# Test applications
+test_libsystemd https://github.com/choco-technologies/dmsystem/releases/download/v<version>/test_libsystemd-v<version>-<arch_name>.zip
+test_systemd https://github.com/choco-technologies/dmsystem/releases/download/v<version>/test_systemd-v<version>-<arch_name>.zip
+test_service https://github.com/choco-technologies/dmsystem/releases/download/v<version>/test_service-v<version>-<arch_name>.zip
