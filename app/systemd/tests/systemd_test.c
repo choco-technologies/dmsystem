@@ -1,5 +1,6 @@
 #define DMOD_ENABLE_REGISTRATION ON
 #include "dmod_test.h"
+#include "systemd.h"
 
 /* Optional lifecycle hooks */
 // void dmod_test_setup(void)    { /* reset state */ }
