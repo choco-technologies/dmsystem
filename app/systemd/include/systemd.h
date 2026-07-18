@@ -11,6 +11,8 @@ dmod_systemd_api(1.0, int, _stop_service, ( const char* unit_name ));
 dmod_systemd_api(1.0, int, _status, ( const char* unit_name, systemd_service_status_t* out_status ));
 dmod_systemd_api(1.0, int, _list, (systemd_visitor_t visitor, void* user_ptr));
 
-
+dmod_systemd_api(1.0, int, _scan, (const char* path));
+dmod_systemd_api(1.0, int, _parse_file, ( const char* file_path, systemd_service_t* service ));
+dmod_systemd_api(1.0, int, _parse_dir, ( const char* dir_path, systemd_services_t* services ));
 
 #endif // SYSTEMD_H
