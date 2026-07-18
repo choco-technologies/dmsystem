@@ -42,7 +42,7 @@ set(DMOD_MODULE_NAME        dmsystem)
 set(DMOD_AUTHOR_NAME        "Patryk Kubiak")
 
 # Stack size for the module (should be integer)
-set(DMOD_STACK_SIZE         4096)
+set(DMOD_STACK_SIZE         2048)
 
 # Priority for the thread of the module (should be integer)
 set(DMOD_PRIORITY           0)
