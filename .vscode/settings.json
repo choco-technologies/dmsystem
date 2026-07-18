@@ -1,12 +1,4 @@
 {
-    "files.associations": {
-        "dmsystem_core.h": "c",
-        "dmsystem_config.h": "c",
-        "dmsystem_proc.h": "c",
-        "dmsystem_unit.h": "c",
-        "dmsystem_unit_types.h": "c",
-        "dmsystem_graph.h": "c"
-    },
     "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
     "C_Cpp.intelliSenseEngine": "default",
     "C_Cpp.errorSquiggles": "enabled"
