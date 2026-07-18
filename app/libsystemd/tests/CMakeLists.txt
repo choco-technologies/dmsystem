@@ -9,6 +9,7 @@ dmod_add_test(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
 )
 
 dmod_link_modules(${DMOD_MODULE_NAME}
+    dmini
     dmosi
     dmlist
     )
