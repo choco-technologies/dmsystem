@@ -45,6 +45,9 @@ jobs:
           # test_libsystemd carries the substantial coverage (parsing, ordering,
           # start/stop/status/list); test_systemd/test_service are thin sanity
           # checks that their own build/link wiring against libsystemd works.
+          dmf-get -d ./build/dmf/test_libsystemd-local.dmd -y
           dmod_loader build/dmf/test_libsystemd.dmf
+          dmf-get -d ./build/dmf/test_systemd-local.dmd -y
           dmod_loader build/dmf/test_systemd.dmf
+          dmf-get -d ./build/dmf/test_service-local.dmd -y
           dmod_loader build/dmf/test_service.dmf
