@@ -1,3 +1,4 @@
+#define DMOD_ENABLE_REGISTRATION ON
 #include "libsystemd.h"
 #include <errno.h>
 #include <string.h>
