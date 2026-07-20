@@ -15,7 +15,9 @@ a quick-reference summary, not a replacement for those.
 | `libsystemd_service_t` | opaque pointer | Handle to one parsed unit. Fields are private to `serviceapi.c`. |
 | `libsystemd_services_t` | opaque pointer | Handle to a registry (list) of `libsystemd_service_t`. |
 | `libsystemd_service_status_t` | struct | `{ dmosi_process_state_t state; dmosi_process_id_t pid; }` - a unit's current process state and PID. |
-| `libsystemd_service_info_t` | struct | `{ const char* unit_name; libsystemd_service_status_t status; }` - passed to `libsystemd_list()`'s visitor. |
+| `libsystemd_service_type_t` | enum | `LIBSYSTEMD_SERVICE_TYPE_SIMPLE` (default) / `LIBSYSTEMD_SERVICE_TYPE_ONESHOT` - from the unit's `type` key, see [configuration.md](configuration.md#keys). |
+| `libsystemd_restart_policy_t` | enum | `LIBSYSTEMD_RESTART_NO` (default) / `LIBSYSTEMD_RESTART_ALWAYS` / `LIBSYSTEMD_RESTART_ON_FAILURE` - from the unit's `restart` key, see [configuration.md](configuration.md#keys). |
+| `libsystemd_service_info_t` | struct | `{ const char* unit_name; const char* description; libsystemd_service_type_t type; libsystemd_restart_policy_t restart_policy; libsystemd_service_status_t status; }` - passed to `libsystemd_list()`'s visitor. |
 | `libsystemd_visitor_t` | function pointer | `bool (*)(const libsystemd_service_info_t* info, void* user_ptr)` - return `false` to stop `libsystemd_list()` early. |
 
 ## Functions
@@ -80,6 +82,11 @@ instantiated on the fly and added to the registry before being spawned - see
 This is the only place template instantiation happens outside of
 `libsystemd_scan()`/`libsystemd_parse_dir()`.
 
+If the unit's `restart` key is not `no`, also registers a `dmosi` process-exit
+callback on the newly spawned process (best-effort - silently skipped if
+unsupported on this build/platform) so the unit is automatically respawned if
+its process later exits on its own - see [configuration.md](configuration.md#restart-supervision).
+
 - `-EINVAL` - `unit_name` was `NULL`.
 - `-ENOENT` - no unit with that name, and it could not be instantiated from a
   template either (including "nothing has been scanned yet").
@@ -90,6 +97,9 @@ This is the only place template instantiation happens outside of
 ### `libsystemd_stop_service(const char* unit_name)`
 
 Looks `unit_name` up and kills its tracked process (`dmosi_process_kill`).
+If a restart-supervision callback is registered for the unit, unregisters it
+first, so a deliberate stop is never mistaken for a crash that needs
+restarting.
 
 - `-EINVAL` - `unit_name` was `NULL`.
 - `-ENOENT` - no unit with that name.

@@ -30,15 +30,64 @@ considered; subdirectories and everything else are silently skipped.
 | `stdout`   | no       | Path bound to `DMOD_STDOUT`. |
 | `stderr`   | no       | Path bound to `DMOD_STDERR`. |
 | `stdlog`   | no       | Path bound to `DMOD_STDLOG` - a separate, platform-configurable logging stream that defaults to the same target as `DMOD_STDOUT` unless the platform overrides `Dmod_GetStdLogFile()`. |
+| `description` | no   | Free-form text, surfaced (not parsed/interpreted) via `libsystemd_service_info_t.description` in `libsystemd_list()`, and printed by `service list`/`service status`. |
+| `type`     | no       | `simple` (default) or `oneshot` - see [Service type](#service-type) below. |
+| `restart`  | no       | `no` (default), `always` or `on-failure` - see [Restart supervision](#restart-supervision) below. |
 
 A unit file with no `exec` key fails to parse (`libsystemd_parse_file()`
 returns `-EINVAL`); `libsystemd_parse_dir()` logs that failure and skips the
 file rather than aborting the whole scan.
 
-`description`, `type` and `restart` are documented in the
-[repository README](../../../README.md#configuration-format) as
-**not yet implemented** - they are reserved for a future supervise-loop /
-richer scheduling pass, but today's parser never reads them.
+An unrecognized `type`/`restart` value is logged via `DMOD_LOG_WARN()` and
+treated as the default (`simple`/`no`) - an unknown value must never silently
+enable restart supervision.
+
+### Service type
+
+The `type` key only affects how a process's own (non-killed) exit is logged,
+not whether/how it is started - every unit is spawned the same way, via
+`Dmod_SpawnModule`:
+
+- `simple` (default) - the process is expected to keep running until
+  explicitly stopped. An exit it was not killed for is logged as a warning.
+- `oneshot` - the process is expected to run to completion and exit on its
+  own. A clean exit (status `0`) is logged as informational, not a warning.
+
+### Restart supervision
+
+The `restart` key opts a unit into automatic restart when its process exits
+**on its own** (never when it is stopped via `service stop`/
+`libsystemd_stop_service()` - see below):
+
+- `no` (default) - never restart automatically; an exited unit is simply left
+  stopped, exactly like before this key existed.
+- `always` - restart unconditionally, regardless of exit status.
+- `on-failure` - restart only if the process exited with a non-zero status.
+
+This is implemented with `dmosi`'s process exit-callback API
+(`dmosi_process_register_exit_callback()`/`dmosi_process_unregister_exit_callback()`),
+not a polling supervise loop: `libsystemd_start_service_internal()` registers
+a callback on the freshly spawned process whenever `restart` is not `no`, and
+the callback re-spawns the unit (via the same internal start path, so a
+restart also re-registers itself) if the policy calls for it. Registration is
+best-effort - if `dmosi_process_register_exit_callback` is not connected on a
+given build/platform, or registration itself fails, the unit simply behaves
+as if `restart=no` (no supervision, same as before this feature existed) -
+`libsystemd_start_service()`'s return value is unaffected either way.
+
+Because the callback fires for *any* process exit, `libsystemd_stop_service()`
+unregisters it before killing the process - otherwise a `restart=always`
+unit would immediately respawn itself in response to a deliberate `service
+stop`. `libsystemd_scan()`'s "stop the previous generation" pass and
+`libsystemd_serviceapi_deinit()` (module unload) go through the same
+stop path, so neither leaves a stray restart behind either.
+
+The callback may run on whatever thread/context the `dmosi` backend detects
+process termination on, not necessarily the thread that called
+`libsystemd_scan()`/`libsystemd_start_service()`/`libsystemd_stop_service()`.
+Like the rest of this module, no internal locking is done - an application
+enabling `restart` from a multi-threaded environment is responsible for
+serializing its own calls into this module's API.
 
 ## Templates
 

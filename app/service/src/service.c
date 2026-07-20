@@ -33,9 +33,55 @@ static const char* state_to_string(dmosi_process_state_t state)
     }
 }
 
+/**
+ * @brief Human-readable label for a libsystemd_service_type_t value
+ */
+static const char* type_to_string(libsystemd_service_type_t type)
+{
+    switch (type)
+    {
+        case LIBSYSTEMD_SERVICE_TYPE_ONESHOT: return "oneshot";
+        case LIBSYSTEMD_SERVICE_TYPE_SIMPLE:
+        default:                              return "simple";
+    }
+}
+
+/**
+ * @brief Human-readable label for a libsystemd_restart_policy_t value
+ */
+static const char* restart_policy_to_string(libsystemd_restart_policy_t policy)
+{
+    switch (policy)
+    {
+        case LIBSYSTEMD_RESTART_ALWAYS:     return "always";
+        case LIBSYSTEMD_RESTART_ON_FAILURE: return "on-failure";
+        case LIBSYSTEMD_RESTART_NO:
+        default:                            return "no";
+    }
+}
+
 static void print_service_info(const libsystemd_service_info_t* info)
 {
-    Dmod_Printf("%-20s %-10s pid=%u\n", info->unit_name, state_to_string(info->status.state), info->status.pid);
+    if (info->description != NULL)
+    {
+        Dmod_Printf("%-20s %-10s pid=%-6u %s\n", info->unit_name, state_to_string(info->status.state), info->status.pid, info->description);
+    }
+    else
+    {
+        Dmod_Printf("%-20s %-10s pid=%u\n", info->unit_name, state_to_string(info->status.state), info->status.pid);
+    }
+}
+
+/**
+ * @brief Print the "type"/"restart" detail line shown by `service status <unit_name>`
+ *
+ * Kept separate from print_service_info() since cmd_list() (which reuses
+ * print_service_info() for every unit) would get too noisy with this on every
+ * line - only a single-unit `service status` query prints it.
+ */
+static void print_service_detail(const libsystemd_service_info_t* info)
+{
+    Dmod_Printf("  type=%s restart=%s\n", type_to_string(info->type), restart_policy_to_string(info->restart_policy));
 }
 
 /**
@@ -71,9 +117,36 @@ static int cmd_list(void)
 }
 
 /**
+ * @brief Closure for find_service_info_visitor(), used by cmd_status()
+ */
+typedef struct
+{
+    const char* unit_name;
+    bool found;
+    libsystemd_service_info_t info;
+} find_info_state_t;
+
+static bool find_service_info_visitor(const libsystemd_service_info_t* info, void* user_ptr)
+{
+    find_info_state_t* state = (find_info_state_t*)user_ptr;
+
+    if (strcmp(info->unit_name, state->unit_name) == 0)
+    {
+        state->info = *info;
+        state->found = true;
+        return false; /* stop iterating - found it */
+    }
+
+    return true;
+}
+
+/**
  * @brief Implements `service status [unit_name]`
  *
- * With no unit name, behaves exactly like cmd_list().
+ * With no unit name, behaves exactly like cmd_list(). With one, goes through
+ * libsystemd_list() (rather than libsystemd_status()) so the "description"/
+ * "type"/"restart" unit metadata - not carried by libsystemd_status()'s
+ * process-only libsystemd_service_status_t - can be shown too.
  */
 static int cmd_status(const char* unit_name)
 {
@@ -82,16 +155,17 @@ static int cmd_status(const char* unit_name)
         return cmd_list();
     }
 
-    libsystemd_service_status_t status;
-    int result = libsystemd_status(unit_name, &status);
-    if (result != 0)
+    find_info_state_t state = { .unit_name = unit_name, .found = false };
+    libsystemd_list(find_service_info_visitor, &state);
+
+    if (!state.found)
     {
-        Dmod_Printf("service: unit '%s' not found (%d)\n", unit_name, result);
-        return result;
+        Dmod_Printf("service: unit '%s' not found (%d)\n", unit_name, -ENOENT);
+        return -ENOENT;
     }
 
-    libsystemd_service_info_t info = { .unit_name = unit_name, .status = status };
-    print_service_info(&info);
+    print_service_info(&state.info);
+    print_service_detail(&state.info);
 
     return 0;
 }

@@ -10,7 +10,7 @@ format, dependency ordering, starting/stopping/status - is documented in
 ## Command line
 
 ```
-systemd <units-directory>
+systemd <units-directory> [rules-directory]
 systemd -h | --help
 ```
 
@@ -20,13 +20,19 @@ Scans `<units-directory>` for `*.ini` unit files, resolves their
 Long-running units keep running as independently spawned processes after
 `systemd` returns - it does not block or supervise them itself.
 
+If `[rules-directory]` is given, it is scanned for `*.ini` device-class rule
+files, which are loaded so devices reported at runtime can be
+started/stopped automatically (see
+[`libsystemd_load_rules()`](../../libsystemd/docs/api-reference.md#libsystemd_load_rulesconst-char-rules_dir)).
+
 ```bash
 dmod_loader systemd.dmf --args "/etc/dmsystem/units"
+dmod_loader systemd.dmf --args "/etc/dmsystem/units /etc/dmsystem/rules"
 ```
 
 Exit code is `0` on success, `-EINVAL` if the units directory argument is
-missing/malformed, or whatever `libsystemd_scan()` returned on failure (e.g.
-`-ENOENT` if the directory does not exist).
+missing/malformed, or whatever `libsystemd_scan()`/`libsystemd_load_rules()`
+returned on failure (e.g. `-ENOENT` if a directory does not exist).
 
 See the [repository README](../../../README.md) for the full unit file
 format and how `systemd`, `libsystemd` and `service` relate to each other.

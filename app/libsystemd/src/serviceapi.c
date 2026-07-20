@@ -22,6 +22,9 @@
 struct libsystemd_service
 {
     char* unit_name;                    //!< Unit name, derived from the ini file name (without the ".ini" suffix). Owned copy.
+    char* description;                  //!< From the optional "description" key, or NULL if unset. Owned copy.
+    libsystemd_service_type_t type;                    //!< From the optional "type" key ("simple"/"oneshot"). Defaults to ::LIBSYSTEMD_SERVICE_TYPE_SIMPLE.
+    libsystemd_restart_policy_t restart_policy;         //!< From the optional "restart" key ("no"/"always"/"on-failure"). Defaults to ::LIBSYSTEMD_RESTART_NO.
     char* exec;                         //!< Module name (or file path) to spawn, from the "exec" key. Owned copy.
     int argc;                           //!< Number of entries in argv (always >= 1, argv[0] == exec).
     char** argv;                        //!< NULL-terminated argument vector (argc+1 entries, each an owned copy).
@@ -30,6 +33,7 @@ struct libsystemd_service
     dmlist_context_t* required;         //!< List of owned `char*` unit names this service requires (from "requires").
     dmlist_context_t* after;            //!< List of owned `char*` unit names this service must start after (from "after").
     Dmod_Pid_t pid;                     //!< PID returned by the last successful start, or <= 0 if never started/not running.
+    dmosi_process_exit_callback_handle_t exit_callback_handle;  //!< Handle of the dmosi exit callback registered for the current run (see libsystemd_start_service_internal()), or NULL if none is registered (restart_policy is ::LIBSYSTEMD_RESTART_NO, not currently running, or registration failed/unsupported).
 };
 
 /**
@@ -222,6 +226,7 @@ static void libsystemd_destroy_service(libsystemd_service_t service)
     }
 
     Dmod_Free(service->unit_name);
+    Dmod_Free(service->description);
     Dmod_Free(service->exec);
 
     if (service->argv != NULL)
@@ -692,17 +697,38 @@ static void libsystemd_resolve_starting_order(dmlist_context_t* services)
 }
 
 /**
+ * @brief dmosi process-exit callback that applies a unit's "restart" policy
+ *
+ * Forward-declared here so libsystemd_start_service_internal() can register
+ * it; defined further down (it calls back into
+ * libsystemd_start_service_internal() itself to actually perform a restart -
+ * see the definition for the full behavior).
+ */
+static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_status, void* arg);
+
+/**
  * @brief Actually spawn a service's process, without looking it up by name first
  *
  * Shared by libsystemd_start_service() (which looks the service up by unit name
  * first) and libsystemd_start_service_visitor() (which already has a direct
  * pointer while walking the registry in libsystemd_scan()), so the spawn logic
- * itself lives in exactly one place.
+ * itself lives in exactly one place. Also the sole place that (re-)registers
+ * the restart-supervision exit callback, so an automatic restart
+ * (libsystemd_service_exit_callback()) is supervised exactly the same way as
+ * the initial start.
  *
  * Spawns `service->exec` as a module via `Dmod_SpawnModule()`, passing
  * `service->argc`/`service->argv` and, if any stream redirections were parsed,
  * `&service->streams`. On success, records the returned PID in `service->pid`
  * so later libsystemd_stop_service()/libsystemd_status() calls can find the process.
+ *
+ * If `service->restart_policy` is not ::LIBSYSTEMD_RESTART_NO, also registers
+ * libsystemd_service_exit_callback() on the newly spawned process (best-effort:
+ * silently skipped if `dmosi_process_register_exit_callback` is not connected
+ * on this build/platform, or if registration itself fails) so the unit is
+ * automatically restarted if its process later exits on its own - see
+ * libsystemd_stop_service_internal() for how a *deliberate* stop avoids
+ * triggering this.
  *
  * @param service Service to start (must not be NULL).
  *
@@ -736,8 +762,80 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
     }
 
     service->pid = (Dmod_Pid_t)spawn_result;
+    service->exit_callback_handle = NULL;
+
+    if (service->restart_policy != LIBSYSTEMD_RESTART_NO && Dmod_IsFunctionConnected((void*)dmosi_process_register_exit_callback))
+    {
+        dmosi_process_t process = dmosi_process_find_by_id((dmosi_process_id_t)service->pid);
+        if (process != NULL)
+        {
+            service->exit_callback_handle = dmosi_process_register_exit_callback(process, libsystemd_service_exit_callback, service);
+        }
+    }
 
     return 0;
+}
+
+/**
+ * @brief dmosi process-exit callback: applies a unit's "restart" policy when its process terminates on its own
+ *
+ * Registered on every process spawned for a unit whose restart_policy is not
+ * ::LIBSYSTEMD_RESTART_NO (see libsystemd_start_service_internal()), and
+ * unregistered before a deliberate libsystemd_stop_service() kill
+ * (libsystemd_stop_service_internal()) - so this only ever runs for a process
+ * that terminated on its own, never for one this module killed itself.
+ *
+ * Logs the exit (DMOD_LOG_INFO() for an expected ::LIBSYSTEMD_SERVICE_TYPE_ONESHOT
+ * completion, DMOD_LOG_WARN() for anything else), then re-spawns the unit via
+ * libsystemd_start_service_internal() if the policy calls for it:
+ * ::LIBSYSTEMD_RESTART_ALWAYS restarts unconditionally,
+ * ::LIBSYSTEMD_RESTART_ON_FAILURE only if @p exit_status is non-zero. A
+ * restart failure (e.g. `exec` no longer resolvable) is logged and otherwise
+ * ignored - there is no further retry until the process exits again, mirroring
+ * how libsystemd_start_service_visitor() handles a failed initial start.
+ *
+ * @param process     Process that terminated (unused - @p arg already identifies the owning service).
+ * @param exit_status Exit status the process terminated with.
+ * @param arg         The `libsystemd_service_t` this callback was registered for (see libsystemd_start_service_internal()).
+ *
+ * @return Nothing.
+ *
+ * @note Invoked from whatever context the dmosi backend detects process
+ *       termination in, not necessarily the thread that called
+ *       libsystemd_scan()/libsystemd_start_service()/libsystemd_stop_service().
+ *       Like the rest of this module (see @ref g_services), no locking is done
+ *       here - a caller enabling "restart" from a multi-threaded environment
+ *       must serialize its own calls into this module's API.
+ */
+static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_status, void* arg)
+{
+    (void)process;
+
+    libsystemd_service_t service = (libsystemd_service_t)arg;
+    service->exit_callback_handle = NULL;
+    service->pid = -1;
+
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_ONESHOT && exit_status == 0)
+    {
+        DMOD_LOG_INFO("Unit '%s' completed (exit=%d)\n", service->unit_name, exit_status);
+    }
+    else
+    {
+        DMOD_LOG_WARN("Unit '%s' exited unexpectedly (exit=%d)\n", service->unit_name, exit_status);
+    }
+
+    bool should_restart = (service->restart_policy == LIBSYSTEMD_RESTART_ALWAYS) ||
+                           (service->restart_policy == LIBSYSTEMD_RESTART_ON_FAILURE && exit_status != 0);
+    if (!should_restart)
+    {
+        return;
+    }
+
+    int result = libsystemd_start_service_internal(service);
+    if (result != 0)
+    {
+        DMOD_LOG_WARN("Failed to restart unit '%s' (%d)\n", service->unit_name, result);
+    }
 }
 
 /**
@@ -779,6 +877,12 @@ static bool libsystemd_start_service_visitor(void* data, void* user_data)
  * running" sentinel (-1) once the process is confirmed gone or killed, so a
  * subsequent libsystemd_start_service() call is never blocked by stale state.
  *
+ * If a restart-supervision exit callback is currently registered for this
+ * service (see libsystemd_start_service_internal()), unregisters it *before*
+ * killing the process - otherwise a "restart=always"/"restart=on-failure"
+ * unit would immediately respawn itself in response to this deliberate stop,
+ * which is never the intent of an explicit libsystemd_stop_service() call.
+ *
  * @param service Service to stop (must not be NULL).
  *
  * @retval 0      The service's process was found and killed successfully.
@@ -808,6 +912,15 @@ static int libsystemd_stop_service_internal(libsystemd_service_t service)
     {
         service->pid = -1;
         return -ESRCH;
+    }
+
+    if (service->exit_callback_handle != NULL)
+    {
+        if (Dmod_IsFunctionConnected((void*)dmosi_process_unregister_exit_callback))
+        {
+            dmosi_process_unregister_exit_callback(process, service->exit_callback_handle);
+        }
+        service->exit_callback_handle = NULL;
     }
 
     int result = dmosi_process_kill(process, 0);
@@ -922,10 +1035,11 @@ static void libsystemd_fill_status(libsystemd_service_t service, libsystemd_serv
 /**
  * @brief dmlist_foreach() visitor that reports one service to a caller-supplied libsystemd_visitor_t
  *
- * Builds a `libsystemd_service_info_t` (unit name + status, via
- * libsystemd_fill_status()) for the current service and forwards it to the
- * user's visitor, propagating whatever the visitor returns so libsystemd_list()
- * can be stopped early exactly like dmlist_foreach() itself supports.
+ * Builds a `libsystemd_service_info_t` (unit name, description, type, restart
+ * policy and status, via libsystemd_fill_status()) for the current service and
+ * forwards it to the user's visitor, propagating whatever the visitor returns
+ * so libsystemd_list() can be stopped early exactly like dmlist_foreach()
+ * itself supports.
  *
  * @param data      Service being visited, actually a `libsystemd_service_t`.
  * @param user_data Fold state, actually a `libsystemd_list_ctx_t*`.
@@ -940,6 +1054,9 @@ static bool libsystemd_list_visitor(void* data, void* user_data)
 
     libsystemd_service_info_t info;
     info.unit_name = service->unit_name;
+    info.description = service->description;
+    info.type = service->type;
+    info.restart_policy = service->restart_policy;
     libsystemd_fill_status(service, &info.status);
 
     return ctx->visitor(&info, ctx->user_ptr);
@@ -1637,6 +1754,75 @@ static char* libsystemd_substitute_device_name(const char* value, const char* de
 }
 
 /**
+ * @brief Parse a unit's "type" ini key into a ::libsystemd_service_type_t
+ *
+ * Recognizes "simple" (the default, also used for an absent key) and
+ * "oneshot" (see ::LIBSYSTEMD_SERVICE_TYPE_ONESHOT). Any other value is
+ * logged via DMOD_LOG_WARN() and treated as "simple", the same "log and fall
+ * back to a safe default" handling as an unrecognized "restart" value (see
+ * libsystemd_parse_restart_policy()).
+ *
+ * @param ctx  Parsed ini context to read the key from (must not be NULL).
+ * @param exec Unit's "exec" value, used only to identify the unit in the
+ *               warning log - its own unit_name is not assigned yet at this
+ *               point in parsing (see libsystemd_build_service_from_ctx()).
+ *
+ * @return The parsed (or defaulted) type.
+ */
+static libsystemd_service_type_t libsystemd_parse_service_type(dmini_context_t ctx, const char* exec)
+{
+    const char* value = dmini_get_string(ctx, NULL, "type", "simple");
+
+    if (strcmp(value, "simple") == 0)
+    {
+        return LIBSYSTEMD_SERVICE_TYPE_SIMPLE;
+    }
+    if (strcmp(value, "oneshot") == 0)
+    {
+        return LIBSYSTEMD_SERVICE_TYPE_ONESHOT;
+    }
+
+    DMOD_LOG_WARN("Unit with exec '%s' has unrecognized type '%s', treating as 'simple'\n", exec, value);
+    return LIBSYSTEMD_SERVICE_TYPE_SIMPLE;
+}
+
+/**
+ * @brief Parse a unit's "restart" ini key into a ::libsystemd_restart_policy_t
+ *
+ * Recognizes "no" (the default, also used for an absent key), "always" and
+ * "on-failure" (see ::libsystemd_restart_policy_t). Any other value is
+ * logged via DMOD_LOG_WARN() and treated as "no" - restart supervision is a
+ * deliberate opt-in (see libsystemd_start_service_internal()), so an unknown
+ * value must never silently enable it.
+ *
+ * @param ctx  Parsed ini context to read the key from (must not be NULL).
+ * @param exec Unit's "exec" value, used only to identify the unit in the
+ *               warning log (see libsystemd_parse_service_type()).
+ *
+ * @return The parsed (or defaulted) restart policy.
+ */
+static libsystemd_restart_policy_t libsystemd_parse_restart_policy(dmini_context_t ctx, const char* exec)
+{
+    const char* value = dmini_get_string(ctx, NULL, "restart", "no");
+
+    if (strcmp(value, "no") == 0)
+    {
+        return LIBSYSTEMD_RESTART_NO;
+    }
+    if (strcmp(value, "always") == 0)
+    {
+        return LIBSYSTEMD_RESTART_ALWAYS;
+    }
+    if (strcmp(value, "on-failure") == 0)
+    {
+        return LIBSYSTEMD_RESTART_ON_FAILURE;
+    }
+
+    DMOD_LOG_WARN("Unit with exec '%s' has unrecognized restart policy '%s', treating as 'no'\n", exec, value);
+    return LIBSYSTEMD_RESTART_NO;
+}
+
+/**
  * @brief Build a fresh `libsystemd_service_t` from an already-parsed ini context
  *
  * Shared tail end of both libsystemd_parse_unit_internal() (file-backed
@@ -1671,6 +1857,9 @@ static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_ser
     }
 
     new_service->unit_name = NULL;
+    new_service->description = NULL;
+    new_service->type = LIBSYSTEMD_SERVICE_TYPE_SIMPLE;
+    new_service->restart_policy = LIBSYSTEMD_RESTART_NO;
     new_service->exec = NULL;
     new_service->argc = 0;
     new_service->argv = NULL;
@@ -1680,14 +1869,20 @@ static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_ser
     new_service->required = NULL;
     new_service->after = NULL;
     new_service->pid = -1;
+    new_service->exit_callback_handle = NULL;
 
     const char* args = dmini_get_string(ctx, NULL, "args", NULL);
+    const char* description = dmini_get_string(ctx, NULL, "description", NULL);
+
+    new_service->type = libsystemd_parse_service_type(ctx, exec);
+    new_service->restart_policy = libsystemd_parse_restart_policy(ctx, exec);
 
     bool ok = (new_service->exec = Dmod_StrDup(exec)) != NULL;
     ok = ok && libsystemd_build_argv(new_service, exec, args);
     ok = ok && libsystemd_build_streams(ctx, new_service);
     ok = ok && libsystemd_parse_name_list(ctx, "requires", &new_service->required);
     ok = ok && libsystemd_parse_name_list(ctx, "after", &new_service->after);
+    ok = ok && (description == NULL || (new_service->description = Dmod_StrDup(description)) != NULL);
 
     if (!ok)
     {

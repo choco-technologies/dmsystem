@@ -100,9 +100,9 @@ Recognized keys:
 | `stdout`      | (unset)    | Implemented | Path to a file to redirect the unit's stdout to |
 | `stderr`      | (unset)    | Implemented | Path to a file to redirect the unit's stderr to |
 | `stdlog`      | (unset)    | Implemented | Path to a file to redirect the unit's `DMOD_STDLOG` stream to - a separate, platform-configurable logging stream that defaults to the same target as `stdout` unless the platform overrides `Dmod_GetStdLogFile()` |
-| `description` | unit name  | **Not yet implemented** | Parsed by no one - the key is free to set but currently has no effect (not logged, not surfaced by `service`) |
-| `type`        | `simple`   | **Not yet implemented** | Key is not read at all yet - every unit is started the same way (spawned via `Dmod_SpawnModule`); there is no `oneshot` run-to-completion behavior |
-| `restart`     | `no`       | **Not yet implemented** | Key is not read at all yet - there is no supervise loop, so a unit that exits on its own is simply left stopped |
+| `description` | unit name  | Implemented | Free-form text, surfaced via `libsystemd_list()`'s `libsystemd_service_info_t.description` and printed by `service list`/`service status` - not otherwise interpreted |
+| `type`        | `simple`   | Implemented | `simple` (default, expected to keep running) or `oneshot` (expected to run to completion - a clean exit is logged as informational, not a warning) |
+| `restart`     | `no`       | Implemented | `no` (default), `always`, or `on-failure` - restarts the unit when its process exits **on its own** (not on `service stop`), via `dmosi`'s process exit-callback API. See [app/libsystemd/docs/configuration.md](app/libsystemd/docs/configuration.md#restart-supervision) |
 
 An unset stream key leaves that stream at whatever default the spawned module
 would otherwise get; `stdout`/`stderr`/`stdlog` may point at the same path (as
@@ -196,6 +196,7 @@ instead of fetching `develop` from GitHub.
 
 ```bash
 dmod_loader /path/to/systemd.dmf --args "/path/to/units-directory"
+dmod_loader /path/to/systemd.dmf --args "/path/to/units-directory /path/to/rules-directory"
 ```
 
 ### Controlling units with `service`

@@ -441,6 +441,89 @@ DMOD_TEST_STEP(notify_device_added_is_replayed_once_units_directory_is_scanned)
     DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@x2", &status), 0);
 }
 
+/**
+ * Fixture directory: tests/fixtures/metadata/, exercising the
+ * "description"/"type"/"restart" ini keys added on top of the pre-existing
+ * exec/args/after/requires/stdin/stdout/stderr/stdlog set - see
+ * libsystemd_parse_service_type()/libsystemd_parse_restart_policy() in
+ * serviceapi.c and app/libsystemd/docs/configuration.md#restart-supervision.
+ */
+#define LIBSYSTEMD_METADATA_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/metadata"
+
+/**
+ * @brief Closure for find_info_visitor(), used by the metadata test steps below
+ */
+typedef struct
+{
+    const char* unit_name;
+    bool found;
+    libsystemd_service_info_t info;
+} find_info_state_t;
+
+static bool find_info_visitor(const libsystemd_service_info_t* info, void* user_ptr)
+{
+    find_info_state_t* state = (find_info_state_t*)user_ptr;
+
+    if (strcmp(info->unit_name, state->unit_name) == 0)
+    {
+        state->info = *info;
+        state->found = true;
+        return false;
+    }
+
+    return true;
+}
+
+DMOD_TEST_STEP(scan_defaults_type_and_restart_when_keys_absent)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
+
+    find_info_state_t state = { .unit_name = "defaults", .found = false };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
+    DMOD_TEST_EXPECT_TRUE(state.found);
+    DMOD_TEST_EXPECT_NULL(state.info.description);
+    DMOD_TEST_EXPECT_EQ(state.info.type, LIBSYSTEMD_SERVICE_TYPE_SIMPLE);
+    DMOD_TEST_EXPECT_EQ(state.info.restart_policy, LIBSYSTEMD_RESTART_NO);
+}
+
+DMOD_TEST_STEP(scan_parses_oneshot_type_and_on_failure_restart)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
+
+    find_info_state_t state = { .unit_name = "oneshot", .found = false };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
+    DMOD_TEST_EXPECT_TRUE(state.found);
+    DMOD_TEST_EXPECT_NOT_NULL(state.info.description);
+    DMOD_TEST_EXPECT_EQ(strcmp(state.info.description, "Runs once and exits"), 0);
+    DMOD_TEST_EXPECT_EQ(state.info.type, LIBSYSTEMD_SERVICE_TYPE_ONESHOT);
+    DMOD_TEST_EXPECT_EQ(state.info.restart_policy, LIBSYSTEMD_RESTART_ON_FAILURE);
+}
+
+DMOD_TEST_STEP(scan_parses_always_restart_policy)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
+
+    find_info_state_t state = { .unit_name = "always-restart", .found = false };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
+    DMOD_TEST_EXPECT_TRUE(state.found);
+    DMOD_TEST_EXPECT_EQ(state.info.restart_policy, LIBSYSTEMD_RESTART_ALWAYS);
+}
+
+DMOD_TEST_STEP(scan_falls_back_to_defaults_for_unrecognized_type_and_restart_values)
+{
+    /* "unknown-values.ini" sets type=forking and restart=on-success - neither
+     * is a recognized value, so both must fall back to their defaults
+     * (simple/no) rather than failing the parse or silently enabling restart
+     * supervision. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
+
+    find_info_state_t state = { .unit_name = "unknown-values", .found = false };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
+    DMOD_TEST_EXPECT_TRUE(state.found);
+    DMOD_TEST_EXPECT_EQ(state.info.type, LIBSYSTEMD_SERVICE_TYPE_SIMPLE);
+    DMOD_TEST_EXPECT_EQ(state.info.restart_policy, LIBSYSTEMD_RESTART_NO);
+}
+
 DMOD_TEST_STEP(notify_device_removed_forgets_a_pending_device)
 {
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
