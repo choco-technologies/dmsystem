@@ -161,12 +161,14 @@ start=getty@%name
 
 A driver that discovers devices at runtime (e.g. `dmtty` finding a serial
 port, `dmdevfs` noticing a new `/dev` node) calls
-`libsystemd_notify_device_added("tty", "tty1")` /
+`libsystemd_notify_device_added("tty", "tty1", "/dev/ttyS1")` /
 `libsystemd_notify_device_removed("tty", "tty1")` to report it; `libsystemd`
 substitutes `%name` in the matching rule and starts/stops the resulting unit
 (`getty@tty1` here) - instantiating it from a template on the fly if needed,
-via the same mechanism described above. Drivers are typically loaded (and
-start reporting devices) before `libsystemd_scan()`/`libsystemd_load_rules()`
+via the same mechanism described above, with the optional third argument
+substituted for `%v` in that template's own keys (`NULL` if not needed).
+Drivers are typically loaded (and start reporting devices) before
+`libsystemd_scan()`/`libsystemd_load_rules()`
 ever run, so a device reported early is remembered and retried automatically
 once both are in place, regardless of call order. See
 [`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#device-rules)

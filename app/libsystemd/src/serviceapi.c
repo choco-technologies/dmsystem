@@ -107,6 +107,7 @@ typedef struct
 {
     char* device_class;  //!< Device class as reported to libsystemd_notify_device_added(). Owned copy.
     char* device_name;   //!< Device name as reported to libsystemd_notify_device_added(). Owned copy.
+    char* user_value;    //!< Value as reported to libsystemd_notify_device_added(), substituted for `%v` on instantiation, or NULL if none was given. Owned copy.
 } libsystemd_device_t;
 
 /**
@@ -364,6 +365,7 @@ static void libsystemd_destroy_devices(dmlist_context_t* devices)
     {
         Dmod_Free(device->device_class);
         Dmod_Free(device->device_name);
+        Dmod_Free(device->user_value);
         Dmod_Free(device);
         device = (libsystemd_device_t*)dmlist_pop_front(devices);
     }
@@ -423,10 +425,13 @@ static int libsystemd_compare_device(const void* data1, const void* data2)
  *
  * @param device_class Device class to remember (must not be NULL).
  * @param device_name  Device name to remember (must not be NULL).
+ * @param user_value   Value to remember alongside the device, replayed as the
+ *                       `%v` substitution on a later retry (see
+ *                       libsystemd_replay_pending_devices()), or NULL if none was given.
  *
  * @return Nothing.
  */
-static void libsystemd_remember_device(const char* device_class, const char* device_name)
+static void libsystemd_remember_device(const char* device_class, const char* device_name, const char* user_value)
 {
     if (g_devices == NULL)
     {
@@ -451,10 +456,13 @@ static void libsystemd_remember_device(const char* device_class, const char* dev
 
     device->device_class = Dmod_StrDup(device_class);
     device->device_name = Dmod_StrDup(device_name);
-    if (device->device_class == NULL || device->device_name == NULL || !dmlist_push_back(g_devices, device))
+    device->user_value = (user_value != NULL) ? Dmod_StrDup(user_value) : NULL;
+    if (device->device_class == NULL || device->device_name == NULL || (user_value != NULL && device->user_value == NULL) ||
+        !dmlist_push_back(g_devices, device))
     {
         Dmod_Free(device->device_class);
         Dmod_Free(device->device_name);
+        Dmod_Free(device->user_value);
         Dmod_Free(device);
     }
 }
@@ -1560,29 +1568,37 @@ static char* libsystemd_build_unit_name(const char* prefix, const char* instance
  * @brief Expand systemd-style `%`-specifiers in a single string
  *
  * Recognized specifiers: `%i`/`%I` (instance name), `%p` (template prefix),
- * `%n` (full instantiated unit name, "<prefix>@<instance>"), `%%` (a literal
- * `%`). An unrecognized `%<char>` sequence (or a trailing `%` at the end of
- * the string) is copied through verbatim, unexpanded.
+ * `%n` (full instantiated unit name, "<prefix>@<instance>"), `%v` (caller-supplied
+ * user value, see @ref libsystemd_notify_device_added/@ref libsystemd_start_service),
+ * `%%` (a literal `%`). An unrecognized `%<char>` sequence (or a trailing `%`
+ * at the end of the string) is copied through verbatim, unexpanded.
  *
- * @param value    String to expand (must not be NULL).
- * @param prefix   Template prefix, substituted for `%p` (must not be NULL).
- * @param instance Instance name, substituted for `%i`/`%I` (must not be NULL).
- * @param unit_name Full "<prefix>@<instance>" unit name, substituted for `%n` (must not be NULL).
+ * @param value      String to expand (must not be NULL).
+ * @param prefix     Template prefix, substituted for `%p` (must not be NULL).
+ * @param instance   Instance name, substituted for `%i`/`%I` (must not be NULL).
+ * @param unit_name  Full "<prefix>@<instance>" unit name, substituted for `%n` (must not be NULL).
+ * @param user_value Caller-supplied value, substituted for `%v`, or NULL to expand `%v` to an empty string.
  *
  * @return Newly heap-allocated expanded string, owned by the caller (free
  *         with Dmod_Free()), or NULL if allocation failed.
  *
  * @par Example
  * @code
- * char* expanded = libsystemd_substitute_specifiers("--tty %i", "getty", "tty1", "getty@tty1");
+ * char* expanded = libsystemd_substitute_specifiers("--tty %i", "getty", "tty1", "getty@tty1", NULL);
  * // expanded == "--tty tty1"
  * @endcode
  */
-static char* libsystemd_substitute_specifiers(const char* value, const char* prefix, const char* instance, const char* unit_name)
+static char* libsystemd_substitute_specifiers(const char* value, const char* prefix, const char* instance, const char* unit_name, const char* user_value)
 {
+    if (user_value == NULL)
+    {
+        user_value = "";
+    }
+
     size_t prefix_len = strlen(prefix);
     size_t instance_len = strlen(instance);
     size_t unit_name_len = strlen(unit_name);
+    size_t user_value_len = strlen(user_value);
 
     size_t out_len = 0;
     for (const char* scan = value; *scan != '\0'; )
@@ -1591,10 +1607,11 @@ static char* libsystemd_substitute_specifiers(const char* value, const char* pre
         {
             switch (scan[1])
             {
-                case 'i': case 'I': out_len += instance_len; scan += 2; continue;
-                case 'p':           out_len += prefix_len;   scan += 2; continue;
-                case 'n':           out_len += unit_name_len; scan += 2; continue;
-                case '%':           out_len += 1;             scan += 2; continue;
+                case 'i': case 'I': out_len += instance_len;   scan += 2; continue;
+                case 'p':           out_len += prefix_len;     scan += 2; continue;
+                case 'n':           out_len += unit_name_len;  scan += 2; continue;
+                case 'v':           out_len += user_value_len; scan += 2; continue;
+                case '%':           out_len += 1;              scan += 2; continue;
                 default: break; /* unknown specifier: copied through as-is below */
             }
         }
@@ -1617,10 +1634,11 @@ static char* libsystemd_substitute_specifiers(const char* value, const char* pre
             size_t replacement_len = 0;
             switch (scan[1])
             {
-                case 'i': case 'I': replacement = instance;   replacement_len = instance_len;   break;
-                case 'p':           replacement = prefix;     replacement_len = prefix_len;     break;
-                case 'n':           replacement = unit_name;  replacement_len = unit_name_len;  break;
-                case '%':           replacement = "%";        replacement_len = 1;               break;
+                case 'i': case 'I': replacement = instance;    replacement_len = instance_len;   break;
+                case 'p':           replacement = prefix;      replacement_len = prefix_len;     break;
+                case 'n':           replacement = unit_name;   replacement_len = unit_name_len;  break;
+                case 'v':           replacement = user_value;  replacement_len = user_value_len; break;
+                case '%':           replacement = "%";         replacement_len = 1;              break;
                 default: break;
             }
 
@@ -1649,16 +1667,17 @@ static char* libsystemd_substitute_specifiers(const char* value, const char* pre
  * `set_pair_in_section()` in dmini - so this does not disturb key order/count
  * while iterating by index).
  *
- * @param ctx      Ini context to expand in place (must not be NULL).
- * @param prefix   Template prefix, forwarded to libsystemd_substitute_specifiers().
- * @param instance Instance name, forwarded to libsystemd_substitute_specifiers().
- * @param unit_name Full unit name, forwarded to libsystemd_substitute_specifiers().
+ * @param ctx        Ini context to expand in place (must not be NULL).
+ * @param prefix     Template prefix, forwarded to libsystemd_substitute_specifiers().
+ * @param instance   Instance name, forwarded to libsystemd_substitute_specifiers().
+ * @param unit_name  Full unit name, forwarded to libsystemd_substitute_specifiers().
+ * @param user_value Caller-supplied value, forwarded to libsystemd_substitute_specifiers() (may be NULL).
  *
  * @retval true  Every key was expanded successfully.
  * @retval false Allocation failed part-way through; @p ctx is left with
  *                whatever subset of keys had already been expanded.
  */
-static bool libsystemd_apply_specifiers(dmini_context_t ctx, const char* prefix, const char* instance, const char* unit_name)
+static bool libsystemd_apply_specifiers(dmini_context_t ctx, const char* prefix, const char* instance, const char* unit_name, const char* user_value)
 {
     int count = dmini_key_count(ctx, NULL);
 
@@ -1676,7 +1695,7 @@ static bool libsystemd_apply_specifiers(dmini_context_t ctx, const char* prefix,
             continue;
         }
 
-        char* expanded = libsystemd_substitute_specifiers(value, prefix, instance, unit_name);
+        char* expanded = libsystemd_substitute_specifiers(value, prefix, instance, unit_name, user_value);
         if (expanded == NULL)
         {
             return false;
@@ -1966,19 +1985,20 @@ static bool libsystemd_split_instance_name(const char* unit_name, char** out_pre
 /**
  * @brief Synthesize a service purely from a template, with no on-disk instance file
  *
- * Parses `<units_dir>/<prefix>@.ini` and expands `%i`/`%I`/`%p`/`%n`/`%%` for
- * the given @p instance, exactly like libsystemd_parse_dir() would for an
+ * Parses `<units_dir>/<prefix>@.ini` and expands `%i`/`%I`/`%p`/`%n`/`%v`/`%%`
+ * for the given @p instance, exactly like libsystemd_parse_dir() would for an
  * on-disk instance file - the difference is that no such file needs to
  * exist. This is the "systemctl start foo@bar" analog: unlike the directory
  * scan (which only starts instances that already have their own `*.ini`
  * file), this lets any instance name be started as long as its template
  * exists.
  *
- * @param units_dir Directory to look for "<prefix>@.ini" in (must not be NULL).
- * @param prefix    Template prefix, e.g. "getty" (must not be NULL).
- * @param instance  Instance name, e.g. "tty1" (must not be NULL).
- * @param service   Receives the newly allocated service on success, with
- *                    `unit_name` already set to "<prefix>@<instance>" (must not be NULL).
+ * @param units_dir  Directory to look for "<prefix>@.ini" in (must not be NULL).
+ * @param prefix     Template prefix, e.g. "getty" (must not be NULL).
+ * @param instance   Instance name, e.g. "tty1" (must not be NULL).
+ * @param user_value Caller-supplied value substituted for `%v`, or NULL to expand `%v` to an empty string.
+ * @param service    Receives the newly allocated service on success, with
+ *                     `unit_name` already set to "<prefix>@<instance>" (must not be NULL).
  *
  * @retval 0       `*service` is fully populated and owns its `unit_name`.
  * @retval -ENOMEM Allocation failed.
@@ -1987,7 +2007,7 @@ static bool libsystemd_split_instance_name(const char* unit_name, char** out_pre
  *                   from `dmini_parse_file` on the template (e.g.
  *                   `DMINI_ERR_FILE` if "<prefix>@.ini" does not exist).
  */
-static int libsystemd_instantiate_from_template(const char* units_dir, const char* prefix, const char* instance, libsystemd_service_t* service)
+static int libsystemd_instantiate_from_template(const char* units_dir, const char* prefix, const char* instance, const char* user_value, libsystemd_service_t* service)
 {
     char* template_path = libsystemd_build_template_path(units_dir, prefix);
     if (template_path == NULL)
@@ -2017,7 +2037,7 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
         return -ENOMEM;
     }
 
-    if (!libsystemd_apply_specifiers(ctx, prefix, instance, unit_name))
+    if (!libsystemd_apply_specifiers(ctx, prefix, instance, unit_name, user_value))
     {
         dmini_destroy(ctx);
         Dmod_Free(unit_name);
@@ -2052,13 +2072,14 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
  * other unit from then on (found by libsystemd_status()/libsystemd_stop_service()/
  * libsystemd_list(), and not re-instantiated on a later libsystemd_start_service() call).
  *
- * @param unit_name Unit name that was not found by libsystemd_find_service() (must not be NULL).
+ * @param unit_name  Unit name that was not found by libsystemd_find_service() (must not be NULL).
+ * @param user_value Caller-supplied value substituted for `%v` in the template's keys, or NULL.
  *
  * @return The newly instantiated and registered service, or NULL if
  *         @p unit_name is not template-shaped, no units directory is known
  *         yet, no matching template exists, or allocation failed.
  */
-static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char* unit_name)
+static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char* unit_name, const char* user_value)
 {
     if (g_units_dir == NULL || g_services == NULL || g_services->services == NULL)
     {
@@ -2073,7 +2094,7 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
     }
 
     libsystemd_service_t service = NULL;
-    int result = libsystemd_instantiate_from_template(g_units_dir, prefix, instance, &service);
+    int result = libsystemd_instantiate_from_template(g_units_dir, prefix, instance, user_value, &service);
 
     Dmod_Free(prefix);
     Dmod_Free(instance);
@@ -2299,7 +2320,7 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
         return true;
     }
 
-    result = libsystemd_start_service(target);
+    result = libsystemd_start_service(target, device->user_value);
     if (result != 0 && result != -EALREADY)
     {
         DMOD_LOG_WARN("Failed to start '%s' for device (class=%s, name=%s) (%d)\n", target, device->device_class, device->device_name, result);
@@ -2478,9 +2499,14 @@ int dmod_deinit(void)
  * libsystemd_stop_service()/libsystemd_list() sees it exactly like any unit
  * that was already on disk at the last libsystemd_scan().
  *
- * @param unit_name Unit name to start (e.g. "webserver", or "getty@tty1" for
- *                    a template instance), as derived by libsystemd_parse_dir()
- *                    from the ini file name, or synthesized as "<prefix>@<instance>".
+ * @param unit_name  Unit name to start (e.g. "webserver", or "getty@tty1" for
+ *                     a template instance), as derived by libsystemd_parse_dir()
+ *                     from the ini file name, or synthesized as "<prefix>@<instance>".
+ * @param user_value Optional caller-supplied value, substituted for `%v` in
+ *                     the template's keys if @p unit_name is instantiated
+ *                     on demand (see above) - pass NULL if not needed. Has no
+ *                     effect if @p unit_name already exists in the registry,
+ *                     since only on-demand instantiation expands specifiers.
  *
  * @retval 0         The service was found (or instantiated) and spawned successfully.
  * @retval -EINVAL   @p unit_name was NULL.
@@ -2495,13 +2521,13 @@ int dmod_deinit(void)
  * @par Example
  * @code
  * libsystemd_scan("/etc/services"); // only has getty@.ini, no getty@tty1.ini
- * int result = libsystemd_start_service("getty@tty1"); // instantiated on the fly
+ * int result = libsystemd_start_service("getty@tty1", NULL); // instantiated on the fly
  * if (result != 0) {
  *     Dmod_Printf("failed to start getty@tty1: %d\n", result);
  * }
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_name ))
+dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_name, const char* user_value ))
 {
     if (unit_name == NULL)
     {
@@ -2511,7 +2537,7 @@ dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_nam
     libsystemd_service_t service = libsystemd_find_service(g_services, unit_name);
     if (service == NULL)
     {
-        service = libsystemd_instantiate_service_on_demand(unit_name);
+        service = libsystemd_instantiate_service_on_demand(unit_name, user_value);
     }
     if (service == NULL)
     {
@@ -2822,6 +2848,11 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
  *                        sections (e.g. "tty") (must not be NULL).
  * @param device_name  Device name substituted for "%name" in the matching
  *                        rule's "start" template (e.g. "tty1") (must not be NULL).
+ * @param user_value   Optional caller-supplied value, substituted for `%v` in
+ *                        the resolved unit's own template keys if it is
+ *                        instantiated on demand (see libsystemd_start_service()) -
+ *                        pass NULL if not needed. Remembered alongside the
+ *                        device so a later replay (see below) still has it.
  *
  * @retval 0       The resolved unit was found (or instantiated from a template)
  *                   and spawned successfully.
@@ -2835,18 +2866,18 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
  *
  * @par Example
  * @code
- * libsystemd_notify_device_added("tty", "tty1"); // no rules loaded yet - remembered, returns -ENOENT
+ * libsystemd_notify_device_added("tty", "tty1", "/dev/ttyS1"); // no rules loaded yet - remembered, returns -ENOENT
  * libsystemd_load_rules("/etc/dmsystem/rules");  // [class=tty] start=getty@%name - replays it, starts "getty@tty1"
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* device_class, const char* device_name))
+dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* device_class, const char* device_name, const char* user_value))
 {
     if (device_class == NULL || device_name == NULL)
     {
         return -EINVAL;
     }
 
-    libsystemd_remember_device(device_class, device_name);
+    libsystemd_remember_device(device_class, device_name, user_value);
 
     char* target = NULL;
     int result = libsystemd_resolve_device_target(device_class, device_name, &target);
@@ -2855,7 +2886,7 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
         return result;
     }
 
-    result = libsystemd_start_service(target);
+    result = libsystemd_start_service(target, user_value);
     Dmod_Free(target);
 
     return result;
@@ -2985,7 +3016,7 @@ static int libsystemd_parse_unit_internal(const char* file_path, const char* tem
     if (prefix != NULL && instance != NULL)
     {
         char* unit_name = libsystemd_build_unit_name(prefix, instance);
-        if (unit_name == NULL || !libsystemd_apply_specifiers(ctx, prefix, instance, unit_name))
+        if (unit_name == NULL || !libsystemd_apply_specifiers(ctx, prefix, instance, unit_name, NULL))
         {
             Dmod_Free(unit_name);
             dmini_destroy(ctx);

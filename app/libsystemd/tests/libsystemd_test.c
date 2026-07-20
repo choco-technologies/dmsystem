@@ -164,12 +164,12 @@ DMOD_TEST_STEP(status_reports_known_unit)
 
 DMOD_TEST_STEP(start_service_rejects_unknown_unit)
 {
-    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("does-not-exist"), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("does-not-exist", NULL), -ENOENT);
 }
 
 DMOD_TEST_STEP(start_service_rejects_null_unit_name)
 {
-    DMOD_TEST_EXPECT_EQ(libsystemd_start_service(NULL), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service(NULL, NULL), -EINVAL);
 }
 
 DMOD_TEST_STEP(stop_service_rejects_unknown_unit)
@@ -261,7 +261,7 @@ DMOD_TEST_STEP(start_service_instantiates_template_on_demand)
      * still resolved from the template and registered, exactly like a unit
      * whose exec module can't be found at libsystemd_scan() time still ends
      * up in the registry (see stop_service_reports_not_running_for_unspawnable_unit). */
-    libsystemd_start_service("bare@one");
+    libsystemd_start_service("bare@one", NULL);
 
     DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@one", &status), 0);
 
@@ -274,7 +274,7 @@ DMOD_TEST_STEP(start_service_instantiates_template_on_demand)
      * pass can have injected other "bare@<instance>" entries left pending by
      * earlier test steps in this same process (see
      * notify_device_added_is_replayed_once_units_directory_is_scanned()). */
-    libsystemd_start_service("bare@one");
+    libsystemd_start_service("bare@one", NULL);
     unit_summary_t summary_again = { 0 };
     DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary_again), 0);
     DMOD_TEST_EXPECT_EQ(summary_again.count, summary.count);
@@ -285,7 +285,7 @@ DMOD_TEST_STEP(start_service_rejects_instance_with_no_matching_template)
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
 
     /* "other@.ini" does not exist anywhere in the scanned directory. */
-    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("other@one"), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("other@one", NULL), -ENOENT);
 }
 
 /**
@@ -330,8 +330,8 @@ DMOD_TEST_STEP(load_rules_parses_class_sections)
 
 DMOD_TEST_STEP(notify_device_added_rejects_null_arguments)
 {
-    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added(NULL, "tty1"), -EINVAL);
-    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("tty", NULL), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added(NULL, "tty1", NULL), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("tty", NULL, NULL), -EINVAL);
 }
 
 DMOD_TEST_STEP(notify_device_removed_rejects_null_arguments)
@@ -353,7 +353,7 @@ DMOD_TEST_STEP(notify_device_added_starts_unit_matching_class_rule)
      * libsystemd_start_service() instantiated+registered it from the
      * template, exactly like a direct libsystemd_start_service("bare@tty1")
      * call would (see start_service_instantiates_template_on_demand). */
-    libsystemd_notify_device_added("tty", "tty1");
+    libsystemd_notify_device_added("tty", "tty1", NULL);
 
     DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@tty1", &status), 0);
 }
@@ -363,7 +363,7 @@ DMOD_TEST_STEP(notify_device_added_rejects_unmatched_class)
     DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
 
     /* The rules fixture only defines "tty" and "net" classes. */
-    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("usb", "sda"), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("usb", "sda", NULL), -ENOENT);
 }
 
 DMOD_TEST_STEP(notify_device_removed_stops_unit_matching_class_rule)
@@ -371,7 +371,7 @@ DMOD_TEST_STEP(notify_device_removed_stops_unit_matching_class_rule)
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
     DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
 
-    libsystemd_notify_device_added("tty", "tty1"); /* registers "bare@tty1" */
+    libsystemd_notify_device_added("tty", "tty1", NULL); /* registers "bare@tty1" */
 
     /* Never actually running ("dmbare" isn't loadable), so this mirrors
      * stop_service_reports_not_running_for_unspawnable_unit: the point is
@@ -409,7 +409,7 @@ DMOD_TEST_STEP(notify_device_added_is_replayed_once_matching_rules_are_loaded)
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
 
     /* No rule for "replay-tty" exists anywhere yet - remembered, not started. */
-    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("replay-tty", "x1"), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("replay-tty", "x1", NULL), -ENOENT);
 
     libsystemd_service_status_t status;
     DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@x1", &status), -ENOENT);
@@ -428,7 +428,7 @@ DMOD_TEST_STEP(notify_device_added_is_replayed_once_units_directory_is_scanned)
      * "replay-scan" (which the rules below map to "bare@%name") finds a
      * matching rule but cannot instantiate a unit from it yet. */
     DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_REPLAY_SCAN_FIXTURES_DIR), 0);
-    DMOD_TEST_EXPECT_NE(libsystemd_notify_device_added("replay-scan", "x2"), 0);
+    DMOD_TEST_EXPECT_NE(libsystemd_notify_device_added("replay-scan", "x2", NULL), 0);
 
     libsystemd_service_status_t status;
     DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@x2", &status), -ENOENT);
@@ -529,7 +529,7 @@ DMOD_TEST_STEP(notify_device_removed_forgets_a_pending_device)
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
 
     /* No rule for "replay-forget" exists yet - remembered. */
-    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("replay-forget", "y1"), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("replay-forget", "y1", NULL), -ENOENT);
 
     /* Removed again before any matching rule was ever loaded - forgotten,
      * so it must not be resurrected by the load_rules() below. */
@@ -539,4 +539,59 @@ DMOD_TEST_STEP(notify_device_removed_forgets_a_pending_device)
 
     libsystemd_service_status_t status;
     DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@y1", &status), -ENOENT);
+}
+
+/**
+ * The following steps exercise the `%v` specifier ("bare@.ini" sets
+ * "description=%v", see tests/fixtures/template_only/bare@.ini) - the
+ * caller-supplied value threaded through libsystemd_start_service()'s and
+ * libsystemd_notify_device_added()'s optional last argument, all the way to
+ * on-demand template instantiation (libsystemd_instantiate_from_template()).
+ */
+
+DMOD_TEST_STEP(start_service_substitutes_user_value_specifier_when_provided)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    /* "dmbare" isn't loadable in this test environment (see
+     * start_service_instantiates_template_on_demand) - what matters here is
+     * that the instance was still resolved from the template with "%v"
+     * substituted for the given user_value. */
+    libsystemd_start_service("bare@withvalue", "/dev/ttyS9");
+
+    find_info_state_t state = { .unit_name = "bare@withvalue", .found = false };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
+    DMOD_TEST_EXPECT_TRUE(state.found);
+    DMOD_TEST_EXPECT_NOT_NULL(state.info.description);
+    DMOD_TEST_EXPECT_EQ(strcmp(state.info.description, "/dev/ttyS9"), 0);
+}
+
+DMOD_TEST_STEP(start_service_expands_user_value_specifier_to_empty_when_omitted)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    libsystemd_start_service("bare@novalue", NULL);
+
+    find_info_state_t state = { .unit_name = "bare@novalue", .found = false };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
+    DMOD_TEST_EXPECT_TRUE(state.found);
+    DMOD_TEST_EXPECT_NOT_NULL(state.info.description);
+    DMOD_TEST_EXPECT_EQ(strcmp(state.info.description, ""), 0);
+}
+
+DMOD_TEST_STEP(notify_device_added_substitutes_user_value_specifier)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
+
+    /* [class=tty] start=bare@%name (see LIBSYSTEMD_RULES_FIXTURES_DIR) resolves
+     * "tty"+"path1" to "bare@path1", instantiated from "bare@.ini" with the
+     * given user_value substituted for its "description=%v" key. */
+    libsystemd_notify_device_added("tty", "path1", "/dev/ttyPATH1");
+
+    find_info_state_t state = { .unit_name = "bare@path1", .found = false };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
+    DMOD_TEST_EXPECT_TRUE(state.found);
+    DMOD_TEST_EXPECT_NOT_NULL(state.info.description);
+    DMOD_TEST_EXPECT_EQ(strcmp(state.info.description, "/dev/ttyPATH1"), 0);
 }

@@ -70,7 +70,7 @@ exists) with `%i`/`%I`/`%p`/`%n`/`%%` expanded - see
 - `-ENOENT` - `dir_path` does not exist / cannot be opened.
 - `-ENOMEM` - allocation failed.
 
-### `libsystemd_start_service(const char* unit_name)`
+### `libsystemd_start_service(const char* unit_name, const char* user_value)`
 
 Looks `unit_name` up in the global registry and spawns it (`Dmod_SpawnModule`
 with the unit's `exec`/`argc`/`argv`/stream redirections).
@@ -80,7 +80,9 @@ and `<prefix>@.ini` exists in the last-scanned units directory, it is
 instantiated on the fly and added to the registry before being spawned - see
 [configuration.md](configuration.md#starting-an-instance-that-was-never-scanned).
 This is the only place template instantiation happens outside of
-`libsystemd_scan()`/`libsystemd_parse_dir()`.
+`libsystemd_scan()`/`libsystemd_parse_dir()`. `user_value` (may be `NULL`) is
+substituted for `%v` in the template's keys during that on-demand
+instantiation only - it has no effect if `unit_name` is already registered.
 
 If the unit's `restart` key is not `no`, also registers a `dmosi` process-exit
 callback on the newly spawned process (best-effort - silently skipped if
@@ -139,19 +141,21 @@ this is the only way loading rules can start/stop anything by itself.
 - `-ENOENT` - `rules_dir` does not exist / cannot be opened.
 - `-ENOMEM` - allocation failed.
 
-### `libsystemd_notify_device_added(const char* device_class, const char* device_name)`
+### `libsystemd_notify_device_added(const char* device_class, const char* device_name, const char* user_value)`
 
 Resolves `(device_class, device_name)` to a unit name via the rules loaded
 by the last `libsystemd_load_rules()` call (`%name` in the matching rule's
 `start` value is replaced with `device_name`) and starts it via
 `libsystemd_start_service()` - which instantiates it from a template on
-demand if it is not already registered.
+demand if it is not already registered, substituting `user_value` (may be
+`NULL`) for `%v` in that template's keys.
 
-The device is remembered regardless of whether it resolves/starts right now
-- drivers commonly report devices before `libsystemd_scan()`/
-`libsystemd_load_rules()` have run, so a non-zero return here does not mean
-the device was dropped; a later `libsystemd_scan()`/`libsystemd_load_rules()`
-call retries it. See [Devices reported before rules/units exist yet](configuration.md#devices-reported-before-rulesunits-exist-yet).
+The device (and `user_value`) is remembered regardless of whether it
+resolves/starts right now - drivers commonly report devices before
+`libsystemd_scan()`/`libsystemd_load_rules()` have run, so a non-zero return
+here does not mean the device was dropped; a later `libsystemd_scan()`/
+`libsystemd_load_rules()` call retries it, with the same `user_value`. See
+[Devices reported before rules/units exist yet](configuration.md#devices-reported-before-rulesunits-exist-yet).
 
 - `-EINVAL` - `device_class`/`device_name` was `NULL`.
 - `-ENOENT` - no rule currently matches `device_class`, or the resolved unit

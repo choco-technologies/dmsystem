@@ -181,7 +181,7 @@ static int cmd_start(const char* unit_name)
         return -EINVAL;
     }
 
-    int result = libsystemd_start_service(unit_name);
+    int result = libsystemd_start_service(unit_name, NULL);
     if (result != 0)
     {
         Dmod_Printf("service: failed to start '%s' (%d)\n", unit_name, result);
