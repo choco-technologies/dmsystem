@@ -289,6 +289,28 @@ DMOD_TEST_STEP(start_service_rejects_instance_with_no_matching_template)
 }
 
 /**
+ * Fixture directory: tests/fixtures/template_only_nested/, containing only
+ * "console/bare@.ini" - the exact shape produced by units organized into
+ * subdirectories (libsystemd_parse_dir_walk() scans recursively). Regression
+ * test for on-demand instantiation assuming a bare template always sits
+ * directly under the scanned units directory: it must resolve "<prefix>@.ini"
+ * in whatever (possibly nested) directory it was actually found in.
+ */
+#define LIBSYSTEMD_TEMPLATE_ONLY_NESTED_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/template_only_nested"
+
+DMOD_TEST_STEP(start_service_instantiates_template_found_in_nested_directory)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_NESTED_FIXTURES_DIR), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@one", &status), -ENOENT);
+
+    libsystemd_start_service("bare@one", NULL);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@one", &status), 0);
+}
+
+/**
  * Regression fixture for libsystemd_build_streams(): "all-streams.ini" sets
  * all four of stdin/stdout/stderr/stdlog at once. Its entries array must be
  * sized for 4 candidates, not 3 - a unit setting all four used to overflow

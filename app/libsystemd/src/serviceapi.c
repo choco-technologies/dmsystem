@@ -37,6 +37,22 @@ struct libsystemd_service
 };
 
 /**
+ * @brief One bare template ("<prefix>@.ini") discovered by libsystemd_parse_dir_walk()
+ *
+ * Templates are never parsed/started during the scan itself (see
+ * ::LIBSYSTEMD_UNIT_TEMPLATE), but their prefix -> directory mapping is kept
+ * so libsystemd_instantiate_service_on_demand() can later find "<prefix>@.ini"
+ * again even when it lives in a subdirectory of the scanned units directory
+ * rather than directly inside it (units are scanned recursively, but a
+ * template only applies within the subdirectory it was found in).
+ */
+typedef struct
+{
+    char* prefix;    //!< Template prefix, e.g. "console" for "console@.ini". Owned copy.
+    char* dir_path;  //!< Directory "<prefix>@.ini" was found in (may be nested under the scanned units directory). Owned copy.
+} libsystemd_template_t;
+
+/**
  * @brief Full definition of the opaque @ref libsystemd_services_t handle
  *
  * A thin wrapper around a dmlist of `libsystemd_service_t` pointers. Kept as its
@@ -46,6 +62,7 @@ struct libsystemd_service
 struct libsystemd_services
 {
     dmlist_context_t* services;         //!< List of `libsystemd_service_t` entries (list data pointers are libsystemd_service_t).
+    dmlist_context_t* templates;        //!< List of `libsystemd_template_t` entries for every bare template found by the scan.
 };
 
 /**
@@ -295,7 +312,36 @@ static void libsystemd_destroy_services(libsystemd_services_t services)
         dmlist_destroy(services->services);
     }
 
+    if (services->templates != NULL)
+    {
+        libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_pop_front(services->templates);
+        while (tmpl != NULL)
+        {
+            Dmod_Free(tmpl->prefix);
+            Dmod_Free(tmpl->dir_path);
+            Dmod_Free(tmpl);
+            tmpl = (libsystemd_template_t*)dmlist_pop_front(services->templates);
+        }
+        dmlist_destroy(services->templates);
+    }
+
     Dmod_Free(services);
+}
+
+/**
+ * @brief dmlist_find() comparator matching a template by its prefix
+ *
+ * @param data1 Node data, actually a `libsystemd_template_t*`.
+ * @param data2 Query data, actually a `const char*` prefix.
+ *
+ * @retval 0    The template's prefix equals the queried prefix.
+ * @retval <0/>0 `strcmp()` order, otherwise.
+ */
+static int libsystemd_compare_template_by_prefix(const void* data1, const void* data2)
+{
+    const libsystemd_template_t* tmpl = (const libsystemd_template_t*)data1;
+    const char* prefix = (const char*)data2;
+    return strcmp(tmpl->prefix, prefix);
 }
 
 /**
@@ -762,6 +808,8 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
         return -ENOSYS;
     }
 
+    DMOD_LOG_INFO("Starting service '%s'\n", service->unit_name);
+
     const Dmod_StreamRedirections_t* streams = (service->streams.Count > 0) ? &service->streams : NULL;
     int spawn_result = Dmod_SpawnModule(service->exec, service->argc, service->argv, streams);
     if (spawn_result < 0)
@@ -930,6 +978,8 @@ static int libsystemd_stop_service_internal(libsystemd_service_t service)
         }
         service->exit_callback_handle = NULL;
     }
+
+    DMOD_LOG_INFO("Stopping service '%s'\n", service->unit_name);
 
     int result = dmosi_process_kill(process, 0);
     if (result != 0)
@@ -2093,11 +2143,15 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
  * Called from libsystemd_start_service() when @p unit_name isn't already
  * registered. If @p unit_name is "<prefix>@<instance>"-shaped
  * (libsystemd_split_instance_name()) and a units directory is known (@ref
- * g_units_dir, set by the last successful libsystemd_scan()), tries to
- * instantiate it from "<prefix>@.ini" (libsystemd_instantiate_from_template())
- * and, on success, adds it to @ref g_services so it behaves exactly like any
- * other unit from then on (found by libsystemd_status()/libsystemd_stop_service()/
- * libsystemd_list(), and not re-instantiated on a later libsystemd_start_service() call).
+ * g_units_dir, set by the last successful libsystemd_scan()), looks up
+ * "<prefix>" in @ref g_services's template registry (populated by
+ * libsystemd_parse_dir_walk() with the actual, possibly nested, directory
+ * "<prefix>@.ini" was found in - the scan is recursive, so that directory is
+ * not necessarily @ref g_units_dir itself) and, if found, instantiates it
+ * (libsystemd_instantiate_from_template()) and adds it to @ref g_services so
+ * it behaves exactly like any other unit from then on (found by
+ * libsystemd_status()/libsystemd_stop_service()/libsystemd_list(), and not
+ * re-instantiated on a later libsystemd_start_service() call).
  *
  * @param unit_name  Unit name that was not found by libsystemd_find_service() (must not be NULL).
  * @param user_value Caller-supplied value substituted for `%v` in the template's keys, or NULL.
@@ -2108,7 +2162,7 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
  */
 static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char* unit_name, const char* user_value)
 {
-    if (g_units_dir == NULL || g_services == NULL || g_services->services == NULL)
+    if (g_units_dir == NULL || g_services == NULL || g_services->services == NULL || g_services->templates == NULL)
     {
         return NULL;
     }
@@ -2120,8 +2174,16 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
         return NULL;
     }
 
+    libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_find(g_services->templates, prefix, libsystemd_compare_template_by_prefix);
+    if (tmpl == NULL)
+    {
+        Dmod_Free(prefix);
+        Dmod_Free(instance);
+        return NULL;
+    }
+
     libsystemd_service_t service = NULL;
-    int result = libsystemd_instantiate_from_template(g_units_dir, prefix, instance, user_value, &service);
+    int result = libsystemd_instantiate_from_template(tmpl->dir_path, prefix, instance, user_value, &service);
 
     Dmod_Free(prefix);
     Dmod_Free(instance);
@@ -2160,6 +2222,8 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
  */
 static void libsystemd_parse_rules_file(const char* file_path, dmlist_context_t* rules)
 {
+    DMOD_LOG_INFO("Analyzing rules file '%s'\n", file_path);
+
     dmini_context_t ctx = dmini_create();
     if (ctx == NULL)
     {
@@ -2273,6 +2337,7 @@ static int libsystemd_parse_rules_dir_walk(const char* rules_dir, dmlist_context
             char* file_path = libsystemd_join_path(rules_dir, entry->name);
             if (file_path != NULL)
             {
+                DMOD_LOG_INFO("Detected rules file '%s'\n", file_path);
                 libsystemd_parse_rules_file(file_path, rules);
                 Dmod_Free(file_path);
             }
@@ -2392,6 +2457,8 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
 
     libsystemd_device_t* device = (libsystemd_device_t*)data;
 
+    DMOD_LOG_INFO("Replaying remembered device (class=%s, name=%s)\n", device->device_class, device->device_name);
+
     char* target = NULL;
     int result = libsystemd_resolve_device_target(device->device_class, device->device_name, &target);
     if (result != 0)
@@ -2468,9 +2535,10 @@ static int libsystemd_serviceapi_init(void)
     }
 
     services->services = dmlist_create(DMOD_MODULE_NAME);
-    if (services->services == NULL)
+    services->templates = dmlist_create(DMOD_MODULE_NAME);
+    if (services->services == NULL || services->templates == NULL)
     {
-        Dmod_Free(services);
+        libsystemd_destroy_services(services);
         return -ENOMEM;
     }
 
@@ -2803,6 +2871,8 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
         return -EINVAL;
     }
 
+    DMOD_LOG_INFO("Starting scan of units directory '%s'\n", path);
+
     int result = libsystemd_serviceapi_init();
     if (result != 0)
     {
@@ -2888,6 +2958,8 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
         return -EINVAL;
     }
 
+    DMOD_LOG_INFO("Starting scan of rules directory '%s'\n", rules_dir);
+
     dmlist_context_t* parsed = NULL;
     int result = libsystemd_parse_rules_dir(rules_dir, &parsed);
     if (result != 0)
@@ -2956,6 +3028,8 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
         return -EINVAL;
     }
 
+    DMOD_LOG_INFO("Device added (class=%s, name=%s)\n", device_class, device_name);
+
     libsystemd_remember_device(device_class, device_name, user_value);
 
     char* target = NULL;
@@ -3008,6 +3082,8 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* d
     {
         return -EINVAL;
     }
+
+    DMOD_LOG_INFO("Device removed (class=%s, name=%s)\n", device_class, device_name);
 
     libsystemd_forget_device(device_class, device_name);
 
@@ -3200,11 +3276,31 @@ static int libsystemd_parse_dir_walk(const char* dir_path, libsystemd_services_t
 
         if (libsystemd_has_ini_extension(entry->name))
         {
+            DMOD_LOG_INFO("Detected unit file '%s'\n", entry->name);
+
             char* prefix = NULL;
             char* instance = NULL;
             libsystemd_unit_kind_t kind = libsystemd_classify_unit_file(entry->name, &prefix, &instance);
 
-            if (kind != LIBSYSTEMD_UNIT_TEMPLATE)
+            if (kind == LIBSYSTEMD_UNIT_TEMPLATE)
+            {
+                libsystemd_template_t* tmpl = Dmod_Malloc(sizeof(libsystemd_template_t));
+                if (tmpl != NULL)
+                {
+                    tmpl->prefix = prefix;
+                    tmpl->dir_path = Dmod_StrDup(dir_path);
+                    if (tmpl->dir_path == NULL || !dmlist_push_back(services->templates, tmpl))
+                    {
+                        Dmod_Free(tmpl->dir_path);
+                        Dmod_Free(tmpl);
+                    }
+                    else
+                    {
+                        prefix = NULL; /* ownership moved into tmpl */
+                    }
+                }
+            }
+            else
             {
                 char* file_path = libsystemd_join_path(dir_path, entry->name);
                 if (file_path != NULL)
@@ -3306,9 +3402,10 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, li
     }
 
     new_services->services = dmlist_create(DMOD_MODULE_NAME);
-    if (new_services->services == NULL)
+    new_services->templates = dmlist_create(DMOD_MODULE_NAME);
+    if (new_services->services == NULL || new_services->templates == NULL)
     {
-        Dmod_Free(new_services);
+        libsystemd_destroy_services(new_services);
         return -ENOMEM;
     }
 
