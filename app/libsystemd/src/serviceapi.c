@@ -1343,6 +1343,33 @@ static bool libsystemd_has_ini_extension(const char* file_name)
 }
 
 /**
+ * @brief Check whether a file name ends in the ".ini" or ".rules" extension (case-sensitive)
+ *
+ * Rule files accept both extensions - ".ini" for consistency with unit files,
+ * ".rules" (the udev-style convention) as an alternative some deployments
+ * prefer. Used only for scanning a rules directory; unit files still only
+ * accept ".ini" (libsystemd_has_ini_extension()).
+ *
+ * @param file_name Bare file name to check (e.g. "devices.rules"), must not be NULL.
+ *
+ * @retval true  @p file_name ends in ".ini" (libsystemd_has_ini_extension()) or is
+ *                longer than ".rules" and ends with it.
+ * @retval false Otherwise (including a name that is exactly ".rules").
+ *
+ * @par Example
+ * @code
+ * libsystemd_has_rules_extension("devices.rules"); // true
+ * libsystemd_has_rules_extension("devices.ini");   // true
+ * libsystemd_has_rules_extension("README.md");     // false
+ * @endcode
+ */
+static bool libsystemd_has_rules_extension(const char* file_name)
+{
+    size_t len = strlen(file_name);
+    return libsystemd_has_ini_extension(file_name) || ((len > 6) && (strcmp(file_name + len - 6, ".rules") == 0));
+}
+
+/**
  * @brief Derive a unit name from a ".ini" file name by stripping the extension
  *
  * @param file_name Bare file name to derive from (e.g. "webserver.ini"); must
@@ -2114,7 +2141,7 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
 }
 
 /**
- * @brief Parse one rules ".ini" file's "[class=...]" sections into @p rules
+ * @brief Parse one rules file's (".ini" or ".rules", same INI syntax either way) "[class=...]" sections into @p rules
  *
  * Every section named `class=<something>` (e.g. `[class=tty]`) contributes
  * one `libsystemd_rule_t` to @p rules, built from that section's "start" key.
@@ -2124,7 +2151,7 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
  * at all is logged via DMOD_LOG_WARN() and skipped, same as an unparseable
  * unit file in libsystemd_parse_dir().
  *
- * @param file_path Path to the rules ".ini" file to parse (must not be NULL).
+ * @param file_path Path to the rules file to parse (must not be NULL).
  * @param rules     Registry to append newly parsed rules to (must not be NULL, already created).
  *
  * @return Nothing - failures (parse errors, individual allocation failures)
@@ -2191,21 +2218,23 @@ static void libsystemd_parse_rules_file(const char* file_path, dmlist_context_t*
 }
 
 /**
- * @brief Parse every ".ini" file in a directory into a newly allocated rules registry
+ * @brief Recursively walk one directory, parsing every ".ini"/".rules" file into @p rules
  *
- * The rules analog of libsystemd_parse_dir(): opens @p rules_dir and calls
- * libsystemd_parse_rules_file() on every entry ending in ".ini"
- * (libsystemd_has_ini_extension()). Subdirectories and non-".ini" entries
- * are ignored, same as for a units directory.
+ * Worker behind libsystemd_parse_rules_dir(): opens @p rules_dir and, for
+ * each entry, either walks a subdirectory (other than "." / "..")
+ * recursively, or calls libsystemd_parse_rules_file() on an entry ending in
+ * ".ini" or ".rules" (libsystemd_has_rules_extension()).
  *
- * @param rules_dir Directory to scan (e.g. "/etc/dmsystem/rules").
- * @param out_rules Receives the newly allocated (possibly empty) registry on success (must not be NULL).
+ * @param rules_dir Directory to scan (recursively).
+ * @param rules     Registry to append parsed rules to (must already be allocated).
  *
- * @retval 0       `*out_rules` now holds every rule successfully parsed from @p rules_dir.
+ * @retval 0       @p rules_dir was scanned (possibly zero rules were found/parsed).
  * @retval -ENOENT @p rules_dir does not exist / cannot be opened.
- * @retval -ENOMEM Allocation of the registry or its underlying dmlist failed.
+ *
+ * @note A subdirectory that fails to open is logged via DMOD_LOG_WARN() and
+ *       skipped - one bad subdirectory must not abort the whole scan.
  */
-static int libsystemd_parse_rules_dir(const char* rules_dir, dmlist_context_t** out_rules)
+static int libsystemd_parse_rules_dir_walk(const char* rules_dir, dmlist_context_t* rules)
 {
     void* dir = Dmod_OpenDir(rules_dir);
     if (dir == NULL)
@@ -2213,17 +2242,33 @@ static int libsystemd_parse_rules_dir(const char* rules_dir, dmlist_context_t** 
         return -ENOENT;
     }
 
-    dmlist_context_t* rules = dmlist_create(DMOD_MODULE_NAME);
-    if (rules == NULL)
-    {
-        Dmod_CloseDir(dir);
-        return -ENOMEM;
-    }
-
     const Dmod_DirEntry_t* entry = Dmod_ReadDirEx(dir);
     while (entry != NULL)
     {
-        if (libsystemd_has_ini_extension(entry->name))
+        if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0)
+        {
+            entry = Dmod_ReadDirEx(dir);
+            continue;
+        }
+
+        if (entry->type == Dmod_DirEntryType_Dir)
+        {
+            char* sub_dir_path = libsystemd_join_path(rules_dir, entry->name);
+            if (sub_dir_path != NULL)
+            {
+                int result = libsystemd_parse_rules_dir_walk(sub_dir_path, rules);
+                if (result != 0)
+                {
+                    DMOD_LOG_WARN("Failed to scan rules subdirectory '%s' (%d)\n", sub_dir_path, result);
+                }
+                Dmod_Free(sub_dir_path);
+            }
+
+            entry = Dmod_ReadDirEx(dir);
+            continue;
+        }
+
+        if (libsystemd_has_rules_extension(entry->name))
         {
             char* file_path = libsystemd_join_path(rules_dir, entry->name);
             if (file_path != NULL)
@@ -2237,6 +2282,40 @@ static int libsystemd_parse_rules_dir(const char* rules_dir, dmlist_context_t** 
     }
 
     Dmod_CloseDir(dir);
+
+    return 0;
+}
+
+/**
+ * @brief Parse every ".ini"/".rules" file in a directory tree into a newly allocated rules registry
+ *
+ * The rules analog of libsystemd_parse_dir(): recursively walks @p rules_dir
+ * (libsystemd_parse_rules_dir_walk()) and calls libsystemd_parse_rules_file()
+ * on every entry ending in ".ini" or ".rules" (libsystemd_has_rules_extension())
+ * found anywhere in the tree. Any other entry is ignored, same as for a units
+ * directory.
+ *
+ * @param rules_dir Directory to scan, recursively (e.g. "/etc/dmsystem/rules").
+ * @param out_rules Receives the newly allocated (possibly empty) registry on success (must not be NULL).
+ *
+ * @retval 0       `*out_rules` now holds every rule successfully parsed from @p rules_dir.
+ * @retval -ENOENT @p rules_dir does not exist / cannot be opened.
+ * @retval -ENOMEM Allocation of the registry or its underlying dmlist failed.
+ */
+static int libsystemd_parse_rules_dir(const char* rules_dir, dmlist_context_t** out_rules)
+{
+    dmlist_context_t* rules = dmlist_create(DMOD_MODULE_NAME);
+    if (rules == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    int result = libsystemd_parse_rules_dir_walk(rules_dir, rules);
+    if (result != 0)
+    {
+        libsystemd_destroy_rules(rules);
+        return result;
+    }
 
     *out_rules = rules;
 
@@ -2761,9 +2840,9 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
 /**
  * @brief Load device-class rules from a directory, replacing any previously loaded rules
  *
- * Parses every ".ini" file directly inside @p rules_dir
- * (libsystemd_parse_rules_dir()) for `[class=<device-class>]` sections with a
- * "start" key, e.g.:
+ * Parses every ".ini"/".rules" file found anywhere under @p rules_dir,
+ * recursively (libsystemd_parse_rules_dir()), for `[class=<device-class>]`
+ * sections with a "start" key, e.g.:
  *
  * @code
  * [class=tty]
@@ -2787,7 +2866,7 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
  * before services are), so this is what makes a device reported early still
  * end up started once its rule is finally loaded.
  *
- * @param rules_dir Directory to scan for rule ".ini" files (e.g. "/etc/dmsystem/rules").
+ * @param rules_dir Directory to scan, recursively, for rule ".ini"/".rules" files (e.g. "/etc/dmsystem/rules").
  *
  * @retval 0       Rules were (re-)loaded; @ref g_rules now reflects @p rules_dir only
  *                   (any previously loaded rules, from a different directory or the
@@ -3068,11 +3147,108 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, 
 }
 
 /**
- * @brief Parse every ".ini" unit file in a directory into a newly allocated registry
+ * @brief Recursively walk one directory, parsing every ".ini" unit file into @p services
  *
- * Opens @p dir_path and, for each entry whose name ends in ".ini"
- * (libsystemd_has_ini_extension()), classifies it via
- * libsystemd_classify_unit_file():
+ * Worker behind libsystemd_parse_dir(): opens @p dir_path and, for each entry:
+ * - a subdirectory (other than "." / "..") is walked recursively, so unit
+ *   files may be organized into nested directories under the units directory;
+ * - a ".ini" file is parsed exactly as documented on libsystemd_parse_dir().
+ *
+ * @param dir_path Directory to scan (recursively).
+ * @param services Registry to append parsed units to (must already be allocated).
+ *
+ * @retval 0       @p dir_path was scanned (possibly zero units were found/parsed).
+ * @retval -ENOENT @p dir_path does not exist / cannot be opened.
+ *
+ * @note A subdirectory that fails to open is logged via DMOD_LOG_WARN() and
+ *       skipped, exactly like a unit file that fails to parse - one bad
+ *       subdirectory must not abort the whole scan.
+ */
+static int libsystemd_parse_dir_walk(const char* dir_path, libsystemd_services_t services)
+{
+    void* dir = Dmod_OpenDir(dir_path);
+    if (dir == NULL)
+    {
+        return -ENOENT;
+    }
+
+    const Dmod_DirEntry_t* entry = Dmod_ReadDirEx(dir);
+    while (entry != NULL)
+    {
+        if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0)
+        {
+            entry = Dmod_ReadDirEx(dir);
+            continue;
+        }
+
+        if (entry->type == Dmod_DirEntryType_Dir)
+        {
+            char* sub_dir_path = libsystemd_join_path(dir_path, entry->name);
+            if (sub_dir_path != NULL)
+            {
+                int result = libsystemd_parse_dir_walk(sub_dir_path, services);
+                if (result != 0)
+                {
+                    DMOD_LOG_WARN("Failed to scan units subdirectory '%s' (%d)\n", sub_dir_path, result);
+                }
+                Dmod_Free(sub_dir_path);
+            }
+
+            entry = Dmod_ReadDirEx(dir);
+            continue;
+        }
+
+        if (libsystemd_has_ini_extension(entry->name))
+        {
+            char* prefix = NULL;
+            char* instance = NULL;
+            libsystemd_unit_kind_t kind = libsystemd_classify_unit_file(entry->name, &prefix, &instance);
+
+            if (kind != LIBSYSTEMD_UNIT_TEMPLATE)
+            {
+                char* file_path = libsystemd_join_path(dir_path, entry->name);
+                if (file_path != NULL)
+                {
+                    char* template_path = (kind == LIBSYSTEMD_UNIT_INSTANCE) ? libsystemd_build_template_path(dir_path, prefix) : NULL;
+
+                    libsystemd_service_t service = NULL;
+                    int result = libsystemd_parse_unit_internal(file_path, template_path, prefix, instance, &service);
+                    if (result == 0)
+                    {
+                        service->unit_name = libsystemd_make_unit_name(entry->name);
+                        if (service->unit_name == NULL || !dmlist_push_back(services->services, service))
+                        {
+                            libsystemd_destroy_service(service);
+                        }
+                    }
+                    else
+                    {
+                        DMOD_LOG_WARN("Failed to parse service file '%s' (%d)\n", file_path, result);
+                    }
+
+                    Dmod_Free(template_path);
+                    Dmod_Free(file_path);
+                }
+            }
+
+            Dmod_Free(prefix);
+            Dmod_Free(instance);
+        }
+
+        entry = Dmod_ReadDirEx(dir);
+    }
+
+    Dmod_CloseDir(dir);
+
+    return 0;
+}
+
+/**
+ * @brief Parse every ".ini" unit file in a directory tree into a newly allocated registry
+ *
+ * Recursively walks @p dir_path (libsystemd_parse_dir_walk()) and, for each
+ * entry whose name ends in ".ini" (libsystemd_has_ini_extension()) anywhere
+ * in the tree, classifies it via libsystemd_classify_unit_file():
  * - ::LIBSYSTEMD_UNIT_TEMPLATE (e.g. "getty@.ini") is skipped entirely - a
  *   bare template is never parsed or started on its own, exactly like
  *   `systemctl start foo@.service` is refused in real systemd.
@@ -3082,19 +3258,22 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, 
  *   defaults first and `%i`/`%I`/`%p`/`%n`/`%%` specifiers are expanded, so a
  *   near-empty instance file can inherit everything from the template and
  *   override only what differs (see [configuration.md](../docs/configuration.md#templates)).
+ *   A template is only merged with an instance found in the very same
+ *   subdirectory - templates do not apply across subdirectory boundaries.
  *
  * On success, sets the resulting service's `unit_name`
  * (libsystemd_make_unit_name() - "getty@tty1.ini" becomes "getty@tty1") and
- * appends it to the new registry's list. Files that fail to parse are
- * logged via DMOD_LOG_WARN() and skipped rather than aborting the whole scan.
+ * appends it to the new registry's list. Files that fail to parse, and
+ * subdirectories that fail to open, are logged via DMOD_LOG_WARN() and
+ * skipped rather than aborting the whole scan.
  * Does not resolve `starting_order`, sort, or start anything - see
  * libsystemd_scan() for the full pipeline built on top of this function.
  *
- * @param dir_path Directory to scan (e.g. "/etc/services").
+ * @param dir_path Directory to scan, recursively (e.g. "/etc/services").
  * @param services Receives the newly allocated registry on success (must not be NULL).
  *
- * @retval 0       `*services` now holds every successfully parsed ".ini" file in
- *                   @p dir_path (possibly zero services if none were found/parsed).
+ * @retval 0       `*services` now holds every successfully parsed ".ini" file found
+ *                   under @p dir_path (possibly zero services if none were found/parsed).
  * @retval -EINVAL @p dir_path or @p services was NULL.
  * @retval -ENOENT @p dir_path does not exist / cannot be opened.
  * @retval -ENOMEM Allocation of the registry or its underlying dmlist failed.
@@ -3120,16 +3299,9 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, li
         return -EINVAL;
     }
 
-    void* dir = Dmod_OpenDir(dir_path);
-    if (dir == NULL)
-    {
-        return -ENOENT;
-    }
-
     libsystemd_services_t new_services = Dmod_Malloc(sizeof(struct libsystemd_services));
     if (new_services == NULL)
     {
-        Dmod_CloseDir(dir);
         return -ENOMEM;
     }
 
@@ -3137,54 +3309,15 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, li
     if (new_services->services == NULL)
     {
         Dmod_Free(new_services);
-        Dmod_CloseDir(dir);
         return -ENOMEM;
     }
 
-    const Dmod_DirEntry_t* entry = Dmod_ReadDirEx(dir);
-    while (entry != NULL)
+    int result = libsystemd_parse_dir_walk(dir_path, new_services);
+    if (result != 0)
     {
-        if (libsystemd_has_ini_extension(entry->name))
-        {
-            char* prefix = NULL;
-            char* instance = NULL;
-            libsystemd_unit_kind_t kind = libsystemd_classify_unit_file(entry->name, &prefix, &instance);
-
-            if (kind != LIBSYSTEMD_UNIT_TEMPLATE)
-            {
-                char* file_path = libsystemd_join_path(dir_path, entry->name);
-                if (file_path != NULL)
-                {
-                    char* template_path = (kind == LIBSYSTEMD_UNIT_INSTANCE) ? libsystemd_build_template_path(dir_path, prefix) : NULL;
-
-                    libsystemd_service_t service = NULL;
-                    int result = libsystemd_parse_unit_internal(file_path, template_path, prefix, instance, &service);
-                    if (result == 0)
-                    {
-                        service->unit_name = libsystemd_make_unit_name(entry->name);
-                        if (service->unit_name == NULL || !dmlist_push_back(new_services->services, service))
-                        {
-                            libsystemd_destroy_service(service);
-                        }
-                    }
-                    else
-                    {
-                        DMOD_LOG_WARN("Failed to parse service file '%s' (%d)\n", file_path, result);
-                    }
-
-                    Dmod_Free(template_path);
-                    Dmod_Free(file_path);
-                }
-            }
-
-            Dmod_Free(prefix);
-            Dmod_Free(instance);
-        }
-
-        entry = Dmod_ReadDirEx(dir);
+        libsystemd_destroy_services(new_services);
+        return result;
     }
-
-    Dmod_CloseDir(dir);
 
     *services = new_services;
 

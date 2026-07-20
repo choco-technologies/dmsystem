@@ -128,8 +128,8 @@ order), stopping early if `visitor` returns `false`.
 
 ### `libsystemd_load_rules(const char* rules_dir)`
 
-Loads device-class rules from every `*.ini` file directly inside
-`rules_dir` - see [configuration.md](configuration.md#device-rules). Fully
+Loads device-class rules from every `*.ini`/`*.rules` file found anywhere
+under `rules_dir`, recursively - see [configuration.md](configuration.md#device-rules). Fully
 independent of `libsystemd_scan()`. Replaces any previously loaded rules
 (from this or a different directory) - same "full reload" semantics as
 `libsystemd_scan()`. Afterwards, retries every device still remembered from

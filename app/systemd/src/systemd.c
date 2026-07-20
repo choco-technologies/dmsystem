@@ -12,13 +12,15 @@ static void print_usage(const char* program_name)
 {
     Dmod_Printf("Usage: %s <units-directory> [rules-directory]\n", program_name);
     Dmod_Printf("\n");
-    Dmod_Printf("Scans <units-directory> for \"*.ini\" unit files, resolves their\n");
-    Dmod_Printf("\"requires\"/\"after\" dependency order, and starts every unit found\n");
-    Dmod_Printf("there in that order (see libsystemd_scan()).\n");
+    Dmod_Printf("Recursively scans <units-directory> (including subdirectories) for\n");
+    Dmod_Printf("\"*.ini\" unit files, resolves their \"requires\"/\"after\" dependency\n");
+    Dmod_Printf("order, and starts every unit found there in that order (see\n");
+    Dmod_Printf("libsystemd_scan()).\n");
     Dmod_Printf("\n");
-    Dmod_Printf("If [rules-directory] is given, it is scanned for \"*.ini\" device-class\n");
-    Dmod_Printf("rule files, which are loaded so devices reported at runtime can be\n");
-    Dmod_Printf("started/stopped automatically (see libsystemd_load_rules()).\n");
+    Dmod_Printf("If [rules-directory] is given, it is recursively scanned (including\n");
+    Dmod_Printf("subdirectories) for \"*.ini\"/\"*.rules\" device-class rule files, which\n");
+    Dmod_Printf("are loaded so devices reported at runtime can be started/stopped\n");
+    Dmod_Printf("automatically (see libsystemd_load_rules()).\n");
     Dmod_Printf("\n");
     Dmod_Printf("Options:\n");
     Dmod_Printf("  -h, --help    Show this help message and exit\n");

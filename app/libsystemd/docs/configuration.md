@@ -15,8 +15,11 @@ This happens in `libsystemd_parse_dir()`, not in `libsystemd_parse_file()` -
 a service parsed directly via `libsystemd_parse_file()` has no unit name
 until its caller assigns one.
 
-Only files directly inside the scanned directory and ending in `.ini` are
-considered; subdirectories and everything else are silently skipped.
+The scanned directory is walked recursively: every `.ini` file anywhere
+under it is considered, no matter how deeply nested in subdirectories.
+Templates (`<prefix>@.ini`) are only merged with instances found in the same
+subdirectory - they do not apply across subdirectory boundaries. Everything
+else (non-`.ini` files) is silently skipped.
 
 ## Keys
 
@@ -197,8 +200,9 @@ rest of the registry from starting.
 
 `libsystemd_load_rules(rules_dir)` is a separate entry point from
 `libsystemd_scan()`/`libsystemd_parse_dir()` - it loads *rules*, not units,
-from every `*.ini` file directly inside `rules_dir`. A rules file has one or
-more `[class=<device-class>]` sections, each with a `start` key:
+from every `*.ini`/`*.rules` file found anywhere under `rules_dir`,
+recursively. A rules file has one or more `[class=<device-class>]` sections,
+each with a `start` key:
 
 ```ini
 # rules/devices.ini
