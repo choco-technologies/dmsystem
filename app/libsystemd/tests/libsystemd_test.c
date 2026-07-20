@@ -231,10 +231,12 @@ DMOD_TEST_STEP(scan_does_not_start_a_bare_template_without_instances)
 {
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
 
-    unit_summary_t summary = { 0 };
-    DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary), 0);
-    DMOD_TEST_EXPECT_EQ(summary.count, 0);
-
+    /* Not asserting the registry is completely empty here: libsystemd_scan()
+     * also replays any device reported (and still pending) from an earlier
+     * test step in this same process (libsystemd_replay_pending_devices()) -
+     * see notify_device_added_is_replayed_once_units_directory_is_scanned().
+     * The actual invariant under test is that a bare template contributes
+     * nothing *on its own* via the directory scan. */
     libsystemd_service_status_t status;
     DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@", &status), -ENOENT);
 }
@@ -265,14 +267,17 @@ DMOD_TEST_STEP(start_service_instantiates_template_on_demand)
 
     unit_summary_t summary = { 0 };
     DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary), 0);
-    DMOD_TEST_EXPECT_EQ(summary.count, 1);
 
     /* A second start_service() call finds the now-registered instance
-     * directly - it must not be instantiated (or registered) twice. */
+     * directly - it must not be instantiated (or registered) twice. Compared
+     * as a delta (not an absolute count): libsystemd_scan()'s device-replay
+     * pass can have injected other "bare@<instance>" entries left pending by
+     * earlier test steps in this same process (see
+     * notify_device_added_is_replayed_once_units_directory_is_scanned()). */
     libsystemd_start_service("bare@one");
     unit_summary_t summary_again = { 0 };
     DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary_again), 0);
-    DMOD_TEST_EXPECT_EQ(summary_again.count, 1);
+    DMOD_TEST_EXPECT_EQ(summary_again.count, summary.count);
 }
 
 DMOD_TEST_STEP(start_service_rejects_instance_with_no_matching_template)
@@ -297,4 +302,158 @@ DMOD_TEST_STEP(scan_parses_unit_with_all_four_stream_keys)
 
     libsystemd_service_status_t status;
     DMOD_TEST_EXPECT_EQ(libsystemd_status("all-streams", &status), 0);
+}
+
+/**
+ * Fixture directory: tests/fixtures/rules/, containing "devices.ini" with
+ * "[class=tty] start=bare@%name" and "[class=net] start=other@%name". "bare"
+ * matches the "bare@.ini" template in LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR,
+ * so scanning that as the units directory before loading these rules lets
+ * "tty" devices actually resolve to an instantiable unit.
+ */
+#define LIBSYSTEMD_RULES_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/rules"
+
+DMOD_TEST_STEP(load_rules_rejects_null_path)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(NULL), -EINVAL);
+}
+
+DMOD_TEST_STEP(load_rules_rejects_missing_directory)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules("/this/path/does/not/exist"), -ENOENT);
+}
+
+DMOD_TEST_STEP(load_rules_parses_class_sections)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
+}
+
+DMOD_TEST_STEP(notify_device_added_rejects_null_arguments)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added(NULL, "tty1"), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("tty", NULL), -EINVAL);
+}
+
+DMOD_TEST_STEP(notify_device_removed_rejects_null_arguments)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed(NULL, "tty1"), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("tty", NULL), -EINVAL);
+}
+
+DMOD_TEST_STEP(notify_device_added_starts_unit_matching_class_rule)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@tty1", &status), -ENOENT);
+
+    /* "dmbare" isn't loadable in this test environment - what matters here
+     * is that "tty"+"tty1" resolved through the rule to "bare@tty1" and
+     * libsystemd_start_service() instantiated+registered it from the
+     * template, exactly like a direct libsystemd_start_service("bare@tty1")
+     * call would (see start_service_instantiates_template_on_demand). */
+    libsystemd_notify_device_added("tty", "tty1");
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@tty1", &status), 0);
+}
+
+DMOD_TEST_STEP(notify_device_added_rejects_unmatched_class)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
+
+    /* The rules fixture only defines "tty" and "net" classes. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("usb", "sda"), -ENOENT);
+}
+
+DMOD_TEST_STEP(notify_device_removed_stops_unit_matching_class_rule)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
+
+    libsystemd_notify_device_added("tty", "tty1"); /* registers "bare@tty1" */
+
+    /* Never actually running ("dmbare" isn't loadable), so this mirrors
+     * stop_service_reports_not_running_for_unspawnable_unit: the point is
+     * that notify_device_removed() resolved the exact same target as
+     * notify_device_added() did and reached libsystemd_stop_service(). */
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("tty", "tty1"), -ESRCH);
+}
+
+DMOD_TEST_STEP(notify_device_removed_rejects_unmatched_class)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("usb", "sda"), -ENOENT);
+}
+
+/**
+ * Fixture directories: tests/fixtures/rules_replay_{tty,scan,forget}/, each
+ * with its own class ("replay-tty"/"replay-scan"/"replay-forget", all
+ * mapping to "bare@%name") unique to one test each - deliberately *not*
+ * shared, since libsystemd_load_rules() replaces g_rules wholesale and
+ * g_rules/g_devices are process-global state shared across every test step
+ * in this binary; one combined fixture would let one test's load_rules()
+ * call silently satisfy another test's "no rule loaded yet" precondition.
+ * These exercise the g_devices/libsystemd_replay_pending_devices()
+ * machinery: a device reported via libsystemd_notify_device_added() before a
+ * matching rule or the right units directory exists must still end up
+ * started once libsystemd_load_rules()/libsystemd_scan() catches up - drivers
+ * are typically loaded (and start reporting devices) before either one runs.
+ */
+#define LIBSYSTEMD_RULES_REPLAY_TTY_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/rules_replay_tty"
+#define LIBSYSTEMD_RULES_REPLAY_SCAN_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/rules_replay_scan"
+#define LIBSYSTEMD_RULES_REPLAY_FORGET_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/rules_replay_forget"
+
+DMOD_TEST_STEP(notify_device_added_is_replayed_once_matching_rules_are_loaded)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    /* No rule for "replay-tty" exists anywhere yet - remembered, not started. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("replay-tty", "x1"), -ENOENT);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@x1", &status), -ENOENT);
+
+    /* Loading the matching rules replays every still-pending device against
+     * them - "replay-tty"+"x1" now resolves to "bare@x1" and gets started. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_REPLAY_TTY_FIXTURES_DIR), 0);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@x1", &status), 0);
+}
+
+DMOD_TEST_STEP(notify_device_added_is_replayed_once_units_directory_is_scanned)
+{
+    /* dmod_test_setup() has already scanned LIBSYSTEMD_EXAMPLES_DIR before
+     * this step runs - it has no "bare@.ini" template, so resolving
+     * "replay-scan" (which the rules below map to "bare@%name") finds a
+     * matching rule but cannot instantiate a unit from it yet. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_REPLAY_SCAN_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_NE(libsystemd_notify_device_added("replay-scan", "x2"), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@x2", &status), -ENOENT);
+
+    /* Scanning the units directory that actually has "bare@.ini" replays
+     * every still-pending device - "replay-scan"+"x2" now instantiates and
+     * starts successfully. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@x2", &status), 0);
+}
+
+DMOD_TEST_STEP(notify_device_removed_forgets_a_pending_device)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    /* No rule for "replay-forget" exists yet - remembered. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("replay-forget", "y1"), -ENOENT);
+
+    /* Removed again before any matching rule was ever loaded - forgotten,
+     * so it must not be resurrected by the load_rules() below. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("replay-forget", "y1"), -ENOENT);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_REPLAY_FORGET_FIXTURES_DIR), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@y1", &status), -ENOENT);
 }

@@ -142,3 +142,75 @@ ascending by that value (`dmlist_sort`) and every unit is started in that
 order via `Dmod_SpawnModule`. A unit that fails to start (e.g. `exec` names
 a module that cannot be found) is logged and skipped - it does not stop the
 rest of the registry from starting.
+
+## Device rules
+
+`libsystemd_load_rules(rules_dir)` is a separate entry point from
+`libsystemd_scan()`/`libsystemd_parse_dir()` - it loads *rules*, not units,
+from every `*.ini` file directly inside `rules_dir`. A rules file has one or
+more `[class=<device-class>]` sections, each with a `start` key:
+
+```ini
+# rules/devices.ini
+[class=tty]
+start=getty@%name
+
+[class=net]
+start=dhcpd@%name
+```
+
+`libsystemd_notify_device_added(device_class, device_name)` looks up the
+`[class=<device_class>]` section (first match wins if more than one rules
+file defines the same class) and substitutes every `%name` in its `start`
+value with `device_name`, then calls `libsystemd_start_service()` on the
+result - which transparently instantiates it from a template on demand if
+needed (see [Starting an instance that was never scanned](#starting-an-instance-that-was-never-scanned)
+above). `libsystemd_notify_device_removed(device_class, device_name)`
+resolves the exact same target the same way and calls
+`libsystemd_stop_service()` on it instead.
+
+```
+libsystemd_load_rules("/etc/dmsystem/rules");
+libsystemd_notify_device_added("tty", "tty1");   // -> starts "getty@tty1"
+libsystemd_notify_device_removed("tty", "tty1"); // -> stops "getty@tty1"
+```
+
+This is meant to be called by a driver or filesystem module that discovers
+devices at runtime (e.g. `dmtty` enumerating serial ports, or `dmdevfs`
+noticing a new node under `/dev`) - it reports `(class, name)`, and
+`libsystemd` maps that to a unit via the loaded rules without the driver
+needing to know anything about unit names or templates itself.
+
+Note that `%name` here is a distinct, whole-word placeholder handled by the
+rules matcher itself, resolved *before* the target unit name is handed to
+`libsystemd_start_service()` - it is unrelated to the `%i`/`%I`/`%p`/`%n`
+specifiers a template's own keys are expanded for once the target is
+resolved (those still work as usual inside `getty@.ini` itself). A rule with
+no `start` key, or a section not named `class=...`, is ignored. Calling
+`libsystemd_load_rules()` again replaces the entire previously loaded rule
+set, same "full reload" semantics as `libsystemd_scan()`. A runnable copy of
+the example above lives in
+[`app/libsystemd/examples/rules/`](../examples/rules).
+
+### Devices reported before rules/units exist yet
+
+A driver module is typically loaded (and starts reporting devices) *before*
+`libsystemd_scan()`/`libsystemd_load_rules()` ever run - services are
+started only after drivers are up. `libsystemd_notify_device_added()`
+accounts for this: every reported `(class, name)` pair is remembered
+internally regardless of whether it can be resolved/started right away, and
+both `libsystemd_scan()` and `libsystemd_load_rules()` retry every
+still-remembered device against the current rules/units state right after
+they finish. So this works regardless of call order:
+
+```
+libsystemd_notify_device_added("tty", "tty1"); // no rules loaded yet - returns -ENOENT, remembered
+libsystemd_load_rules("/etc/dmsystem/rules");  // [class=tty] start=getty@%name - replays it, starts "getty@tty1"
+```
+
+as does the reverse (rules loaded first, but the units directory with
+`getty@.ini` in it not scanned until later) - either one being the missing
+piece is enough to leave a device pending, and either one showing up later
+is enough to retry it. A device stops being remembered - and is never
+retried again - once `libsystemd_notify_device_removed()` is called for the
+same `(class, name)` pair, even if it was never successfully started.

@@ -15,4 +15,8 @@ dmod_libsystemd_api(1.0, int, _scan, (const char* path));
 dmod_libsystemd_api(1.0, int, _parse_file, ( const char* file_path, libsystemd_service_t* service ));
 dmod_libsystemd_api(1.0, int, _parse_dir, ( const char* dir_path, libsystemd_services_t* services ));
 
+dmod_libsystemd_api(1.0, int, _load_rules, (const char* rules_dir));
+dmod_libsystemd_api(1.0, int, _notify_device_added, (const char* device_class, const char* device_name));
+dmod_libsystemd_api(1.0, int, _notify_device_removed, (const char* device_class, const char* device_name));
+
 #endif // LIBSYSTEMD_H

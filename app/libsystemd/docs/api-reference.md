@@ -113,3 +113,52 @@ order), stopping early if `visitor` returns `false`.
 - `-EINVAL` - `visitor` was `NULL`.
 - `0` - always returned otherwise, including when the registry is
   empty/uninitialized (there is simply nothing to visit).
+
+### `libsystemd_load_rules(const char* rules_dir)`
+
+Loads device-class rules from every `*.ini` file directly inside
+`rules_dir` - see [configuration.md](configuration.md#device-rules). Fully
+independent of `libsystemd_scan()`. Replaces any previously loaded rules
+(from this or a different directory) - same "full reload" semantics as
+`libsystemd_scan()`. Afterwards, retries every device still remembered from
+an earlier `libsystemd_notify_device_added()` call against the new rules
+(see [Devices reported before rules/units exist yet](configuration.md#devices-reported-before-rulesunits-exist-yet)) -
+this is the only way loading rules can start/stop anything by itself.
+
+- `-EINVAL` - `rules_dir` was `NULL`.
+- `-ENOENT` - `rules_dir` does not exist / cannot be opened.
+- `-ENOMEM` - allocation failed.
+
+### `libsystemd_notify_device_added(const char* device_class, const char* device_name)`
+
+Resolves `(device_class, device_name)` to a unit name via the rules loaded
+by the last `libsystemd_load_rules()` call (`%name` in the matching rule's
+`start` value is replaced with `device_name`) and starts it via
+`libsystemd_start_service()` - which instantiates it from a template on
+demand if it is not already registered.
+
+The device is remembered regardless of whether it resolves/starts right now
+- drivers commonly report devices before `libsystemd_scan()`/
+`libsystemd_load_rules()` have run, so a non-zero return here does not mean
+the device was dropped; a later `libsystemd_scan()`/`libsystemd_load_rules()`
+call retries it. See [Devices reported before rules/units exist yet](configuration.md#devices-reported-before-rulesunits-exist-yet).
+
+- `-EINVAL` - `device_class`/`device_name` was `NULL`.
+- `-ENOENT` - no rule currently matches `device_class`, or the resolved unit
+  could not be found/instantiated yet.
+- `-ENOMEM` - allocation failed.
+- other negative values are forwarded from `libsystemd_start_service()`.
+
+### `libsystemd_notify_device_removed(const char* device_class, const char* device_name)`
+
+Resolves `(device_class, device_name)` exactly like
+`libsystemd_notify_device_added()` and calls `libsystemd_stop_service()` on
+the result instead of starting it. Also forgets the device (regardless of
+whether it could be resolved/stopped right now), so it is never resurrected
+by a later `libsystemd_scan()`/`libsystemd_load_rules()` replay.
+
+- `-EINVAL` - `device_class`/`device_name` was `NULL`.
+- `-ENOENT` - no rules loaded, no rule matches `device_class`, or no unit
+  with the resolved name is currently registered.
+- `-ESRCH` - the resolved unit exists but has no running process to stop.
+- `-ENOMEM` - allocation failed while resolving the target.

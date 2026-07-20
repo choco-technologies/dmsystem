@@ -148,6 +148,32 @@ dependency cycle does not crash or hang anything - it simply stops
 propagating once the pass budget is exhausted - but unlike a real cycle
 detector it is not currently reported or logged as an error.
 
+### Device rules
+
+`libsystemd_load_rules(rules_dir)` loads `udev`-style rules from a separate
+directory of `*.ini` files, each with one or more `[class=<device-class>]`
+sections and a `start` key:
+
+```ini
+[class=tty]
+start=getty@%name
+```
+
+A driver that discovers devices at runtime (e.g. `dmtty` finding a serial
+port, `dmdevfs` noticing a new `/dev` node) calls
+`libsystemd_notify_device_added("tty", "tty1")` /
+`libsystemd_notify_device_removed("tty", "tty1")` to report it; `libsystemd`
+substitutes `%name` in the matching rule and starts/stops the resulting unit
+(`getty@tty1` here) - instantiating it from a template on the fly if needed,
+via the same mechanism described above. Drivers are typically loaded (and
+start reporting devices) before `libsystemd_scan()`/`libsystemd_load_rules()`
+ever run, so a device reported early is remembered and retried automatically
+once both are in place, regardless of call order. See
+[`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#device-rules)
+for the full format, and
+[`app/libsystemd/examples/rules/`](app/libsystemd/examples/rules) for a
+runnable example.
+
 ## Building
 
 ### Using CMake
