@@ -59,6 +59,11 @@ Files that fail to parse are logged and skipped, not treated as a fatal
 error for the whole scan. Does not resolve ordering, sort, or start
 anything - see `libsystemd_scan()`.
 
+A file named `<prefix>@.ini` is a template and is skipped entirely; a file
+named `<prefix>@<instance>.ini` is parsed on top of its template (if one
+exists) with `%i`/`%I`/`%p`/`%n`/`%%` expanded - see
+[configuration.md](configuration.md#templates).
+
 - `-EINVAL` - `dir_path`/`services` was `NULL`.
 - `-ENOENT` - `dir_path` does not exist / cannot be opened.
 - `-ENOMEM` - allocation failed.
@@ -68,8 +73,16 @@ anything - see `libsystemd_scan()`.
 Looks `unit_name` up in the global registry and spawns it (`Dmod_SpawnModule`
 with the unit's `exec`/`argc`/`argv`/stream redirections).
 
+If `unit_name` is not already registered but is `<prefix>@<instance>`-shaped
+and `<prefix>@.ini` exists in the last-scanned units directory, it is
+instantiated on the fly and added to the registry before being spawned - see
+[configuration.md](configuration.md#starting-an-instance-that-was-never-scanned).
+This is the only place template instantiation happens outside of
+`libsystemd_scan()`/`libsystemd_parse_dir()`.
+
 - `-EINVAL` - `unit_name` was `NULL`.
-- `-ENOENT` - no unit with that name (including "nothing has been scanned yet").
+- `-ENOENT` - no unit with that name, and it could not be instantiated from a
+  template either (including "nothing has been scanned yet").
 - `-EALREADY` - the unit already has a live process.
 - `-ENOSYS` - module spawning is unavailable on this build/platform.
 - other negative values are forwarded from `Dmod_SpawnModule`.

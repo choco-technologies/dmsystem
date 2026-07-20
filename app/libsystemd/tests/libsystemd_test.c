@@ -122,7 +122,10 @@ DMOD_TEST_STEP(list_reports_all_example_units)
     unit_summary_t summary = { 0 };
     DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary), 0);
 
-    DMOD_TEST_EXPECT_EQ(summary.count, 3);
+    /* networking, webserver, monitoring, plus getty@tty1/getty@tty2 (two
+     * instances of the getty@.ini template - the bare template itself is
+     * never started, so it does not count towards this total). */
+    DMOD_TEST_EXPECT_EQ(summary.count, 5);
     DMOD_TEST_EXPECT_TRUE(summary.found_networking);
     DMOD_TEST_EXPECT_TRUE(summary.found_webserver);
     DMOD_TEST_EXPECT_TRUE(summary.found_monitoring);
@@ -185,4 +188,113 @@ DMOD_TEST_STEP(stop_service_reports_not_running_for_unspawnable_unit)
      * example unit file and is never actually loadable in this environment,
      * so libsystemd_scan()'s best-effort auto-start always leaves it stopped. */
     DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("networking"), -ESRCH);
+}
+
+/**
+ * Fixture directory for these steps: tests/fixtures/templates/, containing
+ * a template "app@.ini" (exec=dmapp, args="--name %i --literal %%") and two
+ * instances: "app@one.ini" (empty - fully inherited) and "app@two.ini"
+ * (overrides "args" but still inherits "exec"/"description").
+ */
+#define LIBSYSTEMD_TEMPLATE_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/templates"
+#define LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/template_only"
+
+DMOD_TEST_STEP(scan_expands_template_instances)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_FIXTURES_DIR), 0);
+
+    libsystemd_service_status_t status;
+
+    /* Both instances were found, named "<prefix>@<instance>", and parsed
+     * successfully (a failure to inherit "exec" from the template would
+     * have made libsystemd_parse_file() reject them with -EINVAL, and they
+     * would not be in the registry at all). */
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("app@one", &status), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("app@two", &status), 0);
+
+    /* Neither the bare template nor the un-instantiated prefix is ever
+     * registered as a startable unit. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("app@", &status), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("app", &status), -ENOENT);
+}
+
+DMOD_TEST_STEP(scan_lists_exactly_the_two_template_instances)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_FIXTURES_DIR), 0);
+
+    unit_summary_t summary = { 0 };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary), 0);
+    DMOD_TEST_EXPECT_EQ(summary.count, 2);
+}
+
+DMOD_TEST_STEP(scan_does_not_start_a_bare_template_without_instances)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    unit_summary_t summary = { 0 };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary), 0);
+    DMOD_TEST_EXPECT_EQ(summary.count, 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@", &status), -ENOENT);
+}
+
+/**
+ * Fixture directory: tests/fixtures/template_only/, containing only
+ * "bare@.ini" (exec=dmbare) - no instance file on disk anywhere. These steps
+ * exercise libsystemd_start_service()'s on-demand instantiation
+ * (libsystemd_instantiate_service_on_demand()): starting "bare@one" (never
+ * scanned, no file for it) should still create and register it purely from
+ * the template, the same way `systemctl start foo@bar` would in real systemd.
+ */
+DMOD_TEST_STEP(start_service_instantiates_template_on_demand)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@one", &status), -ENOENT);
+
+    /* "dmbare" is not a loadable module in this test environment, so the
+     * spawn itself fails - what this step checks is that the instance was
+     * still resolved from the template and registered, exactly like a unit
+     * whose exec module can't be found at libsystemd_scan() time still ends
+     * up in the registry (see stop_service_reports_not_running_for_unspawnable_unit). */
+    libsystemd_start_service("bare@one");
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@one", &status), 0);
+
+    unit_summary_t summary = { 0 };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary), 0);
+    DMOD_TEST_EXPECT_EQ(summary.count, 1);
+
+    /* A second start_service() call finds the now-registered instance
+     * directly - it must not be instantiated (or registered) twice. */
+    libsystemd_start_service("bare@one");
+    unit_summary_t summary_again = { 0 };
+    DMOD_TEST_EXPECT_EQ(libsystemd_list(count_units_visitor, &summary_again), 0);
+    DMOD_TEST_EXPECT_EQ(summary_again.count, 1);
+}
+
+DMOD_TEST_STEP(start_service_rejects_instance_with_no_matching_template)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEMPLATE_ONLY_FIXTURES_DIR), 0);
+
+    /* "other@.ini" does not exist anywhere in the scanned directory. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("other@one"), -ENOENT);
+}
+
+/**
+ * Regression fixture for libsystemd_build_streams(): "all-streams.ini" sets
+ * all four of stdin/stdout/stderr/stdlog at once. Its entries array must be
+ * sized for 4 candidates, not 3 - a unit setting all four used to overflow
+ * the allocated array by one `Dmod_StreamRedirection_t` entry.
+ */
+#define LIBSYSTEMD_STREAMS_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/streams"
+
+DMOD_TEST_STEP(scan_parses_unit_with_all_four_stream_keys)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_STREAMS_FIXTURES_DIR), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("all-streams", &status), 0);
 }

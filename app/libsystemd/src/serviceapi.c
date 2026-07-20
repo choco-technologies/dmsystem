@@ -13,9 +13,11 @@
  * this file cannot read or modify its fields directly - they must go through
  * libsystemd_start_service()/libsystemd_stop_service()/libsystemd_status()/libsystemd_list().
  *
- * An instance is created by libsystemd_parse_file() (called from libsystemd_parse_dir())
- * and lives inside the global service registry (@ref g_services) until it is
- * replaced by a new libsystemd_scan() or the module is unloaded (libsystemd_serviceapi_deinit()).
+ * A `libsystemd_service_t` is created by libsystemd_parse_unit_internal()
+ * (called from libsystemd_parse_dir(), via the public libsystemd_parse_file()
+ * for a non-templated unit) and lives inside the global service registry
+ * (@ref g_services) until it is replaced by a new libsystemd_scan() or the
+ * module is unloaded (libsystemd_serviceapi_deinit()).
  */
 struct libsystemd_service
 {
@@ -23,7 +25,7 @@ struct libsystemd_service
     char* exec;                         //!< Module name (or file path) to spawn, from the "exec" key. Owned copy.
     int argc;                           //!< Number of entries in argv (always >= 1, argv[0] == exec).
     char** argv;                        //!< NULL-terminated argument vector (argc+1 entries, each an owned copy).
-    Dmod_StreamRedirections_t streams;  //!< Stream redirections built from the optional "stdin"/"stdout"/"stderr" keys.
+    Dmod_StreamRedirections_t streams;  //!< Stream redirections built from the optional "stdin"/"stdout"/"stderr"/"stdlog" keys.
     int starting_order;                 //!< Relative start order computed by libsystemd_resolve_starting_order() (lower starts first).
     dmlist_context_t* required;         //!< List of owned `char*` unit names this service requires (from "requires").
     dmlist_context_t* after;            //!< List of owned `char*` unit names this service must start after (from "after").
@@ -62,6 +64,17 @@ struct libsystemd_services
  *       module's API.
  */
 static libsystemd_services_t g_services = NULL;
+
+/**
+ * @brief Units directory of the last successful libsystemd_scan(), or NULL
+ *
+ * Remembered purely so libsystemd_start_service() can resolve an on-demand
+ * template instance (e.g. "getty@tty1", with no matching file ever having
+ * been scanned) by looking for "<prefix>@.ini" in the same directory - see
+ * libsystemd_instantiate_service_on_demand(). NULL before the first
+ * successful libsystemd_scan(), or after libsystemd_serviceapi_deinit().
+ */
+static char* g_units_dir = NULL;
 
 /**
  * @brief Closure passed to libsystemd_dependency_order_visitor() while walking one service's dependency lists
@@ -793,19 +806,19 @@ static bool libsystemd_build_argv(libsystemd_service_t service, const char* exec
 }
 
 /**
- * @brief Build a service's stream redirection table from its "stdin"/"stdout"/"stderr" ini keys
+ * @brief Build a service's stream redirection table from its "stdin"/"stdout"/"stderr"/"stdlog" ini keys
  *
- * Allocates up to 3 `Dmod_StreamRedirection_t` entries, one for each of
- * "stdin", "stdout", "stderr" that is present in @p ctx, mapping it to
- * `DMOD_STDIN`/`DMOD_STDOUT`/`DMOD_STDERR` respectively with an owned copy of
- * its path. Keys that are absent are simply skipped - `service->streams.Count`
- * reflects only the keys that were actually present.
+ * Allocates up to 4 `Dmod_StreamRedirection_t` entries, one for each of
+ * "stdin", "stdout", "stderr", "stdlog" that is present in @p ctx, mapping it
+ * to `DMOD_STDIN`/`DMOD_STDOUT`/`DMOD_STDERR`/`DMOD_STDLOG` respectively with
+ * an owned copy of its path. Keys that are absent are simply skipped -
+ * `service->streams.Count` reflects only the keys that were actually present.
  *
  * @param ctx     Parsed ini context to read the keys from (must not be NULL).
  * @param service Service being built; `streams` is set on success (must not be NULL).
  *
  * @retval true  `service->streams` was populated successfully (possibly with `Count == 0`
- *                and `Entries == NULL` if none of the three keys were present).
+ *                and `Entries == NULL` if none of the four keys were present).
  * @retval false Allocation of the entries array failed; `service->streams` is left zeroed.
  *
  * @par Example
@@ -829,7 +842,7 @@ static bool libsystemd_build_streams(dmini_context_t ctx, libsystemd_service_t s
         { DMOD_STDLOG, "stdlog" },
     };
 
-    Dmod_StreamRedirection_t* entries = Dmod_Malloc(sizeof(Dmod_StreamRedirection_t) * 3);
+    Dmod_StreamRedirection_t* entries = Dmod_Malloc(sizeof(Dmod_StreamRedirection_t) * 4);
     if (entries == NULL)
     {
         return false;
@@ -1030,6 +1043,549 @@ static char* libsystemd_join_path(const char* dir_path, const char* file_name)
 }
 
 /**
+ * @brief Classification of a ".ini" unit file name with respect to systemd-style `@` templating
+ */
+typedef enum
+{
+    LIBSYSTEMD_UNIT_PLAIN,     //!< No '@' in the name (e.g. "webserver.ini") - parsed as-is, no specifier substitution.
+    LIBSYSTEMD_UNIT_TEMPLATE,  //!< '@' immediately followed by ".ini" (e.g. "getty@.ini") - never parsed/started on its own.
+    LIBSYSTEMD_UNIT_INSTANCE,  //!< '@' followed by a non-empty instance (e.g. "getty@tty1.ini") - merged with its template, if any.
+} libsystemd_unit_kind_t;
+
+/**
+ * @brief Split a ".ini" unit file name into its template prefix/instance, systemd-`@`-style
+ *
+ * Looks for the first `@` before the ".ini" suffix. `"foo.ini"` (no `@`) is
+ * ::LIBSYSTEMD_UNIT_PLAIN. `"foo@.ini"` (empty instance) is
+ * ::LIBSYSTEMD_UNIT_TEMPLATE - the bare template, never started on its own.
+ * `"foo@bar.ini"` is ::LIBSYSTEMD_UNIT_INSTANCE with prefix `"foo"` and
+ * instance `"bar"`.
+ *
+ * @param file_name   Bare file name to classify; must already satisfy
+ *                      libsystemd_has_ini_extension().
+ * @param out_prefix  Receives an owned copy of the part before `@` for
+ *                      ::LIBSYSTEMD_UNIT_TEMPLATE/::LIBSYSTEMD_UNIT_INSTANCE,
+ *                      or NULL for ::LIBSYSTEMD_UNIT_PLAIN (must not be NULL).
+ * @param out_instance Receives an owned copy of the part between `@` and
+ *                      ".ini" for ::LIBSYSTEMD_UNIT_INSTANCE, or NULL otherwise
+ *                      (must not be NULL).
+ *
+ * @return The file's ::libsystemd_unit_kind_t. On allocation failure, falls
+ *         back to ::LIBSYSTEMD_UNIT_PLAIN with both output pointers NULL,
+ *         which simply causes the file to be parsed without template
+ *         expansion rather than aborting the whole directory scan.
+ *
+ * @par Example
+ * @code
+ * char* prefix = NULL;
+ * char* instance = NULL;
+ * libsystemd_classify_unit_file("getty@tty1.ini", &prefix, &instance);
+ * // kind == LIBSYSTEMD_UNIT_INSTANCE, prefix == "getty", instance == "tty1"
+ * @endcode
+ */
+static libsystemd_unit_kind_t libsystemd_classify_unit_file(const char* file_name, char** out_prefix, char** out_instance)
+{
+    *out_prefix = NULL;
+    *out_instance = NULL;
+
+    size_t base_len = strlen(file_name) - 4; /* strip trailing ".ini" */
+
+    const char* at = NULL;
+    for (size_t i = 0; i < base_len; i++)
+    {
+        if (file_name[i] == '@')
+        {
+            at = file_name + i;
+            break;
+        }
+    }
+    if (at == NULL)
+    {
+        return LIBSYSTEMD_UNIT_PLAIN;
+    }
+
+    size_t prefix_len = (size_t)(at - file_name);
+    size_t instance_len = base_len - prefix_len - 1;
+
+    char* prefix = Dmod_Malloc(prefix_len + 1);
+    if (prefix == NULL)
+    {
+        return LIBSYSTEMD_UNIT_PLAIN;
+    }
+    memcpy(prefix, file_name, prefix_len);
+    prefix[prefix_len] = '\0';
+
+    if (instance_len == 0)
+    {
+        *out_prefix = prefix;
+        return LIBSYSTEMD_UNIT_TEMPLATE;
+    }
+
+    char* instance = Dmod_Malloc(instance_len + 1);
+    if (instance == NULL)
+    {
+        Dmod_Free(prefix);
+        return LIBSYSTEMD_UNIT_PLAIN;
+    }
+    memcpy(instance, at + 1, instance_len);
+    instance[instance_len] = '\0';
+
+    *out_prefix = prefix;
+    *out_instance = instance;
+    return LIBSYSTEMD_UNIT_INSTANCE;
+}
+
+/**
+ * @brief Build the file path of a template's own unit file ("<prefix>@.ini") inside a directory
+ *
+ * @param dir_path Directory the instance file was found in (must not be NULL).
+ * @param prefix   Template prefix, as produced by libsystemd_classify_unit_file() (must not be NULL).
+ *
+ * @return Newly heap-allocated path (e.g. "/etc/units/getty@.ini"), owned by
+ *         the caller (free with Dmod_Free()), or NULL if allocation failed.
+ */
+static char* libsystemd_build_template_path(const char* dir_path, const char* prefix)
+{
+    size_t prefix_len = strlen(prefix);
+
+    char* file_name = Dmod_Malloc(prefix_len + 5 /* "@.ini" */ + 1);
+    if (file_name == NULL)
+    {
+        return NULL;
+    }
+    memcpy(file_name, prefix, prefix_len);
+    memcpy(file_name + prefix_len, "@.ini", 5);
+    file_name[prefix_len + 5] = '\0';
+
+    char* path = libsystemd_join_path(dir_path, file_name);
+    Dmod_Free(file_name);
+
+    return path;
+}
+
+/**
+ * @brief Build an instantiated unit's full name ("<prefix>@<instance>") from its parts
+ *
+ * @param prefix   Template prefix (must not be NULL).
+ * @param instance Instance name (must not be NULL).
+ *
+ * @return Newly heap-allocated, NUL-terminated unit name, owned by the caller
+ *         (free with Dmod_Free()), or NULL if allocation failed.
+ */
+static char* libsystemd_build_unit_name(const char* prefix, const char* instance)
+{
+    size_t prefix_len = strlen(prefix);
+    size_t instance_len = strlen(instance);
+
+    char* unit_name = Dmod_Malloc(prefix_len + 1 + instance_len + 1);
+    if (unit_name == NULL)
+    {
+        return NULL;
+    }
+
+    memcpy(unit_name, prefix, prefix_len);
+    unit_name[prefix_len] = '@';
+    memcpy(unit_name + prefix_len + 1, instance, instance_len);
+    unit_name[prefix_len + 1 + instance_len] = '\0';
+
+    return unit_name;
+}
+
+/**
+ * @brief Expand systemd-style `%`-specifiers in a single string
+ *
+ * Recognized specifiers: `%i`/`%I` (instance name), `%p` (template prefix),
+ * `%n` (full instantiated unit name, "<prefix>@<instance>"), `%%` (a literal
+ * `%`). An unrecognized `%<char>` sequence (or a trailing `%` at the end of
+ * the string) is copied through verbatim, unexpanded.
+ *
+ * @param value    String to expand (must not be NULL).
+ * @param prefix   Template prefix, substituted for `%p` (must not be NULL).
+ * @param instance Instance name, substituted for `%i`/`%I` (must not be NULL).
+ * @param unit_name Full "<prefix>@<instance>" unit name, substituted for `%n` (must not be NULL).
+ *
+ * @return Newly heap-allocated expanded string, owned by the caller (free
+ *         with Dmod_Free()), or NULL if allocation failed.
+ *
+ * @par Example
+ * @code
+ * char* expanded = libsystemd_substitute_specifiers("--tty %i", "getty", "tty1", "getty@tty1");
+ * // expanded == "--tty tty1"
+ * @endcode
+ */
+static char* libsystemd_substitute_specifiers(const char* value, const char* prefix, const char* instance, const char* unit_name)
+{
+    size_t prefix_len = strlen(prefix);
+    size_t instance_len = strlen(instance);
+    size_t unit_name_len = strlen(unit_name);
+
+    size_t out_len = 0;
+    for (const char* scan = value; *scan != '\0'; )
+    {
+        if (scan[0] == '%' && scan[1] != '\0')
+        {
+            switch (scan[1])
+            {
+                case 'i': case 'I': out_len += instance_len; scan += 2; continue;
+                case 'p':           out_len += prefix_len;   scan += 2; continue;
+                case 'n':           out_len += unit_name_len; scan += 2; continue;
+                case '%':           out_len += 1;             scan += 2; continue;
+                default: break; /* unknown specifier: copied through as-is below */
+            }
+        }
+        out_len += 1;
+        scan += 1;
+    }
+
+    char* result = Dmod_Malloc(out_len + 1);
+    if (result == NULL)
+    {
+        return NULL;
+    }
+
+    char* dst = result;
+    for (const char* scan = value; *scan != '\0'; )
+    {
+        if (scan[0] == '%' && scan[1] != '\0')
+        {
+            const char* replacement = NULL;
+            size_t replacement_len = 0;
+            switch (scan[1])
+            {
+                case 'i': case 'I': replacement = instance;   replacement_len = instance_len;   break;
+                case 'p':           replacement = prefix;     replacement_len = prefix_len;     break;
+                case 'n':           replacement = unit_name;  replacement_len = unit_name_len;  break;
+                case '%':           replacement = "%";        replacement_len = 1;               break;
+                default: break;
+            }
+
+            if (replacement != NULL)
+            {
+                memcpy(dst, replacement, replacement_len);
+                dst += replacement_len;
+                scan += 2;
+                continue;
+            }
+        }
+        *dst++ = *scan++;
+    }
+    *dst = '\0';
+
+    return result;
+}
+
+/**
+ * @brief Expand `%`-specifiers in every key of an ini context's global section, in place
+ *
+ * Walks every key currently in @p ctx's global section (via
+ * dmini_key_count()/dmini_key_name()) and, for any value containing a `%`,
+ * replaces it with its libsystemd_substitute_specifiers() expansion
+ * (dmini_set_string() updates the existing key in place - see
+ * `set_pair_in_section()` in dmini - so this does not disturb key order/count
+ * while iterating by index).
+ *
+ * @param ctx      Ini context to expand in place (must not be NULL).
+ * @param prefix   Template prefix, forwarded to libsystemd_substitute_specifiers().
+ * @param instance Instance name, forwarded to libsystemd_substitute_specifiers().
+ * @param unit_name Full unit name, forwarded to libsystemd_substitute_specifiers().
+ *
+ * @retval true  Every key was expanded successfully.
+ * @retval false Allocation failed part-way through; @p ctx is left with
+ *                whatever subset of keys had already been expanded.
+ */
+static bool libsystemd_apply_specifiers(dmini_context_t ctx, const char* prefix, const char* instance, const char* unit_name)
+{
+    int count = dmini_key_count(ctx, NULL);
+
+    for (int i = 0; i < count; i++)
+    {
+        const char* key = dmini_key_name(ctx, NULL, i);
+        if (key == NULL)
+        {
+            continue;
+        }
+
+        const char* value = dmini_get_string(ctx, NULL, key, NULL);
+        if (value == NULL || strchr(value, '%') == NULL)
+        {
+            continue;
+        }
+
+        char* expanded = libsystemd_substitute_specifiers(value, prefix, instance, unit_name);
+        if (expanded == NULL)
+        {
+            return false;
+        }
+
+        dmini_set_string(ctx, NULL, key, expanded);
+        Dmod_Free(expanded);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Build a fresh `libsystemd_service_t` from an already-parsed ini context
+ *
+ * Shared tail end of both libsystemd_parse_unit_internal() (file-backed
+ * parsing) and libsystemd_instantiate_from_template() (on-demand template
+ * instantiation with no file of its own) - everything from here on only
+ * cares about the fully-resolved `dmini_context_t`, not where it came from.
+ *
+ * @param ctx     Fully-parsed (and, for a template instance, already
+ *                  specifier-expanded) ini context to read from (must not be NULL).
+ * @param service Receives the newly allocated service on success (must not
+ *                  be NULL). `unit_name` is left NULL - callers set it themselves,
+ *                  since neither of this function's two callers has one single
+ *                  obvious source for it (a file name vs. a synthesized "<prefix>@<instance>").
+ *
+ * @retval 0       `*service` now points to a fully populated service (unit_name is NULL,
+ *                   starting_order is 0, pid is -1).
+ * @retval -EINVAL @p ctx has no "exec" key.
+ * @retval -ENOMEM Allocation failed at some point; nothing is leaked.
+ */
+static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_service_t* service)
+{
+    const char* exec = dmini_get_string(ctx, NULL, "exec", NULL);
+    if (exec == NULL)
+    {
+        return -EINVAL;
+    }
+
+    libsystemd_service_t new_service = Dmod_Malloc(sizeof(struct libsystemd_service));
+    if (new_service == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    new_service->unit_name = NULL;
+    new_service->exec = NULL;
+    new_service->argc = 0;
+    new_service->argv = NULL;
+    new_service->streams.Entries = NULL;
+    new_service->streams.Count = 0;
+    new_service->starting_order = 0;
+    new_service->required = NULL;
+    new_service->after = NULL;
+    new_service->pid = -1;
+
+    const char* args = dmini_get_string(ctx, NULL, "args", NULL);
+
+    bool ok = (new_service->exec = Dmod_StrDup(exec)) != NULL;
+    ok = ok && libsystemd_build_argv(new_service, exec, args);
+    ok = ok && libsystemd_build_streams(ctx, new_service);
+    ok = ok && libsystemd_parse_name_list(ctx, "requires", &new_service->required);
+    ok = ok && libsystemd_parse_name_list(ctx, "after", &new_service->after);
+
+    if (!ok)
+    {
+        libsystemd_destroy_service(new_service);
+        return -ENOMEM;
+    }
+
+    *service = new_service;
+
+    return 0;
+}
+
+/**
+ * @brief Split a unit *name* (not a file name - no ".ini") into its `@` template prefix/instance
+ *
+ * Used by libsystemd_instantiate_service_on_demand() to decide whether a
+ * unit name that was not found in the registry could still be resolved as a
+ * template instance (e.g. "getty@tty1" -> prefix "getty", instance "tty1").
+ * Unlike libsystemd_classify_unit_file(), a name with an `@` but an empty
+ * prefix or instance (e.g. "@foo", "foo@") is rejected outright - there is no
+ * such thing as "starting" a bare template.
+ *
+ * @param unit_name   Unit name to split (must not be NULL).
+ * @param out_prefix  Receives an owned copy of the part before `@` on success (must not be NULL).
+ * @param out_instance Receives an owned copy of the part after `@` on success (must not be NULL).
+ *
+ * @retval true  @p unit_name is "<prefix>@<instance>" with both non-empty; `*out_prefix`/`*out_instance` are set.
+ * @retval false @p unit_name has no `@`, an empty prefix, an empty instance, or allocation failed;
+ *                both output pointers are left NULL.
+ */
+static bool libsystemd_split_instance_name(const char* unit_name, char** out_prefix, char** out_instance)
+{
+    *out_prefix = NULL;
+    *out_instance = NULL;
+
+    size_t len = strlen(unit_name);
+
+    const char* at = NULL;
+    for (size_t i = 0; i < len; i++)
+    {
+        if (unit_name[i] == '@')
+        {
+            at = unit_name + i;
+            break;
+        }
+    }
+    if (at == NULL)
+    {
+        return false;
+    }
+
+    size_t prefix_len = (size_t)(at - unit_name);
+    size_t instance_len = len - prefix_len - 1;
+    if (prefix_len == 0 || instance_len == 0)
+    {
+        return false;
+    }
+
+    char* prefix = Dmod_Malloc(prefix_len + 1);
+    if (prefix == NULL)
+    {
+        return false;
+    }
+    memcpy(prefix, unit_name, prefix_len);
+    prefix[prefix_len] = '\0';
+
+    char* instance = Dmod_Malloc(instance_len + 1);
+    if (instance == NULL)
+    {
+        Dmod_Free(prefix);
+        return false;
+    }
+    memcpy(instance, at + 1, instance_len);
+    instance[instance_len] = '\0';
+
+    *out_prefix = prefix;
+    *out_instance = instance;
+    return true;
+}
+
+/**
+ * @brief Synthesize a service purely from a template, with no on-disk instance file
+ *
+ * Parses `<units_dir>/<prefix>@.ini` and expands `%i`/`%I`/`%p`/`%n`/`%%` for
+ * the given @p instance, exactly like libsystemd_parse_dir() would for an
+ * on-disk instance file - the difference is that no such file needs to
+ * exist. This is the "systemctl start foo@bar" analog: unlike the directory
+ * scan (which only starts instances that already have their own `*.ini`
+ * file), this lets any instance name be started as long as its template
+ * exists.
+ *
+ * @param units_dir Directory to look for "<prefix>@.ini" in (must not be NULL).
+ * @param prefix    Template prefix, e.g. "getty" (must not be NULL).
+ * @param instance  Instance name, e.g. "tty1" (must not be NULL).
+ * @param service   Receives the newly allocated service on success, with
+ *                    `unit_name` already set to "<prefix>@<instance>" (must not be NULL).
+ *
+ * @retval 0       `*service` is fully populated and owns its `unit_name`.
+ * @retval -ENOMEM Allocation failed.
+ * @retval -EINVAL The resolved template has no "exec" key.
+ * @retval <0      Any other negative value is a `DMINI_ERR_*` code forwarded
+ *                   from `dmini_parse_file` on the template (e.g.
+ *                   `DMINI_ERR_FILE` if "<prefix>@.ini" does not exist).
+ */
+static int libsystemd_instantiate_from_template(const char* units_dir, const char* prefix, const char* instance, libsystemd_service_t* service)
+{
+    char* template_path = libsystemd_build_template_path(units_dir, prefix);
+    if (template_path == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    dmini_context_t ctx = dmini_create();
+    if (ctx == NULL)
+    {
+        Dmod_Free(template_path);
+        return -ENOMEM;
+    }
+
+    int result = dmini_parse_file(ctx, template_path);
+    Dmod_Free(template_path);
+    if (result != DMINI_OK)
+    {
+        dmini_destroy(ctx);
+        return result;
+    }
+
+    char* unit_name = libsystemd_build_unit_name(prefix, instance);
+    if (unit_name == NULL)
+    {
+        dmini_destroy(ctx);
+        return -ENOMEM;
+    }
+
+    if (!libsystemd_apply_specifiers(ctx, prefix, instance, unit_name))
+    {
+        dmini_destroy(ctx);
+        Dmod_Free(unit_name);
+        return -ENOMEM;
+    }
+
+    libsystemd_service_t new_service = NULL;
+    result = libsystemd_build_service_from_ctx(ctx, &new_service);
+    dmini_destroy(ctx);
+
+    if (result != 0)
+    {
+        Dmod_Free(unit_name);
+        return result;
+    }
+
+    new_service->unit_name = unit_name;
+    *service = new_service;
+
+    return 0;
+}
+
+/**
+ * @brief Resolve a unit name that was not found in @ref g_services as an on-demand template instance
+ *
+ * Called from libsystemd_start_service() when @p unit_name isn't already
+ * registered. If @p unit_name is "<prefix>@<instance>"-shaped
+ * (libsystemd_split_instance_name()) and a units directory is known (@ref
+ * g_units_dir, set by the last successful libsystemd_scan()), tries to
+ * instantiate it from "<prefix>@.ini" (libsystemd_instantiate_from_template())
+ * and, on success, adds it to @ref g_services so it behaves exactly like any
+ * other unit from then on (found by libsystemd_status()/libsystemd_stop_service()/
+ * libsystemd_list(), and not re-instantiated on a later libsystemd_start_service() call).
+ *
+ * @param unit_name Unit name that was not found by libsystemd_find_service() (must not be NULL).
+ *
+ * @return The newly instantiated and registered service, or NULL if
+ *         @p unit_name is not template-shaped, no units directory is known
+ *         yet, no matching template exists, or allocation failed.
+ */
+static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char* unit_name)
+{
+    if (g_units_dir == NULL || g_services == NULL || g_services->services == NULL)
+    {
+        return NULL;
+    }
+
+    char* prefix = NULL;
+    char* instance = NULL;
+    if (!libsystemd_split_instance_name(unit_name, &prefix, &instance))
+    {
+        return NULL;
+    }
+
+    libsystemd_service_t service = NULL;
+    int result = libsystemd_instantiate_from_template(g_units_dir, prefix, instance, &service);
+
+    Dmod_Free(prefix);
+    Dmod_Free(instance);
+
+    if (result != 0)
+    {
+        return NULL;
+    }
+
+    if (!dmlist_push_back(g_services->services, service))
+    {
+        libsystemd_destroy_service(service);
+        return NULL;
+    }
+
+    return service;
+}
+
+/**
  * @brief Allocate and initialize the global service registry (@ref g_services)
  *
  * Idempotent: if @ref g_services is already allocated, returns 0 immediately
@@ -1102,6 +1658,9 @@ static void libsystemd_serviceapi_deinit(void)
     libsystemd_stop_all_services(g_services);
     libsystemd_destroy_services(g_services);
     g_services = NULL;
+
+    Dmod_Free(g_units_dir);
+    g_units_dir = NULL;
 }
 
 /**
@@ -1152,28 +1711,41 @@ int dmod_deinit(void)
 }
 
 /**
- * @brief Start a previously scanned service by unit name
+ * @brief Start a previously scanned service by unit name, instantiating it from a template on demand if needed
  *
  * Looks @p unit_name up in the global registry (@ref g_services, populated by
  * libsystemd_scan()) and, if found, spawns it via libsystemd_start_service_internal().
  *
- * @param unit_name Unit name to start (e.g. "webserver"), as derived by
- *                    libsystemd_parse_dir() from the ini file name.
+ * If @p unit_name is not already known, but is "<prefix>@<instance>"-shaped
+ * and a matching "<prefix>@.ini" template exists in the last-scanned units
+ * directory, it is instantiated on the fly
+ * (libsystemd_instantiate_service_on_demand()) - this is the
+ * `systemctl start foo@bar` analog: an instance does not need its own `*.ini`
+ * file to be started, only its template does. The newly instantiated service
+ * is added to the registry, so a later libsystemd_status()/
+ * libsystemd_stop_service()/libsystemd_list() sees it exactly like any unit
+ * that was already on disk at the last libsystemd_scan().
  *
- * @retval 0         The service was found and spawned successfully.
+ * @param unit_name Unit name to start (e.g. "webserver", or "getty@tty1" for
+ *                    a template instance), as derived by libsystemd_parse_dir()
+ *                    from the ini file name, or synthesized as "<prefix>@<instance>".
+ *
+ * @retval 0         The service was found (or instantiated) and spawned successfully.
  * @retval -EINVAL   @p unit_name was NULL.
- * @retval -ENOENT   No service with that unit name exists in the registry
- *                     (including the case where libsystemd_scan() was never called).
+ * @retval -ENOENT   No service with that unit name exists in the registry, and it
+ *                     could not be instantiated from a template either (not
+ *                     "<prefix>@<instance>"-shaped, no units directory known yet,
+ *                     no matching template, or allocation failed).
  * @retval -EALREADY The service already has a live process associated with it.
  * @retval -ENOSYS   Module spawning is not available on this build/platform.
  * @retval <0        Any other negative value forwarded from `Dmod_SpawnModule`.
  *
  * @par Example
  * @code
- * libsystemd_scan("/etc/services");
- * int result = libsystemd_start_service("webserver");
+ * libsystemd_scan("/etc/services"); // only has getty@.ini, no getty@tty1.ini
+ * int result = libsystemd_start_service("getty@tty1"); // instantiated on the fly
  * if (result != 0) {
- *     Dmod_Printf("failed to start webserver: %d\n", result);
+ *     Dmod_Printf("failed to start getty@tty1: %d\n", result);
  * }
  * @endcode
  */
@@ -1185,6 +1757,10 @@ dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_nam
     }
 
     libsystemd_service_t service = libsystemd_find_service(g_services, unit_name);
+    if (service == NULL)
+    {
+        service = libsystemd_instantiate_service_on_demand(unit_name);
+    }
     if (service == NULL)
     {
         return -ENOENT;
@@ -1329,7 +1905,10 @@ dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, 
  * 5. Stops every service in the *previous* registry and destroys it
  *    (libsystemd_stop_all_services() + libsystemd_destroy_services()), so a rescan
  *    never leaves the old generation's processes running untracked.
- * 6. Installs the fresh, sorted registry as the new @ref g_services.
+ * 6. Installs the fresh, sorted registry as the new @ref g_services, and
+ *    remembers @p path as @ref g_units_dir for later on-demand template
+ *    instantiation (see libsystemd_start_service()) - best-effort, a failure
+ *    to remember it does not fail the scan.
  * 7. Starts every service in the new registry, in order
  *    (libsystemd_start_service_visitor() via dmlist_foreach()) - failures for
  *    individual services are logged and do not abort the scan.
@@ -1382,22 +1961,112 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
     libsystemd_destroy_services(g_services);
     g_services = parsed;
 
+    char* units_dir = Dmod_StrDup(path);
+    if (units_dir != NULL)
+    {
+        Dmod_Free(g_units_dir);
+        g_units_dir = units_dir;
+    }
+
     dmlist_foreach(g_services->services, libsystemd_start_service_visitor, NULL);
 
     return 0;
 }
 
 /**
+ * @brief Parse a single ".ini" unit file into a newly allocated service, optionally merged with a template
+ *
+ * Shared implementation behind both the public libsystemd_parse_file() (which
+ * always passes @p template_path/@p prefix/@p instance as NULL - a plain,
+ * non-templated parse) and libsystemd_parse_dir()'s handling of
+ * ::LIBSYSTEMD_UNIT_INSTANCE files.
+ *
+ * When @p template_path is non-NULL, it is parsed into the same `dmini`
+ * context *first* - best-effort, a missing/invalid template file is not an
+ * error, it just means the instance file's own keys are all there is - so
+ * that @p file_path's own keys are layered on top and override the
+ * template's for any key present in both (`dmini_parse_file`/
+ * `dmini_set_string` update an existing key's value in place - see
+ * `set_pair_in_section()` in dmini). When @p prefix/@p instance are both
+ * non-NULL, every key's value is then run through
+ * libsystemd_apply_specifiers() to expand `%i`/`%I`/`%p`/`%n`/`%%`.
+ *
+ * Otherwise behaves exactly like the original single-file parse: copies
+ * "exec" (required), "args" (optional, tokenized into argv),
+ * "stdin"/"stdout"/"stderr"/"stdlog" (optional, stream redirections), and
+ * "requires"/"after" (optional, dependency name lists) into a fresh
+ * `libsystemd_service_t`. Does **not** set `unit_name` or `starting_order` -
+ * those are the caller's responsibility (see libsystemd_parse_dir()). Does
+ * not touch the global registry.
+ *
+ * @param file_path     Path to the ".ini" file to parse (must not be NULL).
+ * @param template_path Path to the file's `<prefix>@.ini` template, or NULL
+ *                        for a non-templated parse.
+ * @param prefix        Template prefix (e.g. "getty"), or NULL.
+ * @param instance      Instance name (e.g. "tty1"), or NULL.
+ * @param service       Receives the newly allocated service on success (must not be NULL).
+ *
+ * @retval 0       `*service` now points to a fully populated service (unit_name is NULL,
+ *                   starting_order is 0, pid is -1).
+ * @retval -EINVAL @p file_path or @p service was NULL, or the merged result has no "exec" key.
+ * @retval -ENOMEM Allocation failed at some point during parsing; nothing is
+ *                   leaked, and `*service` is left untouched.
+ * @retval <0      Any other negative value is a `DMINI_ERR_*` code forwarded
+ *                   from `dmini_parse_file` on @p file_path itself (e.g.
+ *                   `DMINI_ERR_FILE` if the file could not be opened) - a
+ *                   failure to parse @p template_path is never propagated.
+ */
+static int libsystemd_parse_unit_internal(const char* file_path, const char* template_path, const char* prefix, const char* instance, libsystemd_service_t* service)
+{
+    if (file_path == NULL || service == NULL)
+    {
+        return -EINVAL;
+    }
+
+    dmini_context_t ctx = dmini_create();
+    if (ctx == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    if (template_path != NULL)
+    {
+        dmini_parse_file(ctx, template_path);
+    }
+
+    int result = dmini_parse_file(ctx, file_path);
+    if (result != DMINI_OK)
+    {
+        dmini_destroy(ctx);
+        return result;
+    }
+
+    if (prefix != NULL && instance != NULL)
+    {
+        char* unit_name = libsystemd_build_unit_name(prefix, instance);
+        if (unit_name == NULL || !libsystemd_apply_specifiers(ctx, prefix, instance, unit_name))
+        {
+            Dmod_Free(unit_name);
+            dmini_destroy(ctx);
+            return -ENOMEM;
+        }
+        Dmod_Free(unit_name);
+    }
+
+    result = libsystemd_build_service_from_ctx(ctx, service);
+    dmini_destroy(ctx);
+
+    return result;
+}
+
+/**
  * @brief Parse a single ".ini" unit file into a newly allocated service
  *
- * Reads @p file_path via `dmini` and copies every field this module
- * understands into a fresh `libsystemd_service_t`: "exec" (required), "args"
- * (optional, tokenized into argv), "stdin"/"stdout"/"stderr" (optional,
- * stream redirections), and "requires"/"after" (optional, dependency name
- * lists). Does **not** set `unit_name` or `starting_order` - those are the
- * responsibility of the caller (see libsystemd_parse_dir()), since a bare ini
- * file has no notion of its own file name or its place relative to other
- * services. Does not touch the global registry.
+ * Thin wrapper around libsystemd_parse_unit_internal() with no template - see
+ * that function for the full behavior. Kept as the public entry point so
+ * templated instance parsing (only reachable from libsystemd_parse_dir(),
+ * which knows a file's `<prefix>@.ini` template path and instance name)
+ * stays an internal implementation detail.
  *
  * @param file_path Path to the ".ini" file to parse.
  * @param service   Receives the newly allocated service on success (must not be NULL).
@@ -1423,77 +2092,28 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
  */
 dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, libsystemd_service_t* service ))
 {
-    if (file_path == NULL || service == NULL)
-    {
-        return -EINVAL;
-    }
-
-    dmini_context_t ctx = dmini_create();
-    if (ctx == NULL)
-    {
-        return -ENOMEM;
-    }
-
-    int result = dmini_parse_file(ctx, file_path);
-    if (result != DMINI_OK)
-    {
-        dmini_destroy(ctx);
-        return result;
-    }
-
-    const char* exec = dmini_get_string(ctx, NULL, "exec", NULL);
-    if (exec == NULL)
-    {
-        dmini_destroy(ctx);
-        return -EINVAL;
-    }
-
-    libsystemd_service_t new_service = Dmod_Malloc(sizeof(struct libsystemd_service));
-    if (new_service == NULL)
-    {
-        dmini_destroy(ctx);
-        return -ENOMEM;
-    }
-
-    new_service->unit_name = NULL;
-    new_service->exec = NULL;
-    new_service->argc = 0;
-    new_service->argv = NULL;
-    new_service->streams.Entries = NULL;
-    new_service->streams.Count = 0;
-    new_service->starting_order = 0;
-    new_service->required = NULL;
-    new_service->after = NULL;
-    new_service->pid = -1;
-
-    const char* args = dmini_get_string(ctx, NULL, "args", NULL);
-
-    bool ok = (new_service->exec = Dmod_StrDup(exec)) != NULL;
-    ok = ok && libsystemd_build_argv(new_service, exec, args);
-    ok = ok && libsystemd_build_streams(ctx, new_service);
-    ok = ok && libsystemd_parse_name_list(ctx, "requires", &new_service->required);
-    ok = ok && libsystemd_parse_name_list(ctx, "after", &new_service->after);
-
-    dmini_destroy(ctx);
-
-    if (!ok)
-    {
-        libsystemd_destroy_service(new_service);
-        return -ENOMEM;
-    }
-
-    *service = new_service;
-
-    return 0;
+    return libsystemd_parse_unit_internal(file_path, NULL, NULL, NULL, service);
 }
 
 /**
  * @brief Parse every ".ini" unit file in a directory into a newly allocated registry
  *
  * Opens @p dir_path and, for each entry whose name ends in ".ini"
- * (libsystemd_has_ini_extension()), calls libsystemd_parse_file() on it and, on
- * success, sets the resulting service's `unit_name` (libsystemd_make_unit_name())
- * and appends it to the new registry's list. Files that fail to parse are
+ * (libsystemd_has_ini_extension()), classifies it via
+ * libsystemd_classify_unit_file():
+ * - ::LIBSYSTEMD_UNIT_TEMPLATE (e.g. "getty@.ini") is skipped entirely - a
+ *   bare template is never parsed or started on its own, exactly like
+ *   `systemctl start foo@.service` is refused in real systemd.
+ * - ::LIBSYSTEMD_UNIT_PLAIN and ::LIBSYSTEMD_UNIT_INSTANCE are parsed via
+ *   libsystemd_parse_unit_internal() - for an instance (e.g. "getty@tty1.ini"),
+ *   its `<prefix>@.ini` template (if any exists next to it) is merged in as
+ *   defaults first and `%i`/`%I`/`%p`/`%n`/`%%` specifiers are expanded, so a
+ *   near-empty instance file can inherit everything from the template and
+ *   override only what differs (see [configuration.md](../docs/configuration.md#templates)).
+ *
+ * On success, sets the resulting service's `unit_name`
+ * (libsystemd_make_unit_name() - "getty@tty1.ini" becomes "getty@tty1") and
+ * appends it to the new registry's list. Files that fail to parse are
  * logged via DMOD_LOG_WARN() and skipped rather than aborting the whole scan.
  * Does not resolve `starting_order`, sort, or start anything - see
  * libsystemd_scan() for the full pipeline built on top of this function.
@@ -1554,25 +2174,39 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, li
     {
         if (libsystemd_has_ini_extension(entry->name))
         {
-            char* file_path = libsystemd_join_path(dir_path, entry->name);
-            if (file_path != NULL)
+            char* prefix = NULL;
+            char* instance = NULL;
+            libsystemd_unit_kind_t kind = libsystemd_classify_unit_file(entry->name, &prefix, &instance);
+
+            if (kind != LIBSYSTEMD_UNIT_TEMPLATE)
             {
-                libsystemd_service_t service = NULL;
-                int result = libsystemd_parse_file(file_path, &service);
-                if (result == 0)
+                char* file_path = libsystemd_join_path(dir_path, entry->name);
+                if (file_path != NULL)
                 {
-                    service->unit_name = libsystemd_make_unit_name(entry->name);
-                    if (service->unit_name == NULL || !dmlist_push_back(new_services->services, service))
+                    char* template_path = (kind == LIBSYSTEMD_UNIT_INSTANCE) ? libsystemd_build_template_path(dir_path, prefix) : NULL;
+
+                    libsystemd_service_t service = NULL;
+                    int result = libsystemd_parse_unit_internal(file_path, template_path, prefix, instance, &service);
+                    if (result == 0)
                     {
-                        libsystemd_destroy_service(service);
+                        service->unit_name = libsystemd_make_unit_name(entry->name);
+                        if (service->unit_name == NULL || !dmlist_push_back(new_services->services, service))
+                        {
+                            libsystemd_destroy_service(service);
+                        }
                     }
+                    else
+                    {
+                        DMOD_LOG_WARN("Failed to parse service file '%s' (%d)\n", file_path, result);
+                    }
+
+                    Dmod_Free(template_path);
+                    Dmod_Free(file_path);
                 }
-                else
-                {
-                    DMOD_LOG_WARN("Failed to parse service file '%s' (%d)\n", file_path, result);
-                }
-                Dmod_Free(file_path);
             }
+
+            Dmod_Free(prefix);
+            Dmod_Free(instance);
         }
 
         entry = Dmod_ReadDirEx(dir);

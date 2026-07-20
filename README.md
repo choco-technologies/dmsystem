@@ -99,14 +99,47 @@ Recognized keys:
 | `stdin`       | (unset)    | Implemented | Path to a file to redirect the unit's stdin from |
 | `stdout`      | (unset)    | Implemented | Path to a file to redirect the unit's stdout to |
 | `stderr`      | (unset)    | Implemented | Path to a file to redirect the unit's stderr to |
+| `stdlog`      | (unset)    | Implemented | Path to a file to redirect the unit's `DMOD_STDLOG` stream to - a separate, platform-configurable logging stream that defaults to the same target as `stdout` unless the platform overrides `Dmod_GetStdLogFile()` |
 | `description` | unit name  | **Not yet implemented** | Parsed by no one - the key is free to set but currently has no effect (not logged, not surfaced by `service`) |
 | `type`        | `simple`   | **Not yet implemented** | Key is not read at all yet - every unit is started the same way (spawned via `Dmod_SpawnModule`); there is no `oneshot` run-to-completion behavior |
 | `restart`     | `no`       | **Not yet implemented** | Key is not read at all yet - there is no supervise loop, so a unit that exits on its own is simply left stopped |
-| `stdlog`      | (unset)    | **Not yet implemented** | Only `stdin`/`stdout`/`stderr` are wired up today |
 
 An unset stream key leaves that stream at whatever default the spawned module
-would otherwise get; `stdout`/`stderr` may point at the same path (as in the
-`webserver.ini` example above) to interleave both into one file.
+would otherwise get; `stdout`/`stderr`/`stdlog` may point at the same path (as
+in the `webserver.ini` example above) to interleave several into one file.
+
+### Templates
+
+Unit file names may contain a literal `@`, `systemd`-style: `getty@.ini` is a
+**template** (never started on its own), and `getty@tty1.ini` is an
+**instance** of it. An instance file is parsed on top of its template - any
+key it sets overrides the template's, everything else is inherited - so it
+can be entirely empty and still pull in `exec`/`args`/etc. from the template.
+Every key's value is then expanded for `%i`/`%I` (instance name), `%p`
+(template prefix), `%n` (full `prefix@instance` unit name) and `%%` (literal
+`%`):
+
+```ini
+# getty@.ini
+description=Getty on %i
+exec=dmgetty
+args=--tty %i
+```
+
+```ini
+# getty@tty1.ini (empty - inherits everything from getty@.ini)
+```
+
+A physical instance file is only needed for auto-start at scan time (the
+"enabled unit" equivalent). `service start getty@tty3` also works with no
+`getty@tty3.ini` on disk at all - `libsystemd_start_service()` resolves
+`getty@.ini` and expands `%i` on the fly, the closest equivalent this system
+has to `systemctl start foo@bar` given `dmvfs` has no symlinks to build a
+`.wants/`-style mechanism on. See
+[`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#templates)
+for the full specifier reference, and
+[`app/libsystemd/examples/`](app/libsystemd/examples) for a runnable
+`getty@.ini`/`getty@tty1.ini`/`getty@tty2.ini` set.
 
 Dependency ordering is resolved with a bounded relaxation pass (each unit's
 start order is pushed past everything it requires/comes after, repeated
