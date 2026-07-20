@@ -29,7 +29,11 @@ readme=./README.md => ${destination}/${module}/README.md [origin=${repo_dir}/REA
 
 # === Header Files ===
 # Include directory with all headers (public header + generated <module>_defs.h)
-inc=./include => ${destination}/${module}/include [origin=${repo_dir}/app/service/include] [origin=${build_dir}/${module}_defs.h]
+# NOTE: ${build_dir} is likewise the top-level CMAKE_BINARY_DIR, not this
+# module's own CMAKE_CURRENT_BINARY_DIR - dmod_create_module() generates
+# <module>_defs.h next to the module's own CMakeLists.txt (mirroring the
+# source tree, i.e. ${build_dir}/app/service/), not at the build root.
+inc=./include => ${destination}/${module}/include [origin=${repo_dir}/app/service/include] [origin=${build_dir}/app/service/${module}_defs.h]
 
 # === License ===
 # License file
