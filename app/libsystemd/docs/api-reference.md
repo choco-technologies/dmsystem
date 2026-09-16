@@ -72,8 +72,10 @@ exists) with `%i`/`%I`/`%p`/`%n`/`%%` expanded - see
 
 ### `libsystemd_start_service(const char* unit_name, const char* user_value)`
 
-Looks `unit_name` up in the global registry and spawns it (`Dmod_SpawnModule`
-with the unit's `exec`/`argc`/`argv`/stream redirections).
+Looks `unit_name` up in the global registry and spawns it (`Dmod_RunModuleDetached`
+with the unit's `exec`/`argc`/`argv`/stream redirections - detached rather than
+`Dmod_SpawnModule` so the unit's lifetime is never tied to whichever process
+happened to call this).
 
 If `unit_name` is not already registered but is `<prefix>@<instance>`-shaped
 and `<prefix>@.ini` exists in the last-scanned units directory, it is
@@ -94,7 +96,7 @@ its process later exits on its own - see [configuration.md](configuration.md#res
   template either (including "nothing has been scanned yet").
 - `-EALREADY` - the unit already has a live process.
 - `-ENOSYS` - module spawning is unavailable on this build/platform.
-- other negative values are forwarded from `Dmod_SpawnModule`.
+- other negative values are forwarded from `Dmod_RunModuleDetached`.
 
 ### `libsystemd_stop_service(const char* unit_name)`
 

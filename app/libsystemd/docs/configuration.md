@@ -25,7 +25,7 @@ else (non-`.ini` files) is silently skipped.
 
 | Key        | Required | Meaning |
 |------------|----------|---------|
-| `exec`     | yes      | Module name (or file path) passed to `Dmod_SpawnModule` when the unit is started. Also becomes `argv[0]`. |
+| `exec`     | yes      | Module name (or file path) passed to `Dmod_RunModuleDetached` when the unit is started. Also becomes `argv[0]`. |
 | `args`     | no       | Extra arguments for `exec`, split on runs of spaces/tabs. Each token becomes one more `argv` entry after `argv[0]`. |
 | `after`    | no       | Unit names this unit must be ordered after. Multiple names are split on `,` and/or whitespace (freely mixed). |
 | `requires` | no       | Same syntax as `after`. Currently resolved identically to `after` - both just push this unit's `starting_order` past the referenced units'. |
@@ -49,7 +49,9 @@ enable restart supervision.
 
 The `type` key only affects how a process's own (non-killed) exit is logged,
 not whether/how it is started - every unit is spawned the same way, via
-`Dmod_SpawnModule`:
+`Dmod_RunModuleDetached` (detached, so a unit's lifetime is never tied to
+whichever process happened to start it - see the comment in
+`libsystemd_start_service_internal()`):
 
 - `simple` (default) - the process is expected to keep running until
   explicitly stopped. An exit it was not killed for is logged as a warning.
@@ -192,7 +194,7 @@ some partially-resolved order.
 
 Once every unit's `starting_order` is resolved, the registry is sorted
 ascending by that value (`dmlist_sort`) and every unit is started in that
-order via `Dmod_SpawnModule`. A unit that fails to start (e.g. `exec` names
+order via `Dmod_RunModuleDetached`. A unit that fails to start (e.g. `exec` names
 a module that cannot be found) is logged and skipped - it does not stop the
 rest of the registry from starting.
 

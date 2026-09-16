@@ -771,7 +771,8 @@ static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_s
  * (libsystemd_service_exit_callback()) is supervised exactly the same way as
  * the initial start.
  *
- * Spawns `service->exec` as a module via `Dmod_SpawnModule()`, passing
+ * Spawns `service->exec` as a module via `Dmod_RunModuleDetached()` (not
+ * `Dmod_SpawnModule()` - see the comment at its call site), passing
  * `service->argc`/`service->argv` and, if any stream redirections were parsed,
  * `&service->streams`. On success, records the returned PID in `service->pid`
  * so later libsystemd_stop_service()/libsystemd_status() calls can find the process.
@@ -788,8 +789,8 @@ static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_s
  *
  * @retval 0        The service was spawned successfully; `service->pid` now holds its PID.
  * @retval -EALREADY The service already has a live process associated with it.
- * @retval -ENOSYS  `Dmod_SpawnModule` is not connected on this build/platform (see @ref DMOD_SAL_PROC).
- * @retval <0       Any other negative value is the errno-style error returned by `Dmod_SpawnModule`
+ * @retval -ENOSYS  `Dmod_RunModuleDetached` is not connected on this build/platform (see @ref DMOD_SAL_PROC).
+ * @retval <0       Any other negative value is the errno-style error returned by `Dmod_RunModuleDetached`
  *                   (e.g. -ENOENT if `service->exec` could not be found/loaded as a module).
  *
  * @note `service->pid` is left untouched when spawning fails, so a failed
@@ -803,15 +804,26 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
         return -EALREADY;
     }
 
-    if (!Dmod_IsFunctionConnected((void*)Dmod_SpawnModule))
+    if (!Dmod_IsFunctionConnected((void*)Dmod_RunModuleDetached))
     {
         return -ENOSYS;
     }
 
     DMOD_LOG_INFO("Starting service '%s'\n", service->unit_name);
 
+    // Dmod_RunModuleDetached(), not Dmod_SpawnModule(): the latter parents the new
+    // process under whoever calls it (here, whichever unit's process happens to be
+    // running libsystemd_scan()/_notify_device_added() at the time - typically
+    // `systemd` itself during the initial boot pass). Every spawned module's main()
+    // returning triggers Dmod_Exit() -> dmosi_process_kill() on itself, which
+    // recursively kills its *entire* parented subtree - so a unit spawned via
+    // Dmod_SpawnModule would be torn down the instant its parent's own main()
+    // returns, even though units are meant to keep running independently (see
+    // systemd.c's main() doc comment). Dmod_RunModuleDetached() spawns with no
+    // parent, so a unit's lifetime is never tied to whichever process happened to
+    // start it.
     const Dmod_StreamRedirections_t* streams = (service->streams.Count > 0) ? &service->streams : NULL;
-    int spawn_result = Dmod_SpawnModule(service->exec, service->argc, service->argv, streams);
+    int spawn_result = Dmod_RunModuleDetached(service->exec, service->argc, service->argv, streams);
     if (spawn_result < 0)
     {
         return spawn_result;
@@ -2663,7 +2675,7 @@ int dmod_deinit(void)
  *                     no matching template, or allocation failed).
  * @retval -EALREADY The service already has a live process associated with it.
  * @retval -ENOSYS   Module spawning is not available on this build/platform.
- * @retval <0        Any other negative value forwarded from `Dmod_SpawnModule`.
+ * @retval <0        Any other negative value forwarded from `Dmod_RunModuleDetached`.
  *
  * @par Example
  * @code
