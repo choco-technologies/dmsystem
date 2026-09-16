@@ -27,15 +27,33 @@ jobs:
       - name: List available architectures
         id: list-archs
         run: |
-          DMOD_SRC_DIR=$(find build_discovery -path "*/_deps/dmod-src" -type d | head -1)
+          set -e
+          # FetchContent always places dmod's sources at <build_dir>/_deps/dmod-src.
+          # A `find ... -path "*/_deps/dmod-src"` glob also matches empty phantom
+          # directories that CMake creates under test targets' CMakeFiles/ while
+          # scanning relative-path includes (e.g. app/*/tests/CMakeFiles/*/__/__/__/
+          # _deps/dmod-src) - on some filesystems those can sort before the real
+          # one, silently yielding zero architectures instead of failing loudly.
+          DMOD_SRC_DIR="build_discovery/_deps/dmod-src"
+
+          if [ ! -d "$DMOD_SRC_DIR/configs/arch" ]; then
+            echo "Error: $DMOD_SRC_DIR/configs/arch not found - dmod was not fetched as expected"
+            exit 1
+          fi
 
           # create JSON array
-          ARCHS=$(find ${DMOD_SRC_DIR}/configs/arch -name "tools-cfg.cmake" | \
+          ARCHS=$(find "${DMOD_SRC_DIR}/configs/arch" -name "tools-cfg.cmake" | \
             sed "s|${DMOD_SRC_DIR}/configs/arch/||g" | \
             sed 's|/tools-cfg.cmake||g' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
 
           echo "Found architectures: $ARCHS"
+
+          if [ "$ARCHS" = "[]" ]; then
+            echo "Error: no architectures discovered under $DMOD_SRC_DIR/configs/arch"
+            exit 1
+          fi
+
           echo "architectures=$ARCHS" >> $GITHUB_OUTPUT
 
   build-release:
