@@ -4,10 +4,10 @@
 #include "dmod.h"
 #include "libsystemd_defs.h"
 #include "libsystemd_types.h"
-#include "dmlist.h"
 
 dmod_libsystemd_api(1.0, int, _start_service, ( const char* unit_name, const char* user_value ));
 dmod_libsystemd_api(1.0, int, _stop_service, ( const char* unit_name ));
+dmod_libsystemd_api(1.0, int, _notify_main_pid, ( const char* unit_name, Dmod_Pid_t pid ));
 dmod_libsystemd_api(1.0, int, _status, ( const char* unit_name, libsystemd_service_status_t* out_status ));
 dmod_libsystemd_api(1.0, int, _list, (libsystemd_visitor_t visitor, void* user_ptr));
 

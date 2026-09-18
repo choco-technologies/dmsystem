@@ -4,6 +4,10 @@
 #include <string.h>
 #include "dmini.h"
 #include "dmosi.h"
+// Not pulled in by libsystemd.h: the public API deliberately keeps dmlist out of
+// its surface (see the libsystemd_services_t doc in libsystemd_types.h), so the
+// registry's own list handling includes it here instead.
+#include "dmlist.h"
 
 /**
  * @brief Full definition of the opaque @ref libsystemd_service_t handle
@@ -32,8 +36,9 @@ struct libsystemd_service
     int starting_order;                 //!< Relative start order computed by libsystemd_resolve_starting_order() (lower starts first).
     dmlist_context_t* required;         //!< List of owned `char*` unit names this service requires (from "requires").
     dmlist_context_t* after;            //!< List of owned `char*` unit names this service must start after (from "after").
-    Dmod_Pid_t pid;                     //!< PID returned by the last successful start, or <= 0 if never started/not running.
-    dmosi_process_exit_callback_handle_t exit_callback_handle;  //!< Handle of the dmosi exit callback registered for the current run (see libsystemd_start_service_internal()), or NULL if none is registered (restart_policy is ::LIBSYSTEMD_RESTART_NO, not currently running, or registration failed/unsupported).
+    Dmod_Pid_t pid;                     //!< PID of the process currently tracked for this unit, or <= 0 if never started/not running.
+    Dmod_Pid_t last_pid;                //!< PID of the most recent run, retained after `pid` is released so status can tell "never started" from "exited"; <= 0 only if the unit has never run.
+    dmosi_process_exit_callback_handle_t exit_callback_handle;  //!< Handle of the dmosi exit callback registered for the current run (see libsystemd_attach_exit_callback()), or NULL if none is registered (not currently running, or registration failed/unsupported).
 };
 
 /**
@@ -577,6 +582,36 @@ static int libsystemd_compare_by_unit_name(const void* data1, const void* data2)
 }
 
 /**
+ * @brief dmlist_find() comparator matching a service by its current main PID
+ *
+ * Counterpart of libsystemd_compare_by_unit_name() for the one lookup that
+ * cannot go by name: libsystemd_notify_main_pid() called with a NULL unit
+ * name, where the caller identifies itself simply by being the unit's current
+ * main process (see libsystemd_find_service_by_pid()).
+ *
+ * @param data1 Node data, actually a `libsystemd_service_t`.
+ * @param data2 Query data, actually a `const Dmod_Pid_t*`.
+ *
+ * @retval 0     The service's `pid` equals the queried PID.
+ * @retval <0/>0 Numeric order, otherwise.
+ *
+ * @note A service that is not running carries `pid <= 0`, so a query for a
+ *       non-positive PID must never reach here - libsystemd_find_service_by_pid()
+ *       rejects those up front, otherwise every stopped unit would match.
+ */
+static int libsystemd_compare_by_pid(const void* data1, const void* data2)
+{
+    const struct libsystemd_service* service = (const struct libsystemd_service*)data1;
+    const Dmod_Pid_t* pid = (const Dmod_Pid_t*)data2;
+
+    if (service->pid == *pid)
+    {
+        return 0;
+    }
+    return (service->pid < *pid) ? -1 : 1;
+}
+
+/**
  * @brief Comparator ordering two services by their computed starting_order
  *
  * Intended for use with dmlist_sort(), which sorts ascending - services with
@@ -629,6 +664,32 @@ static libsystemd_service_t libsystemd_find_service(libsystemd_services_t servic
     }
 
     return (libsystemd_service_t)dmlist_find(services->services, unit_name, libsystemd_compare_by_unit_name);
+}
+
+/**
+ * @brief Look up a service in a registry by the PID it is currently tracking
+ *
+ * Used by libsystemd_notify_main_pid() to resolve "the unit the caller is the
+ * main process of" without making every launcher unit thread its own unit name
+ * through its argv - see that function.
+ *
+ * @param services Registry to search, may be NULL.
+ * @param pid      PID to search for; a non-positive value never matches.
+ *
+ * @return Matching `libsystemd_service_t`, or NULL if @p services is NULL/empty,
+ *         @p pid is non-positive, or no service currently tracks that PID.
+ *
+ * @note Like libsystemd_find_service(), the returned pointer is borrowed from
+ *       the registry and must not be freed by the caller.
+ */
+static libsystemd_service_t libsystemd_find_service_by_pid(libsystemd_services_t services, Dmod_Pid_t pid)
+{
+    if (services == NULL || services->services == NULL || pid <= 0)
+    {
+        return NULL;
+    }
+
+    return (libsystemd_service_t)dmlist_find(services->services, &pid, libsystemd_compare_by_pid);
 }
 
 /**
@@ -761,6 +822,77 @@ static void libsystemd_resolve_starting_order(dmlist_context_t* services)
 static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_status, void* arg);
 
 /**
+ * @brief Register libsystemd_service_exit_callback() on the process a service currently tracks
+ *
+ * Registered for *every* unit, not just one with a "restart" policy: the
+ * callback is also what clears `service->pid` back to the "not running"
+ * sentinel when a process exits on its own (see libsystemd_service_exit_callback()).
+ * Without it, a `restart=no` unit kept a stale PID forever, so
+ * libsystemd_status() reported a corpse as running and a later
+ * libsystemd_stop_service() aimed dmosi_process_kill() at an ID that no longer
+ * belonged to it.
+ *
+ * Best-effort: silently does nothing if the PID no longer resolves, or if
+ * registration itself fails - `exit_callback_handle` is then simply left NULL,
+ * exactly as it is for a unit that is not running.
+ *
+ * @param service Service whose `pid` names the process to supervise (must not be NULL).
+ *
+ * @return Nothing - failure is not fatal to starting/adopting a unit.
+ *
+ * @note Overwrites `service->exit_callback_handle` without unregistering a
+ *       previous registration; callers that may already have one (e.g.
+ *       libsystemd_notify_main_pid()) must detach it first.
+ */
+static void libsystemd_attach_exit_callback(libsystemd_service_t service)
+{
+    service->exit_callback_handle = NULL;
+
+    dmosi_process_t process = dmosi_process_find_by_id((dmosi_process_id_t)service->pid);
+    if (process == NULL)
+    {
+        return;
+    }
+
+    service->exit_callback_handle = dmosi_process_register_exit_callback(process, libsystemd_service_exit_callback, service);
+}
+
+/**
+ * @brief Unregister a service's exit callback, if one is currently registered
+ *
+ * Counterpart of libsystemd_attach_exit_callback(), shared by
+ * libsystemd_stop_service_internal() (which must not let a "restart" policy
+ * respawn a deliberately stopped unit) and libsystemd_notify_main_pid() (which
+ * moves supervision from the launcher process to the one it spawned).
+ *
+ * @param service Service to detach the callback from (must not be NULL).
+ * @param process Process the callback was registered on, or NULL to resolve it
+ *                from `service->pid`.
+ *
+ * @return Nothing - `exit_callback_handle` is cleared either way, so a handle
+ *         whose process is already gone is simply forgotten.
+ */
+static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_process_t process)
+{
+    if (service->exit_callback_handle == NULL)
+    {
+        return;
+    }
+
+    if (process == NULL)
+    {
+        process = dmosi_process_find_by_id((dmosi_process_id_t)service->pid);
+    }
+
+    if (process != NULL)
+    {
+        dmosi_process_unregister_exit_callback(process, service->exit_callback_handle);
+    }
+
+    service->exit_callback_handle = NULL;
+}
+
+/**
  * @brief Actually spawn a service's process, without looking it up by name first
  *
  * Shared by libsystemd_start_service() (which looks the service up by unit name
@@ -777,13 +909,13 @@ static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_s
  * `&service->streams`. On success, records the returned PID in `service->pid`
  * so later libsystemd_stop_service()/libsystemd_status() calls can find the process.
  *
- * If `service->restart_policy` is not ::LIBSYSTEMD_RESTART_NO, also registers
- * libsystemd_service_exit_callback() on the newly spawned process (best-effort:
- * silently skipped if `dmosi_process_register_exit_callback` is not connected
- * on this build/platform, or if registration itself fails) so the unit is
- * automatically restarted if its process later exits on its own - see
- * libsystemd_stop_service_internal() for how a *deliberate* stop avoids
- * triggering this.
+ * Also registers libsystemd_service_exit_callback() on the newly spawned
+ * process via libsystemd_attach_exit_callback(), so the unit's PID is released
+ * when that process exits on its own and - if `service->restart_policy` calls
+ * for it - the unit is restarted. See libsystemd_stop_service_internal() for
+ * how a *deliberate* stop avoids triggering the restart, and
+ * libsystemd_notify_main_pid() for how a launcher unit hands supervision over
+ * to the process it spawned.
  *
  * @param service Service to start (must not be NULL).
  *
@@ -802,11 +934,6 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
     if (service->pid > 0 && dmosi_process_find_by_id((dmosi_process_id_t)service->pid) != NULL)
     {
         return -EALREADY;
-    }
-
-    if (!Dmod_IsFunctionConnected((void*)Dmod_RunModuleDetached))
-    {
-        return -ENOSYS;
     }
 
     DMOD_LOG_INFO("Starting service '%s'\n", service->unit_name);
@@ -830,16 +957,8 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
     }
 
     service->pid = (Dmod_Pid_t)spawn_result;
-    service->exit_callback_handle = NULL;
-
-    if (service->restart_policy != LIBSYSTEMD_RESTART_NO && Dmod_IsFunctionConnected((void*)dmosi_process_register_exit_callback))
-    {
-        dmosi_process_t process = dmosi_process_find_by_id((dmosi_process_id_t)service->pid);
-        if (process != NULL)
-        {
-            service->exit_callback_handle = dmosi_process_register_exit_callback(process, libsystemd_service_exit_callback, service);
-        }
-    }
+    service->last_pid = service->pid;
+    libsystemd_attach_exit_callback(service);
 
     return 0;
 }
@@ -847,11 +966,12 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
 /**
  * @brief dmosi process-exit callback: applies a unit's "restart" policy when its process terminates on its own
  *
- * Registered on every process spawned for a unit whose restart_policy is not
- * ::LIBSYSTEMD_RESTART_NO (see libsystemd_start_service_internal()), and
- * unregistered before a deliberate libsystemd_stop_service() kill
- * (libsystemd_stop_service_internal()) - so this only ever runs for a process
- * that terminated on its own, never for one this module killed itself.
+ * Registered on every process a unit currently tracks (see
+ * libsystemd_attach_exit_callback()), and unregistered before a deliberate
+ * libsystemd_stop_service() kill (libsystemd_stop_service_internal()) - so this
+ * only ever runs for a process that terminated on its own, never for one this
+ * module killed itself. Releasing `service->pid` here is what keeps a
+ * `restart=no` unit from carrying a stale PID once its process is gone.
  *
  * Logs the exit (DMOD_LOG_INFO() for an expected ::LIBSYSTEMD_SERVICE_TYPE_ONESHOT
  * completion, DMOD_LOG_WARN() for anything else), then re-spawns the unit via
@@ -982,14 +1102,7 @@ static int libsystemd_stop_service_internal(libsystemd_service_t service)
         return -ESRCH;
     }
 
-    if (service->exit_callback_handle != NULL)
-    {
-        if (Dmod_IsFunctionConnected((void*)dmosi_process_unregister_exit_callback))
-        {
-            dmosi_process_unregister_exit_callback(process, service->exit_callback_handle);
-        }
-        service->exit_callback_handle = NULL;
-    }
+    libsystemd_detach_exit_callback(service, process);
 
     DMOD_LOG_INFO("Stopping service '%s'\n", service->unit_name);
 
@@ -1063,10 +1176,10 @@ static void libsystemd_stop_all_services(libsystemd_services_t services)
  * @brief Compute a service's current status from its tracked PID
  *
  * Shared by libsystemd_status() and libsystemd_list_visitor() so both report status
- * identically. If the service has never been started (`pid <= 0`), reports
- * `DMOSI_PROCESS_STATE_CREATED` with a PID of 0. If it was started but its
- * process can no longer be found (it exited on its own, without going through
- * libsystemd_stop_service()), reports `DMOSI_PROCESS_STATE_TERMINATED` with the
+ * identically. If the service has never been started (`last_pid <= 0`), reports
+ * `DMOSI_PROCESS_STATE_CREATED` with a PID of 0. If it ran but its process is
+ * gone - whether it exited on its own or was stopped through
+ * libsystemd_stop_service() - reports `DMOSI_PROCESS_STATE_TERMINATED` with the
  * last known PID. Otherwise reports the live process's actual state and PID.
  *
  * @param service    Service to inspect (must not be NULL).
@@ -1085,8 +1198,19 @@ static void libsystemd_fill_status(libsystemd_service_t service, libsystemd_serv
 {
     if (service->pid <= 0)
     {
-        out_status->state = DMOSI_PROCESS_STATE_CREATED;
-        out_status->pid = 0;
+        // Released PID: either the unit never ran, or its process is gone and
+        // libsystemd_service_exit_callback()/libsystemd_stop_service_internal()
+        // cleared `pid`. `last_pid` is what still tells those two apart.
+        if (service->last_pid <= 0)
+        {
+            out_status->state = DMOSI_PROCESS_STATE_CREATED;
+            out_status->pid = 0;
+        }
+        else
+        {
+            out_status->state = DMOSI_PROCESS_STATE_TERMINATED;
+            out_status->pid = (dmosi_process_id_t)service->last_pid;
+        }
         return;
     }
 
@@ -1977,6 +2101,7 @@ static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_ser
     new_service->required = NULL;
     new_service->after = NULL;
     new_service->pid = -1;
+    new_service->last_pid = -1;
     new_service->exit_callback_handle = NULL;
 
     const char* args = dmini_get_string(ctx, NULL, "args", NULL);
@@ -2742,6 +2867,114 @@ dmod_libsystemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name
     }
 
     return libsystemd_stop_service_internal(service);
+}
+
+/**
+ * @brief Re-point a unit at another process as its main PID
+ *
+ * The unit-side half of the "launcher" pattern: a unit whose `exec` only sets
+ * something else up and then exits (dmtty's `console`, which binds a tty's
+ * streams and starts `$DMOD_SHELL` on it) must hand its identity over to the
+ * process it spawned, or libsystemd would keep tracking the launcher - a PID
+ * that is gone moments later. After this call, libsystemd_status() reports the
+ * adopted process, libsystemd_stop_service() kills *it*, and its exit (not the
+ * launcher's) is what drives the unit's "restart" policy.
+ *
+ * The launcher must spawn the adopted process detached
+ * (`Dmod_RunModuleDetached()`, not `Dmod_SpawnModule()`): a spawned child is
+ * parented under its spawner, and a process exiting takes its whole parented
+ * subtree down with it (dmosi_process_kill() -> kill_process_tree()), so a
+ * launcher that exits right after adopting would kill exactly the process it
+ * just handed the unit to.
+ *
+ * Supervision is moved as well: the exit callback registered on the previous
+ * process (see libsystemd_attach_exit_callback()) is unregistered and a fresh
+ * one is registered on @p pid. The previous process is *not* killed - it is
+ * expected to be the caller, on its way out.
+ *
+ * @param unit_name Unit to re-point, or NULL to mean "the unit whose current
+ *                  main PID is the calling process" - the usual case, since a
+ *                  launcher was itself started by libsystemd and so is already
+ *                  that unit's tracked PID.
+ * @param pid       PID of the process adopting the unit; must be positive and
+ *                  currently alive.
+ *
+ * @retval 0        The unit now tracks @p pid.
+ * @retval -EINVAL  @p pid was not positive.
+ * @retval -ENOENT  No unit matches @p unit_name, or (for a NULL @p unit_name)
+ *                   the caller is not any unit's tracked main process.
+ * @retval -ESRCH   @p pid does not resolve to a live process.
+ *
+ * @note Not serialized against the rest of this module (see @ref g_services).
+ *
+ * @par Example
+ * @code
+ * // inside a launcher unit, after spawning the real payload detached:
+ * int pid = Dmod_RunModuleDetached("dmell", 0, NULL, &streams);
+ * if (pid > 0) {
+ *     libsystemd_notify_main_pid(NULL, (Dmod_Pid_t)pid);
+ * }
+ * return 0;   // launcher exits; the unit lives on as the payload
+ * @endcode
+ */
+dmod_libsystemd_api_declaration(1.0, int, _notify_main_pid, ( const char* unit_name, Dmod_Pid_t pid ))
+{
+    if (pid <= 0)
+    {
+        return -EINVAL;
+    }
+
+    if (dmosi_process_find_by_id((dmosi_process_id_t)pid) == NULL)
+    {
+        return -ESRCH;
+    }
+
+    libsystemd_service_t service;
+    if (unit_name != NULL)
+    {
+        service = libsystemd_find_service(g_services, unit_name);
+    }
+    else
+    {
+        // No name given: the caller is telling us "I am the unit" - which is
+        // only answerable while it still *is* the tracked PID, i.e. before it
+        // returns from its own main(). dmosi_process_current() is NULL for a
+        // thread dmosi never registered (a driver-owned thread, early boot),
+        // in which case there is simply no unit to re-point.
+        dmosi_process_t current = dmosi_process_current();
+        service = (current != NULL)
+                ? libsystemd_find_service_by_pid(g_services, (Dmod_Pid_t)dmosi_process_get_id(current))
+                : NULL;
+    }
+
+    if (service == NULL)
+    {
+        // Worth a log rather than a silent errno: the NULL-unit_name path fails
+        // here whenever the caller is not (yet) any unit's tracked PID, which
+        // from the caller's side looks identical to "no such unit".
+        DMOD_LOG_WARN("No unit to re-point to PID %d (requested: %s)\n",
+                      (int)pid, (unit_name != NULL) ? unit_name : "<caller's own unit>");
+        return -ENOENT;
+    }
+
+    if (service->pid == pid)
+    {
+        return 0;
+    }
+
+    // Detach from the old process before overwriting the PID the handle is
+    // associated with, or libsystemd_detach_exit_callback() would look the
+    // handle up on the new process and leave the old registration dangling on
+    // a service pointer that is about to be reused.
+    libsystemd_detach_exit_callback(service, NULL);
+
+    DMOD_LOG_INFO("Unit '%s' main PID moved to %d\n", service->unit_name, (int)pid);
+
+    service->pid = pid;
+    service->last_pid = pid;
+    libsystemd_attach_exit_callback(service);
+
+    return 0;
 }
 
 /**

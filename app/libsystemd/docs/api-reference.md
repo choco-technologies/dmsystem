@@ -109,6 +109,32 @@ restarting.
 - `-ENOENT` - no unit with that name.
 - `-ESRCH` - the unit exists but has no running process to stop.
 
+### `libsystemd_notify_main_pid(const char* unit_name, Dmod_Pid_t pid)`
+
+Re-points a unit at another process as its main PID, for units whose `exec`
+is only a launcher: it sets something up, starts the real payload, and exits.
+After the call the unit tracks `pid`, so `libsystemd_status()` reports it,
+`libsystemd_stop_service()` kills it, and its exit is what drives the unit's
+`restart` policy. Supervision is moved with it - the exit callback on the
+previous process is unregistered and re-registered on `pid`. The previous
+process is not killed; it is expected to be the caller, on its way out.
+
+Pass `NULL` as `unit_name` to mean "the unit whose current main PID is the
+calling process", which is the usual case and saves a launcher from having
+its own unit name plumbed through argv.
+
+The launcher must start the payload with `Dmod_RunModuleDetached()`, not
+`Dmod_SpawnModule()`: a spawned child is parented under its spawner, and a
+process exiting takes its whole parented subtree with it, so a launcher that
+exits right after adopting would kill what it just handed the unit to. See
+`dmtty`'s `console` for a worked example.
+
+- `-EINVAL` - `pid` was not positive.
+- `-ENOENT` - no unit with that name, or (for a `NULL` `unit_name`) the
+  caller is not any unit's tracked main process.
+- `-ESRCH` - `pid` does not resolve to a live process.
+- `-ENOSYS` - process lookup is not connected on this build/platform.
+
 ### `libsystemd_status(const char* unit_name, libsystemd_service_status_t* out_status)`
 
 Fills `*out_status` with the unit's current process state and PID. Reports

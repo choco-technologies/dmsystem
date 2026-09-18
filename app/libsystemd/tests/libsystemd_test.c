@@ -1,6 +1,7 @@
 #define DMOD_ENABLE_REGISTRATION ON
 #include "dmod_test.h"
 #include "libsystemd.h"
+#include "dmosi.h"
 #include <errno.h>
 #include <string.h>
 
@@ -188,6 +189,61 @@ DMOD_TEST_STEP(stop_service_reports_not_running_for_unspawnable_unit)
      * example unit file and is never actually loadable in this environment,
      * so libsystemd_scan()'s best-effort auto-start always leaves it stopped. */
     DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("networking"), -ESRCH);
+}
+
+/**
+ * @brief PID of the process running these tests - the only PID guaranteed to
+ *        be alive here, so the one to use whenever a step needs to name a
+ *        live process (see the libsystemd_notify_main_pid steps below).
+ *
+ * @return Own PID, or 0 if dmosi cannot resolve the current process (in which
+ *         case the steps that need it are skipped rather than made to fail on
+ *         an unrelated platform limitation).
+ */
+static Dmod_Pid_t own_pid(void)
+{
+    dmosi_process_t self = dmosi_process_current();
+    return (self != NULL) ? (Dmod_Pid_t)dmosi_process_get_id(self) : 0;
+}
+
+DMOD_TEST_STEP(notify_main_pid_rejects_non_positive_pid)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_main_pid("networking", 0), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_main_pid("networking", -1), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_main_pid(NULL, 0), -EINVAL);
+}
+
+DMOD_TEST_STEP(notify_main_pid_rejects_dead_pid)
+{
+    /* A PID far beyond anything this short-lived test run can have handed out,
+     * so it is guaranteed not to resolve to a live process. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_main_pid("networking", 0x7000000), -ESRCH);
+}
+
+DMOD_TEST_STEP(notify_main_pid_rejects_unknown_unit)
+{
+    Dmod_Pid_t pid = own_pid();
+    if (pid <= 0)
+    {
+        return; /* no resolvable current process on this platform */
+    }
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_main_pid("does-not-exist", pid), -ENOENT);
+}
+
+DMOD_TEST_STEP(notify_main_pid_rejects_caller_that_is_not_a_unit)
+{
+    /* NULL unit name means "the unit whose main PID I am". The test runner was
+     * not started by libsystemd, so no unit tracks it and there is nothing to
+     * re-point - the self-identifying path must report that rather than
+     * picking some arbitrary unit (or dereferencing NULL). */
+    Dmod_Pid_t pid = own_pid();
+    if (pid <= 0)
+    {
+        return;
+    }
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_main_pid(NULL, pid), -ENOENT);
 }
 
 /**
