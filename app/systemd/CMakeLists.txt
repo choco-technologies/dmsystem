@@ -8,7 +8,20 @@ set(DMOD_AUTHOR_NAME        "Patryk Kubiak")
 set(DMOD_STACK_SIZE         2048)
 
 # Priority for the thread of the module (should be integer)
-set(DMOD_PRIORITY           0)
+#
+# The highest priority a module can ask for. systemd is what brings the rest of
+# the system up - it scans the units directory, starts every unit and then
+# replays the devices drivers reported while it was still booting - so nothing
+# a unit does afterwards should be able to push it aside. It was previously 0,
+# i.e. below the default of 1 that every module without an explicit priority
+# gets: a shell started by one of systemd's own units outranked it, and any
+# thread of that shell that failed to block would stop the boot pass halfway
+# through (see DMOD_PRIORITY's default in dmod/scripts/CMakeLists.txt).
+#
+# Values above the backend's ceiling are clamped by the RTOS (FreeRTOS clamps
+# to configMAX_PRIORITIES - 1), so this stays valid on a port with a smaller
+# priority range.
+set(DMOD_PRIORITY           4)
 
 # Path to the .dmr file - enables release package creation in build/packages/
 set(DMOD_DMR_PATH           ${CMAKE_CURRENT_SOURCE_DIR}/systemd.dmr)
