@@ -465,6 +465,59 @@ DMOD_TEST_STEP(notify_device_removed_rejects_unmatched_class)
 }
 
 /**
+ * Fixture directory: tests/fixtures/rules_multi_class/, with two independent
+ * rule files under rules/ that both declare [class=multi] (one targeting
+ * "bare@%name", the other "second@%name") and two templates under units/
+ * (bare@.ini, second@.ini) so both targets can actually be instantiated.
+ * Regression test for libsystemd_resolve_device_targets(): more than one
+ * rules file may legitimately define the same device class (e.g. dmnet's
+ * own networkd.rules and another module's own rule, both matching "netif"),
+ * and a single device event must start every one of them, not just
+ * whichever rule happened to be scanned first.
+ */
+#define LIBSYSTEMD_RULES_MULTI_CLASS_UNITS_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/rules_multi_class/units"
+#define LIBSYSTEMD_RULES_MULTI_CLASS_RULES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/rules_multi_class/rules"
+
+DMOD_TEST_STEP(notify_device_added_starts_every_rule_matching_the_same_class)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_RULES_MULTI_CLASS_UNITS_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_MULTI_CLASS_RULES_DIR), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@multi1", &status), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("second@multi1", &status), -ENOENT);
+
+    /* Both rules/a.ini's [class=multi] start=bare@%name and rules/b.ini's
+     * [class=multi] start=second@%name must fire from this one call - not
+     * just whichever file the directory walk happened to encounter first. */
+    libsystemd_notify_device_added("multi", "multi1", NULL);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@multi1", &status), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("second@multi1", &status), 0);
+}
+
+DMOD_TEST_STEP(notify_device_removed_stops_every_rule_matching_the_same_class)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_RULES_MULTI_CLASS_UNITS_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_RULES_MULTI_CLASS_RULES_DIR), 0);
+
+    libsystemd_notify_device_added("multi", "multi2", NULL);
+
+    /* Both never actually running ("dmbare"/"dmsecond" aren't loadable) -
+     * -ESRCH from this confirms notify_device_removed() reached
+     * libsystemd_stop_service() at all (the first resolved target, in
+     * rule-load order). */
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("multi", "multi2"), -ESRCH);
+
+    /* Symmetric check via status: both targets were still individually
+     * resolved and reached (stop on an unspawned unit doesn't unregister
+     * it - see stop_service_reports_not_running_for_unspawnable_unit). */
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("bare@multi2", &status), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("second@multi2", &status), 0);
+}
+
+/**
  * Fixture directories: tests/fixtures/rules_replay_{tty,scan,forget}/, each
  * with its own class ("replay-tty"/"replay-scan"/"replay-forget", all
  * mapping to "bare@%name") unique to one test each - deliberately *not*

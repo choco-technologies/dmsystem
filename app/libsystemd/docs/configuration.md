@@ -267,16 +267,20 @@ start=dhcpd@%name
 ```
 
 `libsystemd_notify_device_added(device_class, device_name, user_value)` looks
-up the `[class=<device_class>]` section (first match wins if more than one
-rules file defines the same class) and substitutes every `%name` in its
-`start` value with `device_name`, then calls `libsystemd_start_service()` on
-the result - which transparently instantiates it from a template on demand if
-needed (see [Starting an instance that was never scanned](#starting-an-instance-that-was-never-scanned)
+up **every** currently-loaded `[class=<device_class>]` section - more than
+one rules file may independently define a section for the same class (e.g.
+two unrelated modules each shipping their own rule for the same "netif"
+class, one to pump an interface's traffic and another to acquire a DHCP
+lease on it), and every one of them fires, not just whichever rule happened
+to be scanned first. For each matching section, it substitutes every `%name`
+in its `start` value with `device_name`, then calls `libsystemd_start_service()`
+on the result - which transparently instantiates it from a template on demand
+if needed (see [Starting an instance that was never scanned](#starting-an-instance-that-was-never-scanned)
 above), substituting `user_value` for `%v` in that template's own keys.
 `user_value` is optional - pass `NULL` if the device has none, in which case
 `%v` expands to an empty string. `libsystemd_notify_device_removed(device_class, device_name)`
-resolves the exact same target the same way and calls
-`libsystemd_stop_service()` on it instead.
+resolves the exact same set of targets the same way and calls
+`libsystemd_stop_service()` on each of them instead.
 
 ```
 libsystemd_load_rules("/etc/dmsystem/rules");
@@ -288,13 +292,14 @@ This is meant to be called by a driver or filesystem module that discovers
 devices at runtime (e.g. `dmtty` enumerating serial ports, or `dmdevfs`
 noticing a new node under `/dev`) - it reports `(class, name)` plus whatever
 extra value it wants forwarded to the template (e.g. the device's path), and
-`libsystemd` maps that to a unit via the loaded rules without the driver
-needing to know anything about unit names or templates itself.
+`libsystemd` maps that to every matching unit via the loaded rules without
+the driver needing to know anything about unit names, templates, or how many
+other rules exist for the same class.
 
 Note that `%name` here is a distinct, whole-word placeholder handled by the
 rules matcher itself, resolved *before* the target unit name is handed to
 `libsystemd_start_service()` - it is unrelated to the `%i`/`%I`/`%p`/`%n`/`%v`
-specifiers a template's own keys are expanded for once the target is
+specifiers a template's own keys are expanded for once each target is
 resolved (those still work as usual inside `getty@.ini` itself). A rule with
 no `start` key, or a section not named `class=...`, is ignored. Calling
 `libsystemd_load_rules()` again replaces the entire previously loaded rule
