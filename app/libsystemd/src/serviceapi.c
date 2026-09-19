@@ -893,7 +893,7 @@ static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_
 }
 
 /**
- * @brief Actually start a ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit, without looking it up by name first
+ * @brief Actually start a ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY unit, without looking it up by name first
  *
  * Counterpart of libsystemd_start_service_internal() for a unit whose `exec`
  * names a Library-type DMOD module rather than a spawnable Application:
@@ -912,7 +912,7 @@ static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_
  * picked up and enabled here rather than treated as "already started". If
  * enabling fails and this call is the one that loaded the module (it was not
  * already loaded beforehand), the load is undone before returning - most
- * commonly hit by pointing `type=module` at an Application-type module by
+ * commonly hit by pointing `type=library` at an Application-type module by
  * mistake: loading it still succeeds (the dmod core only enforces "Library
  * only" on enable), but leaving it loaded would leak a fresh, unshared
  * Application context on every failed start (see `Dmod_LoadModuleByName()` in
@@ -928,14 +928,14 @@ static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_
  *                    (e.g. it is not a Library module, or one of its required
  *                    modules could not be enabled).
  */
-static int libsystemd_start_module_service_internal(libsystemd_service_t service)
+static int libsystemd_start_library_service_internal(libsystemd_service_t service)
 {
     if (Dmod_IsModuleEnabled(service->exec))
     {
         return -EALREADY;
     }
 
-    DMOD_LOG_INFO("Loading module service '%s' (module '%s')\n", service->unit_name, service->exec);
+    DMOD_LOG_INFO("Loading library service '%s' (module '%s')\n", service->unit_name, service->exec);
 
     bool already_loaded = Dmod_IsModuleLoaded(service->exec);
     if (!already_loaded && Dmod_LoadModuleByName(service->exec) == NULL)
@@ -956,12 +956,12 @@ static int libsystemd_start_module_service_internal(libsystemd_service_t service
 }
 
 /**
- * @brief Actually stop a ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit, without looking it up by name first
+ * @brief Actually stop a ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY unit, without looking it up by name first
  *
- * Counterpart of libsystemd_stop_service_internal() for a module-type unit:
+ * Counterpart of libsystemd_stop_service_internal() for a library-type unit:
  * "stopping" it means disabling and then unloading the module
  * (`Dmod_DisableModule()` + `Dmod_UnloadModule()`), the reverse order of
- * libsystemd_start_module_service_internal() - `Dmod_Unload()` in the dmod
+ * libsystemd_start_library_service_internal() - `Dmod_Unload()` in the dmod
  * core refuses to unload a module that is still enabled (see `dmod_system.c`),
  * so disabling first is required, not just symmetrical.
  *
@@ -972,7 +972,7 @@ static int libsystemd_start_module_service_internal(libsystemd_service_t service
  * @retval -EIO   `Dmod_DisableModule()`/`Dmod_UnloadModule()` failed (e.g. another
  *                  still-enabled module requires this one).
  */
-static int libsystemd_stop_module_service_internal(libsystemd_service_t service)
+static int libsystemd_stop_library_service_internal(libsystemd_service_t service)
 {
     bool loaded = Dmod_IsModuleLoaded(service->exec);
     bool enabled = Dmod_IsModuleEnabled(service->exec);
@@ -982,7 +982,7 @@ static int libsystemd_stop_module_service_internal(libsystemd_service_t service)
         return -ESRCH;
     }
 
-    DMOD_LOG_INFO("Unloading module service '%s' (module '%s')\n", service->unit_name, service->exec);
+    DMOD_LOG_INFO("Unloading library service '%s' (module '%s')\n", service->unit_name, service->exec);
 
     if (enabled && !Dmod_DisableModule(service->exec, false))
     {
@@ -1008,8 +1008,8 @@ static int libsystemd_stop_module_service_internal(libsystemd_service_t service)
  * (libsystemd_service_exit_callback()) is supervised exactly the same way as
  * the initial start.
  *
- * Does nothing process-related for a ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit -
- * delegates to libsystemd_start_module_service_internal() instead, before any
+ * Does nothing process-related for a ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY unit -
+ * delegates to libsystemd_start_library_service_internal() instead, before any
  * of the process-spawning logic below runs.
  *
  * Spawns `service->exec` as a module via `Dmod_RunModuleDetached()` (not
@@ -1040,9 +1040,9 @@ static int libsystemd_stop_module_service_internal(libsystemd_service_t service)
  */
 static int libsystemd_start_service_internal(libsystemd_service_t service)
 {
-    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_LIBRARY)
     {
-        return libsystemd_start_module_service_internal(service);
+        return libsystemd_start_library_service_internal(service);
     }
 
     if (service->pid > 0 && dmosi_process_find_by_id((dmosi_process_id_t)service->pid) != NULL)
@@ -1204,9 +1204,9 @@ static bool libsystemd_start_service_visitor(void* data, void* user_data)
  */
 static int libsystemd_stop_service_internal(libsystemd_service_t service)
 {
-    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_LIBRARY)
     {
-        return libsystemd_stop_module_service_internal(service);
+        return libsystemd_stop_library_service_internal(service);
     }
 
     if (service->pid <= 0)
@@ -1255,7 +1255,7 @@ static bool libsystemd_stop_all_services_visitor(void* data, void* user_data)
     (void)user_data;
 
     libsystemd_service_t service = (libsystemd_service_t)data;
-    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_LIBRARY)
     {
         if (Dmod_IsModuleLoaded(service->exec) || Dmod_IsModuleEnabled(service->exec))
         {
@@ -1308,7 +1308,7 @@ static void libsystemd_stop_all_services(libsystemd_services_t services)
  * libsystemd_stop_service() - reports `DMOSI_PROCESS_STATE_TERMINATED` with the
  * last known PID. Otherwise reports the live process's actual state and PID.
  *
- * A ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit has no process/PID at all - its
+ * A ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY unit has no process/PID at all - its
  * status is instead read live from the module's own loaded/enabled state
  * (`Dmod_IsModuleEnabled()`), reported as `DMOSI_PROCESS_STATE_RUNNING` when
  * enabled and `DMOSI_PROCESS_STATE_CREATED` otherwise (whether it was never
@@ -1329,7 +1329,7 @@ static void libsystemd_stop_all_services(libsystemd_services_t services)
  */
 static void libsystemd_fill_status(libsystemd_service_t service, libsystemd_service_status_t* out_status)
 {
-    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_LIBRARY)
     {
         out_status->state = Dmod_IsModuleEnabled(service->exec) ? DMOSI_PROCESS_STATE_RUNNING : DMOSI_PROCESS_STATE_CREATED;
         out_status->pid = 0;
@@ -2129,8 +2129,8 @@ static char* libsystemd_substitute_device_name(const char* value, const char* de
  * @brief Parse a unit's "type" ini key into a ::libsystemd_service_type_t
  *
  * Recognizes "simple" (the default, also used for an absent key), "oneshot"
- * (see ::LIBSYSTEMD_SERVICE_TYPE_ONESHOT) and "module" (see
- * ::LIBSYSTEMD_SERVICE_TYPE_MODULE). Any other value is logged via
+ * (see ::LIBSYSTEMD_SERVICE_TYPE_ONESHOT) and "library" (see
+ * ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY). Any other value is logged via
  * DMOD_LOG_WARN() and treated as "simple", the same "log and fall back to a
  * safe default" handling as an unrecognized "restart" value (see
  * libsystemd_parse_restart_policy()).
@@ -2154,9 +2154,9 @@ static libsystemd_service_type_t libsystemd_parse_service_type(dmini_context_t c
     {
         return LIBSYSTEMD_SERVICE_TYPE_ONESHOT;
     }
-    if (strcmp(value, "module") == 0)
+    if (strcmp(value, "library") == 0)
     {
-        return LIBSYSTEMD_SERVICE_TYPE_MODULE;
+        return LIBSYSTEMD_SERVICE_TYPE_LIBRARY;
     }
 
     DMOD_LOG_WARN("Unit with exec '%s' has unrecognized type '%s', treating as 'simple'\n", exec, value);

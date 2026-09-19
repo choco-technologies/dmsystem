@@ -525,8 +525,8 @@ DMOD_TEST_STEP(notify_device_added_is_replayed_once_units_directory_is_scanned)
  * exec/args/after/requires/stdin/stdout/stderr/stdlog set - see
  * libsystemd_parse_service_type()/libsystemd_parse_restart_policy() in
  * serviceapi.c and app/libsystemd/docs/configuration.md#restart-supervision.
- * "module.ini" (type=module) additionally exercises
- * ::LIBSYSTEMD_SERVICE_TYPE_MODULE - see the test steps below that use it.
+ * "library.ini" (type=library) additionally exercises
+ * ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY - see the test steps below that use it.
  */
 #define LIBSYSTEMD_METADATA_FIXTURES_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/metadata"
 
@@ -605,51 +605,51 @@ DMOD_TEST_STEP(scan_falls_back_to_defaults_for_unrecognized_type_and_restart_val
 }
 
 /**
- * Fixture: tests/fixtures/metadata/module.ini (exec=dmmetamodule, type=module).
- * "dmmetamodule" is not a real, loadable module in this test environment
+ * Fixture: tests/fixtures/metadata/library.ini (exec=dmmetalibrary, type=library).
+ * "dmmetalibrary" is not a real, loadable module in this test environment
  * (same reasoning as "dmnetd"/"dmbare" elsewhere in this file) - these steps
- * exercise the ::LIBSYSTEMD_SERVICE_TYPE_MODULE plumbing itself (parsing,
+ * exercise the ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY plumbing itself (parsing,
  * status reporting, and the load/enable-vs-disable/unload error paths in
- * libsystemd_start_module_service_internal()/libsystemd_stop_module_service_internal()),
+ * libsystemd_start_library_service_internal()/libsystemd_stop_library_service_internal()),
  * not an actual successful load+enable.
  */
-DMOD_TEST_STEP(scan_parses_module_type)
+DMOD_TEST_STEP(scan_parses_library_type)
 {
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
 
-    find_info_state_t state = { .unit_name = "module", .found = false };
+    find_info_state_t state = { .unit_name = "library", .found = false };
     DMOD_TEST_EXPECT_EQ(libsystemd_list(find_info_visitor, &state), 0);
     DMOD_TEST_EXPECT_TRUE(state.found);
-    DMOD_TEST_EXPECT_EQ(state.info.type, LIBSYSTEMD_SERVICE_TYPE_MODULE);
+    DMOD_TEST_EXPECT_EQ(state.info.type, LIBSYSTEMD_SERVICE_TYPE_LIBRARY);
 }
 
-DMOD_TEST_STEP(status_reports_created_for_unstarted_module_unit)
+DMOD_TEST_STEP(status_reports_created_for_unstarted_library_unit)
 {
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
 
     libsystemd_service_status_t status;
-    DMOD_TEST_EXPECT_EQ(libsystemd_status("module", &status), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("library", &status), 0);
     DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_CREATED);
     DMOD_TEST_EXPECT_EQ(status.pid, 0);
 }
 
-DMOD_TEST_STEP(start_service_reports_module_not_found_for_unloadable_module_unit)
+DMOD_TEST_STEP(start_service_reports_module_not_found_for_unloadable_library_unit)
 {
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
 
-    /* "dmmetamodule" cannot be found/loaded in this environment - mirrors
+    /* "dmmetalibrary" cannot be found/loaded in this environment - mirrors
      * stop_service_reports_not_running_for_unspawnable_unit for the
-     * type=module load/enable path instead of the process-spawn one. */
-    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("module", NULL), -ENOENT);
+     * type=library load/enable path instead of the process-spawn one. */
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("library", NULL), -ENOENT);
 }
 
-DMOD_TEST_STEP(stop_service_reports_not_running_for_module_unit_never_started)
+DMOD_TEST_STEP(stop_service_reports_not_running_for_library_unit_never_started)
 {
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_METADATA_FIXTURES_DIR), 0);
 
-    /* Never loaded/enabled - nothing for libsystemd_stop_module_service_internal()
+    /* Never loaded/enabled - nothing for libsystemd_stop_library_service_internal()
      * to disable/unload. */
-    DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("module"), -ESRCH);
+    DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("library"), -ESRCH);
 }
 
 DMOD_TEST_STEP(notify_device_removed_forgets_a_pending_device)
