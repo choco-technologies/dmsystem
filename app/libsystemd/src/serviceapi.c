@@ -486,7 +486,7 @@ static void libsystemd_remember_device(const char* device_class, const char* dev
 {
     if (g_devices == NULL)
     {
-        g_devices = dmlist_create(DMOD_MODULE_NAME);
+        g_devices = dmlist_create();
         if (g_devices == NULL)
         {
             return;
@@ -1594,7 +1594,7 @@ static bool libsystemd_build_streams(dmini_context_t ctx, libsystemd_service_t s
  */
 static bool libsystemd_parse_name_list(dmini_context_t ctx, const char* key, dmlist_context_t** out_list)
 {
-    dmlist_context_t* list = dmlist_create(DMOD_MODULE_NAME);
+    dmlist_context_t* list = dmlist_create();
     if (list == NULL)
     {
         return false;
@@ -2651,7 +2651,7 @@ static int libsystemd_parse_rules_dir_walk(const char* rules_dir, dmlist_context
  */
 static int libsystemd_parse_rules_dir(const char* rules_dir, dmlist_context_t** out_rules)
 {
-    dmlist_context_t* rules = dmlist_create(DMOD_MODULE_NAME);
+    dmlist_context_t* rules = dmlist_create();
     if (rules == NULL)
     {
         return -ENOMEM;
@@ -2816,8 +2816,8 @@ static int libsystemd_serviceapi_init(void)
         return -ENOMEM;
     }
 
-    services->services = dmlist_create(DMOD_MODULE_NAME);
-    services->templates = dmlist_create(DMOD_MODULE_NAME);
+    services->services = dmlist_create();
+    services->templates = dmlist_create();
     if (services->services == NULL || services->templates == NULL)
     {
         libsystemd_destroy_services(services);
@@ -3791,8 +3791,8 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, li
         return -ENOMEM;
     }
 
-    new_services->services = dmlist_create(DMOD_MODULE_NAME);
-    new_services->templates = dmlist_create(DMOD_MODULE_NAME);
+    new_services->services = dmlist_create();
+    new_services->templates = dmlist_create();
     if (new_services->services == NULL || new_services->templates == NULL)
     {
         libsystemd_destroy_services(new_services);
