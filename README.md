@@ -101,7 +101,7 @@ Recognized keys:
 | `stderr`      | (unset)    | Implemented | Path to a file to redirect the unit's stderr to |
 | `stdlog`      | (unset)    | Implemented | Path to a file to redirect the unit's `DMOD_STDLOG` stream to - a separate, platform-configurable logging stream that defaults to the same target as `stdout` unless the platform overrides `Dmod_GetStdLogFile()` |
 | `description` | unit name  | Implemented | Free-form text, surfaced via `libsystemd_list()`'s `libsystemd_service_info_t.description` and printed by `service list`/`service status` - not otherwise interpreted |
-| `type`        | `simple`   | Implemented | `simple` (default, expected to keep running) or `oneshot` (expected to run to completion - a clean exit is logged as informational, not a warning) |
+| `type`        | `simple`   | Implemented | `simple` (default, expected to keep running), `oneshot` (expected to run to completion - a clean exit is logged as informational, not a warning), or `module` (`exec` names a **Library** module instead of an Application - start loads+enables it, stop disables+unloads it; no process is spawned) - see [app/libsystemd/docs/configuration.md](app/libsystemd/docs/configuration.md#service-type) |
 | `restart`     | `no`       | Implemented | `no` (default), `always`, or `on-failure` - restarts the unit when its process exits **on its own** (not on `service stop`), via `dmosi`'s process exit-callback API. See [app/libsystemd/docs/configuration.md](app/libsystemd/docs/configuration.md#restart-supervision) |
 
 An unset stream key leaves that stream at whatever default the spawned module

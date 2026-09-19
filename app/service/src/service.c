@@ -41,6 +41,7 @@ static const char* type_to_string(libsystemd_service_type_t type)
     switch (type)
     {
         case LIBSYSTEMD_SERVICE_TYPE_ONESHOT: return "oneshot";
+        case LIBSYSTEMD_SERVICE_TYPE_MODULE:  return "module";
         case LIBSYSTEMD_SERVICE_TYPE_SIMPLE:
         default:                              return "simple";
     }
