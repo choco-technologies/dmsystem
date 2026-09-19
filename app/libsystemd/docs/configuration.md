@@ -34,7 +34,7 @@ else (non-`.ini` files) is silently skipped.
 | `stderr`   | no       | Path bound to `DMOD_STDERR`. |
 | `stdlog`   | no       | Path bound to `DMOD_STDLOG` - a separate, platform-configurable logging stream that defaults to the same target as `DMOD_STDOUT` unless the platform overrides `Dmod_GetStdLogFile()`. |
 | `description` | no   | Free-form text, surfaced (not parsed/interpreted) via `libsystemd_service_info_t.description` in `libsystemd_list()`, and printed by `service list`/`service status`. |
-| `type`     | no       | `simple` (default) or `oneshot` - see [Service type](#service-type) below. |
+| `type`     | no       | `simple` (default), `oneshot` or `module` - see [Service type](#service-type) below. |
 | `restart`  | no       | `no` (default), `always` or `on-failure` - see [Restart supervision](#restart-supervision) below. |
 
 A unit file with no `exec` key fails to parse (`libsystemd_parse_file()`
@@ -47,16 +47,65 @@ enable restart supervision.
 
 ### Service type
 
-The `type` key only affects how a process's own (non-killed) exit is logged,
-not whether/how it is started - every unit is spawned the same way, via
-`Dmod_RunModuleDetached` (detached, so a unit's lifetime is never tied to
-whichever process happened to start it - see the comment in
+For `simple`/`oneshot` units, `type` only affects how a process's own
+(non-killed) exit is logged, not whether/how it is started - both are spawned
+the same way, via `Dmod_RunModuleDetached` (detached, so a unit's lifetime is
+never tied to whichever process happened to start it - see the comment in
 `libsystemd_start_service_internal()`):
 
 - `simple` (default) - the process is expected to keep running until
   explicitly stopped. An exit it was not killed for is logged as a warning.
 - `oneshot` - the process is expected to run to completion and exit on its
   own. A clean exit (status `0`) is logged as informational, not a warning.
+
+`module` is a different kind of unit altogether - see the next section.
+
+#### `type=module`: services backed by a Library module, not a process
+
+`simple`/`oneshot` units both assume `exec` names an **Application**-type
+DMOD module - one with a `main()` that can be spawned as a process. Not every
+piece of functionality that needs to be started/stopped by `libsystemd` is
+shaped like that: a **Library** module (no `main()`, e.g. a protocol handler
+that does its job entirely from `dmod_init()`/`dmod_deinit()` once
+loaded/enabled - see
+[`dmicmp`](https://github.com/choco-technologies/dmicmp)) can't be spawned at
+all, only loaded and enabled into the running DMOD system.
+
+`type=module` covers exactly this case: `exec` names the Library module
+instead of an executable, and starting/stopping the unit maps to the DMOD
+loader's own module lifecycle instead of a process one:
+
+- **start** - loads the module if it is not already loaded
+  (`Dmod_LoadModuleByName`), then enables it (`Dmod_EnableModule`). Enabling
+  is what actually runs the module's `dmod_init()` and pulls in/enables its
+  required modules - a module left merely loaded never does anything (see the
+  dmod core's `Dmod_Enable`).
+- **stop** - disables the module (`Dmod_DisableModule`), then unloads it
+  (`Dmod_UnloadModule`) - disable before unload, since the dmod core refuses
+  to unload a module that is still enabled.
+
+Because there is no process, `args`/`stdin`/`stdout`/`stderr`/`stdlog` have no
+effect on a `module`-type unit, and `restart` supervision does not apply
+either (there is no process exit to trigger it) - only `after`/`requires`
+ordering behaves the same as for any other unit. `libsystemd_status()`/
+`service status` still work: they report `DMOSI_PROCESS_STATE_RUNNING`
+(`pid=0`) while the module is enabled and `DMOSI_PROCESS_STATE_CREATED`
+(`pid=0`) otherwise, read live from the module's own state
+(`Dmod_IsModuleEnabled`) rather than from any state `libsystemd` tracks
+itself.
+
+```ini
+# icmp.ini
+description=Answer ICMP Echo Requests (ping)
+exec=dmicmp
+type=module
+```
+
+`Dmod_EnableModule`/`Dmod_LoadModuleByName` (and their `Unload`/`Disable`
+counterparts) reject anything that is not a Library module, so pointing
+`type=module` at an Application-type module's name simply fails to start (see
+`libsystemd_start_service()`'s return codes) rather than doing something
+unexpected.
 
 ### Restart supervision
 

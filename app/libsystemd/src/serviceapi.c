@@ -893,6 +893,111 @@ static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_
 }
 
 /**
+ * @brief Actually start a ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit, without looking it up by name first
+ *
+ * Counterpart of libsystemd_start_service_internal() for a unit whose `exec`
+ * names a Library-type DMOD module rather than a spawnable Application:
+ * "starting" it means loading and enabling that module
+ * (`Dmod_LoadModuleByName()` + `Dmod_EnableModule()`), not spawning a
+ * process. No `argc`/`argv`/stream redirection applies (those are meaningless
+ * for a module that is never run as a process), and there is no PID to track
+ * or restart-supervision callback to attach - libsystemd_fill_status() reads
+ * the module's live loaded/enabled state directly (via `Dmod_IsModuleLoaded()`/
+ * `Dmod_IsModuleEnabled()`) instead of a tracked `pid`.
+ *
+ * `Dmod_LoadModuleByName()` is itself idempotent for a Library module already
+ * loaded (returns the existing context rather than failing - see the dmod
+ * core), so this only calls it when the module is not already loaded; a
+ * module left loaded but not enabled by some earlier partial failure is still
+ * picked up and enabled here rather than treated as "already started". If
+ * enabling fails and this call is the one that loaded the module (it was not
+ * already loaded beforehand), the load is undone before returning - most
+ * commonly hit by pointing `type=module` at an Application-type module by
+ * mistake: loading it still succeeds (the dmod core only enforces "Library
+ * only" on enable), but leaving it loaded would leak a fresh, unshared
+ * Application context on every failed start (see `Dmod_LoadModuleByName()` in
+ * the dmod core - unlike a Library module, an already-loaded Application
+ * module is never reused).
+ *
+ * @param service Service to start (must not be NULL); `service->exec` is the module name.
+ *
+ * @retval 0        The module is now loaded and enabled.
+ * @retval -EALREADY The module was already enabled.
+ * @retval -ENOENT  The module could not be found/loaded.
+ * @retval -EIO     The module was loaded but `Dmod_EnableModule()` failed
+ *                    (e.g. it is not a Library module, or one of its required
+ *                    modules could not be enabled).
+ */
+static int libsystemd_start_module_service_internal(libsystemd_service_t service)
+{
+    if (Dmod_IsModuleEnabled(service->exec))
+    {
+        return -EALREADY;
+    }
+
+    DMOD_LOG_INFO("Loading module service '%s' (module '%s')\n", service->unit_name, service->exec);
+
+    bool already_loaded = Dmod_IsModuleLoaded(service->exec);
+    if (!already_loaded && Dmod_LoadModuleByName(service->exec) == NULL)
+    {
+        return -ENOENT;
+    }
+
+    if (!Dmod_EnableModule(service->exec, false, NULL))
+    {
+        if (!already_loaded)
+        {
+            Dmod_UnloadModule(service->exec, true);
+        }
+        return -EIO;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Actually stop a ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit, without looking it up by name first
+ *
+ * Counterpart of libsystemd_stop_service_internal() for a module-type unit:
+ * "stopping" it means disabling and then unloading the module
+ * (`Dmod_DisableModule()` + `Dmod_UnloadModule()`), the reverse order of
+ * libsystemd_start_module_service_internal() - `Dmod_Unload()` in the dmod
+ * core refuses to unload a module that is still enabled (see `dmod_system.c`),
+ * so disabling first is required, not just symmetrical.
+ *
+ * @param service Service to stop (must not be NULL); `service->exec` is the module name.
+ *
+ * @retval 0      The module is now disabled and unloaded (or was already unloaded entirely).
+ * @retval -ESRCH The module was neither loaded nor enabled - nothing to stop.
+ * @retval -EIO   `Dmod_DisableModule()`/`Dmod_UnloadModule()` failed (e.g. another
+ *                  still-enabled module requires this one).
+ */
+static int libsystemd_stop_module_service_internal(libsystemd_service_t service)
+{
+    bool loaded = Dmod_IsModuleLoaded(service->exec);
+    bool enabled = Dmod_IsModuleEnabled(service->exec);
+
+    if (!loaded && !enabled)
+    {
+        return -ESRCH;
+    }
+
+    DMOD_LOG_INFO("Unloading module service '%s' (module '%s')\n", service->unit_name, service->exec);
+
+    if (enabled && !Dmod_DisableModule(service->exec, false))
+    {
+        return -EIO;
+    }
+
+    if (loaded && !Dmod_UnloadModule(service->exec, false))
+    {
+        return -EIO;
+    }
+
+    return 0;
+}
+
+/**
  * @brief Actually spawn a service's process, without looking it up by name first
  *
  * Shared by libsystemd_start_service() (which looks the service up by unit name
@@ -902,6 +1007,10 @@ static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_
  * the restart-supervision exit callback, so an automatic restart
  * (libsystemd_service_exit_callback()) is supervised exactly the same way as
  * the initial start.
+ *
+ * Does nothing process-related for a ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit -
+ * delegates to libsystemd_start_module_service_internal() instead, before any
+ * of the process-spawning logic below runs.
  *
  * Spawns `service->exec` as a module via `Dmod_RunModuleDetached()` (not
  * `Dmod_SpawnModule()` - see the comment at its call site), passing
@@ -931,6 +1040,11 @@ static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_
  */
 static int libsystemd_start_service_internal(libsystemd_service_t service)
 {
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    {
+        return libsystemd_start_module_service_internal(service);
+    }
+
     if (service->pid > 0 && dmosi_process_find_by_id((dmosi_process_id_t)service->pid) != NULL)
     {
         return -EALREADY;
@@ -1090,6 +1204,11 @@ static bool libsystemd_start_service_visitor(void* data, void* user_data)
  */
 static int libsystemd_stop_service_internal(libsystemd_service_t service)
 {
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    {
+        return libsystemd_stop_module_service_internal(service);
+    }
+
     if (service->pid <= 0)
     {
         return -ESRCH;
@@ -1136,7 +1255,14 @@ static bool libsystemd_stop_all_services_visitor(void* data, void* user_data)
     (void)user_data;
 
     libsystemd_service_t service = (libsystemd_service_t)data;
-    if (service->pid > 0)
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    {
+        if (Dmod_IsModuleLoaded(service->exec) || Dmod_IsModuleEnabled(service->exec))
+        {
+            libsystemd_stop_service_internal(service);
+        }
+    }
+    else if (service->pid > 0)
     {
         libsystemd_stop_service_internal(service);
     }
@@ -1182,6 +1308,13 @@ static void libsystemd_stop_all_services(libsystemd_services_t services)
  * libsystemd_stop_service() - reports `DMOSI_PROCESS_STATE_TERMINATED` with the
  * last known PID. Otherwise reports the live process's actual state and PID.
  *
+ * A ::LIBSYSTEMD_SERVICE_TYPE_MODULE unit has no process/PID at all - its
+ * status is instead read live from the module's own loaded/enabled state
+ * (`Dmod_IsModuleEnabled()`), reported as `DMOSI_PROCESS_STATE_RUNNING` when
+ * enabled and `DMOSI_PROCESS_STATE_CREATED` otherwise (whether it was never
+ * started or has since been stopped - unlike a process-backed unit, there is
+ * no tracked "last" identity to tell those two apart), always with `pid == 0`.
+ *
  * @param service    Service to inspect (must not be NULL).
  * @param out_status Status structure to fill in (must not be NULL).
  *
@@ -1196,6 +1329,13 @@ static void libsystemd_stop_all_services(libsystemd_services_t services)
  */
 static void libsystemd_fill_status(libsystemd_service_t service, libsystemd_service_status_t* out_status)
 {
+    if (service->type == LIBSYSTEMD_SERVICE_TYPE_MODULE)
+    {
+        out_status->state = Dmod_IsModuleEnabled(service->exec) ? DMOSI_PROCESS_STATE_RUNNING : DMOSI_PROCESS_STATE_CREATED;
+        out_status->pid = 0;
+        return;
+    }
+
     if (service->pid <= 0)
     {
         // Released PID: either the unit never ran, or its process is gone and
@@ -1988,10 +2128,11 @@ static char* libsystemd_substitute_device_name(const char* value, const char* de
 /**
  * @brief Parse a unit's "type" ini key into a ::libsystemd_service_type_t
  *
- * Recognizes "simple" (the default, also used for an absent key) and
- * "oneshot" (see ::LIBSYSTEMD_SERVICE_TYPE_ONESHOT). Any other value is
- * logged via DMOD_LOG_WARN() and treated as "simple", the same "log and fall
- * back to a safe default" handling as an unrecognized "restart" value (see
+ * Recognizes "simple" (the default, also used for an absent key), "oneshot"
+ * (see ::LIBSYSTEMD_SERVICE_TYPE_ONESHOT) and "module" (see
+ * ::LIBSYSTEMD_SERVICE_TYPE_MODULE). Any other value is logged via
+ * DMOD_LOG_WARN() and treated as "simple", the same "log and fall back to a
+ * safe default" handling as an unrecognized "restart" value (see
  * libsystemd_parse_restart_policy()).
  *
  * @param ctx  Parsed ini context to read the key from (must not be NULL).
@@ -2012,6 +2153,10 @@ static libsystemd_service_type_t libsystemd_parse_service_type(dmini_context_t c
     if (strcmp(value, "oneshot") == 0)
     {
         return LIBSYSTEMD_SERVICE_TYPE_ONESHOT;
+    }
+    if (strcmp(value, "module") == 0)
+    {
+        return LIBSYSTEMD_SERVICE_TYPE_MODULE;
     }
 
     DMOD_LOG_WARN("Unit with exec '%s' has unrecognized type '%s', treating as 'simple'\n", exec, value);
