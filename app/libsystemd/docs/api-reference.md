@@ -15,7 +15,7 @@ a quick-reference summary, not a replacement for those.
 | `libsystemd_service_t` | opaque pointer | Handle to one parsed unit. Fields are private to `serviceapi.c`. |
 | `libsystemd_services_t` | opaque pointer | Handle to a registry (list) of `libsystemd_service_t`. |
 | `libsystemd_service_status_t` | struct | `{ dmosi_process_state_t state; dmosi_process_id_t pid; }` - a unit's current process state and PID. |
-| `libsystemd_service_type_t` | enum | `LIBSYSTEMD_SERVICE_TYPE_SIMPLE` (default) / `LIBSYSTEMD_SERVICE_TYPE_ONESHOT` / `LIBSYSTEMD_SERVICE_TYPE_MODULE` - from the unit's `type` key, see [configuration.md](configuration.md#keys). |
+| `libsystemd_service_type_t` | enum | `LIBSYSTEMD_SERVICE_TYPE_SIMPLE` (default) / `LIBSYSTEMD_SERVICE_TYPE_ONESHOT` / `LIBSYSTEMD_SERVICE_TYPE_LIBRARY` - from the unit's `type` key, see [configuration.md](configuration.md#keys). |
 | `libsystemd_restart_policy_t` | enum | `LIBSYSTEMD_RESTART_NO` (default) / `LIBSYSTEMD_RESTART_ALWAYS` / `LIBSYSTEMD_RESTART_ON_FAILURE` - from the unit's `restart` key, see [configuration.md](configuration.md#keys). |
 | `libsystemd_service_info_t` | struct | `{ const char* unit_name; const char* description; libsystemd_service_type_t type; libsystemd_restart_policy_t restart_policy; libsystemd_service_status_t status; }` - passed to `libsystemd_list()`'s visitor. |
 | `libsystemd_visitor_t` | function pointer | `bool (*)(const libsystemd_service_info_t* info, void* user_ptr)` - return `false` to stop `libsystemd_list()` early. |
@@ -76,9 +76,9 @@ Looks `unit_name` up in the global registry and starts it. For a `simple`/
 `oneshot` unit, spawns it (`Dmod_RunModuleDetached` with the unit's
 `exec`/`argc`/`argv`/stream redirections - detached rather than
 `Dmod_SpawnModule` so the unit's lifetime is never tied to whichever process
-happened to call this). For a `type=module` unit, instead loads and enables
+happened to call this). For a `type=library` unit, instead loads and enables
 `exec` as a Library module (`Dmod_LoadModuleByName` + `Dmod_EnableModule`) -
-no process is spawned; see [configuration.md](configuration.md#typemodule-services-backed-by-a-library-module-not-a-process).
+no process is spawned; see [configuration.md](configuration.md#typelibrary-services-backed-by-a-library-module-not-a-process).
 
 If `unit_name` is not already registered but is `<prefix>@<instance>`-shaped
 and `<prefix>@.ini` exists in the last-scanned units directory, it is
@@ -93,7 +93,7 @@ If the unit's `restart` key is not `no`, also registers a `dmosi` process-exit
 callback on the newly spawned process (best-effort - silently skipped if
 unsupported on this build/platform) so the unit is automatically respawned if
 its process later exits on its own - see [configuration.md](configuration.md#restart-supervision).
-Not applicable to a `type=module` unit - there is no process to register a
+Not applicable to a `type=library` unit - there is no process to register a
 callback on, so `restart` is simply ignored for it.
 
 For a `simple`/`oneshot` unit:
@@ -104,7 +104,7 @@ For a `simple`/`oneshot` unit:
 - `-ENOSYS` - module spawning is unavailable on this build/platform.
 - other negative values are forwarded from `Dmod_RunModuleDetached`.
 
-For a `type=module` unit:
+For a `type=library` unit:
 - `-EINVAL` - `unit_name` was `NULL`.
 - `-ENOENT` - no unit with that name, and it could not be instantiated from a
   template either; or the module could not be found/loaded.
@@ -117,7 +117,7 @@ For a `type=module` unit:
 Looks `unit_name` up and stops it. For a `simple`/`oneshot` unit, kills its
 tracked process (`dmosi_process_kill`); if a restart-supervision callback is
 registered for the unit, unregisters it first, so a deliberate stop is never
-mistaken for a crash that needs restarting. For a `type=module` unit, instead
+mistaken for a crash that needs restarting. For a `type=library` unit, instead
 disables then unloads `exec` (`Dmod_DisableModule` + `Dmod_UnloadModule`) -
 disable before unload, since the dmod core refuses to unload a module that is
 still enabled.
@@ -125,8 +125,8 @@ still enabled.
 - `-EINVAL` - `unit_name` was `NULL`.
 - `-ENOENT` - no unit with that name.
 - `-ESRCH` - the unit exists but has no running process to stop (or, for a
-  `type=module` unit, is neither loaded nor enabled).
-- `-EIO` - (`type=module` only) disabling or unloading the module failed.
+  `type=library` unit, is neither loaded nor enabled).
+- `-EIO` - (`type=library` only) disabling or unloading the module failed.
 
 ### `libsystemd_notify_main_pid(const char* unit_name, Dmod_Pid_t pid)`
 
@@ -161,7 +161,7 @@ Fills `*out_status` with the unit's current process state and PID. Reports
 `DMOSI_PROCESS_STATE_TERMINATED` for one that was started but whose process
 can no longer be found (e.g. it exited on its own).
 
-For a `type=module` unit there is no process/PID at all - `pid` is always
+For a `type=library` unit there is no process/PID at all - `pid` is always
 `0`, and `state` is read live from the module's own state (`Dmod_IsModuleEnabled`):
 `DMOSI_PROCESS_STATE_RUNNING` while enabled, `DMOSI_PROCESS_STATE_CREATED`
 otherwise (covering both "never started" and "stopped" - unlike a
