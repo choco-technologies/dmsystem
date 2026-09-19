@@ -376,28 +376,6 @@ static void libsystemd_destroy_rules(dmlist_context_t* rules)
 }
 
 /**
- * @brief Comparator matching a rule against a device class string
- *
- * Intended for use with dmlist_find(), same calling convention as
- * libsystemd_compare_by_unit_name(): @p data1 is a `libsystemd_rule_t*` taken
- * from the list, @p data2 is the `const char*` class being searched for. If
- * more than one rule matches the same class (e.g. loaded from two different
- * rule files), dmlist_find() returns the first one encountered.
- *
- * @param data1 Node data, actually a `libsystemd_rule_t*`.
- * @param data2 Query data, actually a `const char*` device class.
- *
- * @retval 0    The rule's class_name equals the queried class.
- * @retval <0/>0 `strcmp()` order, otherwise.
- */
-static int libsystemd_compare_rule_by_class(const void* data1, const void* data2)
-{
-    const libsystemd_rule_t* rule = (const libsystemd_rule_t*)data1;
-    const char* class_name = (const char*)data2;
-    return strcmp(rule->class_name, class_name);
-}
-
-/**
  * @brief Free every device in @ref g_devices and then the registry itself
  *
  * @param devices Registry to destroy, or NULL (no-op).
@@ -2670,45 +2648,141 @@ static int libsystemd_parse_rules_dir(const char* rules_dir, dmlist_context_t** 
 }
 
 /**
- * @brief Resolve a device (class, name) pair to a unit name via the loaded rules
+ * @brief Free every resolved target string in a list returned by
+ *        libsystemd_resolve_device_targets() and then the list itself
  *
- * Looks @p device_class up in @ref g_rules (libsystemd_compare_rule_by_class())
- * and, if a matching rule is found, expands its "start" template's "%name"
+ * @param targets List to destroy, or NULL (no-op).
+ *
+ * @return Nothing.
+ */
+static void libsystemd_destroy_targets(dmlist_context_t* targets)
+{
+    if (targets == NULL)
+    {
+        return;
+    }
+
+    char* target = (char*)dmlist_pop_front(targets);
+    while (target != NULL)
+    {
+        Dmod_Free(target);
+        target = (char*)dmlist_pop_front(targets);
+    }
+
+    dmlist_destroy(targets);
+}
+
+/**
+ * @brief Closure for libsystemd_collect_matching_rule_targets_visitor()
+ */
+typedef struct
+{
+    const char* device_class;  //!< Class being matched against every rule (borrowed).
+    const char* device_name;   //!< Device name to substitute for "%name" (borrowed).
+    dmlist_context_t* targets; //!< Collects one newly allocated target `char*` per matching rule (borrowed).
+    int error;                 //!< Set to a negative errno if a substitution allocation fails; 0 otherwise.
+} libsystemd_rule_match_ctx_t;
+
+/**
+ * @brief dmlist_foreach() visitor collecting every rule matching a device class into a target list
+ *
+ * Unlike a dmlist_find()-based lookup, this walks every rule in @ref g_rules
+ * rather than stopping at the first match - more than one rules file may
+ * legitimately define a `[class=...]` section for the same device class
+ * (e.g. two independent modules each shipping their own rule for the same
+ * "netif" class), and every one of them should get to start/stop its own
+ * unit for the same device event.
+ *
+ * @param data      Rule being checked, actually a `libsystemd_rule_t*`.
+ * @param user_data Actually a `libsystemd_rule_match_ctx_t*`.
+ *
+ * @retval true Always - one rule failing to substitute must not stop the
+ *               rest from being collected; the failure is reported via
+ *               `ctx->error` instead.
+ */
+static bool libsystemd_collect_matching_rule_targets_visitor(void* data, void* user_data)
+{
+    libsystemd_rule_t* rule = (libsystemd_rule_t*)data;
+    libsystemd_rule_match_ctx_t* ctx = (libsystemd_rule_match_ctx_t*)user_data;
+
+    if (strcmp(rule->class_name, ctx->device_class) != 0)
+    {
+        return true;
+    }
+
+    char* target = libsystemd_substitute_device_name(rule->start_template, ctx->device_name);
+    if (target == NULL)
+    {
+        ctx->error = -ENOMEM;
+        return true;
+    }
+
+    if (!dmlist_push_back(ctx->targets, target))
+    {
+        Dmod_Free(target);
+        ctx->error = -ENOMEM;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Resolve a device (class, name) pair to every matching unit name via the loaded rules
+ *
+ * Looks @p device_class up against every rule in @ref g_rules (not just the
+ * first match - see libsystemd_collect_matching_rule_targets_visitor()) and,
+ * for each one that matches, expands its "start" template's "%name"
  * placeholders with @p device_name (libsystemd_substitute_device_name()).
  * Shared by libsystemd_notify_device_added() and
- * libsystemd_notify_device_removed() - both resolve the exact same target
- * unit name from the same rule, they just do different things with it
- * (start vs. stop).
+ * libsystemd_notify_device_removed() - both resolve the exact same set of
+ * target unit names from the same rules, they just do different things with
+ * them (start vs. stop).
  *
  * @param device_class Device class to look up (must not be NULL).
  * @param device_name  Device name to substitute for "%name" (must not be NULL).
- * @param out_target   Receives the newly allocated target unit name on success,
- *                       owned by the caller (free with Dmod_Free()) (must not be NULL).
+ * @param out_targets  Receives a newly allocated dmlist of newly allocated
+ *                       `char*` target unit names (one per matching rule, in
+ *                       rule-load order), owned by the caller - free with
+ *                       libsystemd_destroy_targets() (must not be NULL).
  *
- * @retval 0       `*out_target` is the resolved unit name.
+ * @retval 0       `*out_targets` holds at least one resolved unit name.
  * @retval -ENOENT No rules have been loaded yet, or none of them match @p device_class.
  * @retval -ENOMEM Allocation failed.
  */
-static int libsystemd_resolve_device_target(const char* device_class, const char* device_name, char** out_target)
+static int libsystemd_resolve_device_targets(const char* device_class, const char* device_name, dmlist_context_t** out_targets)
 {
     if (g_rules == NULL)
     {
         return -ENOENT;
     }
 
-    libsystemd_rule_t* rule = (libsystemd_rule_t*)dmlist_find(g_rules, device_class, libsystemd_compare_rule_by_class);
-    if (rule == NULL)
-    {
-        return -ENOENT;
-    }
-
-    char* target = libsystemd_substitute_device_name(rule->start_template, device_name);
-    if (target == NULL)
+    dmlist_context_t* targets = dmlist_create();
+    if (targets == NULL)
     {
         return -ENOMEM;
     }
 
-    *out_target = target;
+    libsystemd_rule_match_ctx_t ctx = {
+        .device_class = device_class,
+        .device_name = device_name,
+        .targets = targets,
+        .error = 0,
+    };
+    dmlist_foreach(g_rules, libsystemd_collect_matching_rule_targets_visitor, &ctx);
+
+    if (ctx.error != 0)
+    {
+        libsystemd_destroy_targets(targets);
+        return ctx.error;
+    }
+
+    if (dmlist_size(targets) == 0)
+    {
+        dmlist_destroy(targets);
+        return -ENOENT;
+    }
+
+    *out_targets = targets;
 
     return 0;
 }
@@ -2717,7 +2791,7 @@ static int libsystemd_resolve_device_target(const char* device_class, const char
  * @brief dmlist_foreach() visitor that retries starting one pending device against the current rules/units state
  *
  * Used by libsystemd_replay_pending_devices() to walk @ref g_devices. A
- * device with no currently-matching rule (libsystemd_resolve_device_target()
+ * device with no currently-matching rule (libsystemd_resolve_device_targets()
  * returns `-ENOENT`) is silently left pending - that is the expected,
  * frequent case (not every remembered device has a rule loaded yet) and is
  * not logged. A device that *does* resolve but fails to start (e.g. its
@@ -2741,19 +2815,27 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
 
     DMOD_LOG_INFO("Replaying remembered device (class=%s, name=%s)\n", device->device_class, device->device_name);
 
-    char* target = NULL;
-    int result = libsystemd_resolve_device_target(device->device_class, device->device_name, &target);
+    dmlist_context_t* targets = NULL;
+    int result = libsystemd_resolve_device_targets(device->device_class, device->device_name, &targets);
     if (result != 0)
     {
         return true;
     }
 
-    result = libsystemd_start_service(target, device->user_value);
-    if (result != 0 && result != -EALREADY)
+    /* More than one rule may match the same class (see
+     * libsystemd_resolve_device_targets()) - replay every one of them. */
+    char* target = (char*)dmlist_pop_front(targets);
+    while (target != NULL)
     {
-        DMOD_LOG_WARN("Failed to start '%s' for device (class=%s, name=%s) (%d)\n", target, device->device_class, device->device_name, result);
+        result = libsystemd_start_service(target, device->user_value);
+        if (result != 0 && result != -EALREADY)
+        {
+            DMOD_LOG_WARN("Failed to start '%s' for device (class=%s, name=%s) (%d)\n", target, device->device_class, device->device_name, result);
+        }
+        Dmod_Free(target);
+        target = (char*)dmlist_pop_front(targets);
     }
-    Dmod_Free(target);
+    dmlist_destroy(targets);
 
     return true;
 }
@@ -3366,11 +3448,13 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
 }
 
 /**
- * @brief Notify libsystemd that a device of a given class appeared, starting whatever rule matches it
+ * @brief Notify libsystemd that a device of a given class appeared, starting every rule that matches it
  *
- * Resolves `(device_class, device_name)` to a target unit name via the rules
- * loaded by the last libsystemd_load_rules() call
- * (libsystemd_resolve_device_target()) and starts it
+ * Resolves `(device_class, device_name)` to every target unit name via the
+ * rules loaded by the last libsystemd_load_rules() call
+ * (libsystemd_resolve_device_targets() - not just the first rule that
+ * matches @p device_class, since more than one rules file may independently
+ * define a `[class=...]` section for the same class) and starts each one
  * (libsystemd_start_service() - which transparently instantiates it from a
  * template on demand if it is not already registered, e.g. "getty@tty1" from
  * a "getty@.ini" template).
@@ -3387,23 +3471,27 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
  *
  * @param device_class Device class to match against loaded rules' `[class=...]`
  *                        sections (e.g. "tty") (must not be NULL).
- * @param device_name  Device name substituted for "%name" in the matching
+ * @param device_name  Device name substituted for "%name" in each matching
  *                        rule's "start" template (e.g. "tty1") (must not be NULL).
  * @param user_value   Optional caller-supplied value, substituted for `%v` in
- *                        the resolved unit's own template keys if it is
+ *                        each resolved unit's own template keys if it is
  *                        instantiated on demand (see libsystemd_start_service()) -
  *                        pass NULL if not needed. Remembered alongside the
  *                        device so a later replay (see below) still has it.
  *
- * @retval 0       The resolved unit was found (or instantiated from a template)
- *                   and spawned successfully.
+ * @retval 0       Every resolved unit was found (or instantiated from a
+ *                   template) and spawned successfully.
  * @retval -EINVAL @p device_class or @p device_name was NULL.
  * @retval -ENOENT No rules have been loaded yet, no rule currently matches
  *                   @p device_class, or the resolved unit could not be found/
  *                   instantiated yet (see libsystemd_start_service()) - in every
  *                   case, the device is still remembered for a later retry.
- * @retval -ENOMEM Allocation failed while resolving the target or instantiating it.
- * @retval <0      Any other negative value forwarded from libsystemd_start_service().
+ * @retval -ENOMEM Allocation failed while resolving a target or instantiating it.
+ * @retval <0      Any other negative value forwarded from libsystemd_start_service() -
+ *                   if more than one rule matched and only some of them failed
+ *                   to start, this is the first failure encountered (in
+ *                   rule-load order); every matching rule is still attempted
+ *                   regardless.
  *
  * @par Example
  * @code
@@ -3422,25 +3510,36 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
 
     libsystemd_remember_device(device_class, device_name, user_value);
 
-    char* target = NULL;
-    int result = libsystemd_resolve_device_target(device_class, device_name, &target);
+    dmlist_context_t* targets = NULL;
+    int result = libsystemd_resolve_device_targets(device_class, device_name, &targets);
     if (result != 0)
     {
         return result;
     }
 
-    result = libsystemd_start_service(target, user_value);
-    Dmod_Free(target);
+    int first_error = 0;
+    char* target = (char*)dmlist_pop_front(targets);
+    while (target != NULL)
+    {
+        int target_result = libsystemd_start_service(target, user_value);
+        if (target_result != 0 && first_error == 0)
+        {
+            first_error = target_result;
+        }
+        Dmod_Free(target);
+        target = (char*)dmlist_pop_front(targets);
+    }
+    dmlist_destroy(targets);
 
-    return result;
+    return first_error;
 }
 
 /**
- * @brief Notify libsystemd that a device of a given class disappeared, stopping whatever rule matches it
+ * @brief Notify libsystemd that a device of a given class disappeared, stopping every rule that matches it
  *
- * Resolves `(device_class, device_name)` to a target unit name exactly like
- * libsystemd_notify_device_added() does - the same rule, the same "%name"
- * substitution, the same resulting unit name - and stops it
+ * Resolves `(device_class, device_name)` to every target unit name exactly
+ * like libsystemd_notify_device_added() does - the same rules, the same
+ * "%name" substitution, the same resulting unit names - and stops each one
  * (libsystemd_stop_service()) instead of starting it.
  *
  * The device is also forgotten (libsystemd_forget_device()), regardless of
@@ -3451,15 +3550,19 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
  *
  * @param device_class Device class to match against loaded rules' `[class=...]`
  *                        sections (e.g. "tty") (must not be NULL).
- * @param device_name  Device name substituted for "%name" in the matching
+ * @param device_name  Device name substituted for "%name" in each matching
  *                        rule's "start" template (e.g. "tty1") (must not be NULL).
  *
- * @retval 0       The resolved unit was found and stopped successfully.
+ * @retval 0       Every resolved unit was found and stopped successfully.
  * @retval -EINVAL @p device_class or @p device_name was NULL.
  * @retval -ENOENT No rules have been loaded, no rule matches @p device_class, or no unit
  *                   with the resolved name is currently registered.
  * @retval -ESRCH  The resolved unit exists but has no running process to stop.
- * @retval -ENOMEM Allocation failed while resolving the target.
+ * @retval -ENOMEM Allocation failed while resolving a target.
+ * @retval <0      If more than one rule matched and only some of them failed
+ *                   to stop, this is the first failure encountered (in
+ *                   rule-load order); every matching rule is still attempted
+ *                   regardless.
  *
  * @par Example
  * @code
@@ -3477,17 +3580,28 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* d
 
     libsystemd_forget_device(device_class, device_name);
 
-    char* target = NULL;
-    int result = libsystemd_resolve_device_target(device_class, device_name, &target);
+    dmlist_context_t* targets = NULL;
+    int result = libsystemd_resolve_device_targets(device_class, device_name, &targets);
     if (result != 0)
     {
         return result;
     }
 
-    result = libsystemd_stop_service(target);
-    Dmod_Free(target);
+    int first_error = 0;
+    char* target = (char*)dmlist_pop_front(targets);
+    while (target != NULL)
+    {
+        int target_result = libsystemd_stop_service(target);
+        if (target_result != 0 && first_error == 0)
+        {
+            first_error = target_result;
+        }
+        Dmod_Free(target);
+        target = (char*)dmlist_pop_front(targets);
+    }
+    dmlist_destroy(targets);
 
-    return result;
+    return first_error;
 }
 
 /**
