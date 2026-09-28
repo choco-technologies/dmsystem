@@ -8,14 +8,14 @@
 // its surface (see the libsystemd_services_t doc in libsystemd_types.h), so the
 // registry's own list handling includes it here instead.
 #include "dmlist.h"
-#include "stophandler.h"
+#include "stoprequest.h"
 
 /**
  * @brief Default for a unit's "stop_timeout_ms" key
  *
- * How long libsystemd_stop_service() waits for a service that registered a
- * stop handler (libsystemd_set_stop_handler()) to exit on its own before it
- * falls back to dmosi_process_kill().
+ * How long libsystemd_stop_service() waits for a service that registered for
+ * stop requests (libsystemd_set_stop_semaphore()) to exit on its own before
+ * it falls back to dmosi_process_kill().
  */
 #define LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS  3000u
 
@@ -44,7 +44,7 @@ struct libsystemd_service
     char* description;                  //!< From the optional "description" key, or NULL if unset. Owned copy.
     libsystemd_service_type_t type;                    //!< From the optional "type" key ("simple"/"oneshot"). Defaults to ::LIBSYSTEMD_SERVICE_TYPE_SIMPLE.
     libsystemd_restart_policy_t restart_policy;         //!< From the optional "restart" key ("no"/"always"/"on-failure"). Defaults to ::LIBSYSTEMD_RESTART_NO.
-    uint32_t stop_timeout_ms;           //!< From the optional "stop_timeout_ms" key: how long a stop waits for a service with a stop handler to exit on its own before killing it. 0 = kill at once. Defaults to ::LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS.
+    uint32_t stop_timeout_ms;           //!< From the optional "stop_timeout_ms" key: how long a stop waits for a service registered for stop requests to exit on its own before killing it. 0 = kill at once. Defaults to ::LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS.
     char* exec;                         //!< Module name (or file path) to spawn, from the "exec" key. Owned copy.
     int argc;                           //!< Number of entries in argv (always >= 1, argv[0] == exec).
     char** argv;                        //!< NULL-terminated argument vector (argc+1 entries, each an owned copy).
@@ -1193,17 +1193,17 @@ static bool libsystemd_wait_for_exit(dmosi_process_id_t pid, uint32_t timeout_ms
 }
 
 /**
- * @brief Ask a service's process to exit on its own, through its stop handler
+ * @brief Ask a service's process to exit on its own, through a stop request
  *
  * Skipped (returns false at once) when the unit's `stop_timeout_ms` is 0, when
- * the process registered no handler with libsystemd_set_stop_handler(), and
+ * the process did not register with libsystemd_set_stop_semaphore(), and
  * when the process is the caller itself - waiting for our own exit could only
  * ever time out.
  *
  * @param service Service whose tracked `pid` is being stopped (must not be NULL).
  *
  * @retval true  The process exited on its own within `stop_timeout_ms`.
- * @retval false It has to be killed (no handler, disabled, or it did not exit in time).
+ * @retval false It has to be killed (not registered, disabled, or it did not exit in time).
  */
 static bool libsystemd_request_graceful_stop(libsystemd_service_t service)
 {
@@ -1214,7 +1214,7 @@ static bool libsystemd_request_graceful_stop(libsystemd_service_t service)
     {
         return false;
     }
-    if (!libsystemd_stophandler_request(pid))
+    if (!libsystemd_stoprequest_send(pid))
     {
         return false;
     }
@@ -1236,8 +1236,8 @@ static bool libsystemd_request_graceful_stop(libsystemd_service_t service)
  * pointer while walking a registry that is about to be replaced/torn down).
  *
  * Resolves `service->pid` to a live `dmosi_process_t`. If that process
- * registered a stop handler (libsystemd_set_stop_handler()), it is asked to
- * exit on its own first and given up to the unit's `stop_timeout_ms`
+ * registered for stop requests (libsystemd_set_stop_semaphore()), it is asked
+ * to exit on its own first and given up to the unit's `stop_timeout_ms`
  * (libsystemd_request_graceful_stop()) - this blocks the caller for at most
  * that long. Otherwise, or if it does not exit in time, it is killed via
  * `dmosi_process_kill()`. Always clears `service->pid` back to the "not
@@ -3031,7 +3031,7 @@ static int libsystemd_serviceapi_init(void)
         return -ENOMEM;
     }
 
-    int result = libsystemd_stophandler_init();
+    int result = libsystemd_stoprequest_init();
     if (result != 0)
     {
         libsystemd_destroy_services(services);
@@ -3078,8 +3078,8 @@ static void libsystemd_serviceapi_deinit(void)
     libsystemd_destroy_devices(g_devices);
     g_devices = NULL;
 
-    // Last: stopping services above may still ask their stop handlers.
-    libsystemd_stophandler_deinit();
+    // Last: stopping services above may still send stop requests.
+    libsystemd_stoprequest_deinit();
 }
 
 /**

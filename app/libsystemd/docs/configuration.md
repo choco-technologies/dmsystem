@@ -36,7 +36,7 @@ else (non-`.ini` files) is silently skipped.
 | `description` | no   | Free-form text, surfaced (not parsed/interpreted) via `libsystemd_service_info_t.description` in `libsystemd_list()`, and printed by `service list`/`service status`. |
 | `type`     | no       | `simple` (default), `oneshot` or `library` - see [Service type](#service-type) below. |
 | `restart`  | no       | `no` (default), `always` or `on-failure` - see [Restart supervision](#restart-supervision) below. |
-| `stop_timeout_ms` | no | How long a stop waits for a service that registered a stop handler to exit on its own before killing it. Default `3000`; `0` kills at once. See [Graceful stop](#graceful-stop) below. |
+| `stop_timeout_ms` | no | How long a stop waits for a service that registered for stop requests to exit on its own before killing it. Default `3000`; `0` kills at once. See [Graceful stop](#graceful-stop) below. |
 
 A unit file with no `exec` key fails to parse (`libsystemd_parse_file()`
 returns `-EINVAL`); `libsystemd_parse_dir()` logs that failure and skips the
@@ -155,26 +155,19 @@ Whatever the service held at that moment stays held - a driver's I/O lock
 taken inside an ioctl, a half-written filesystem structure, a mutex shared
 with another module.
 
-A service avoids that by registering a stop handler for its own process:
+A service avoids that by registering the semaphore its main loop waits on:
 
 ```c
-static void on_stop(void* arg)            /* runs in the stopper's context */
-{
-    my_service_t* s = arg;
-    s->stop = true;                       /* only make main() leave ...        */
-    dmosi_semaphore_post(s->wakeup, 1);   /* ... and wake it if it is waiting */
-}
-
 int main(int argc, char* argv[])
 {
     ...
-    libsystemd_set_stop_handler(on_stop, &s);
-    while (!s.stop)
+    libsystemd_set_stop_semaphore(s.wakeup);  /* may be the one it already waits on */
+    while (!libsystemd_stop_requested())
     {
         dmosi_semaphore_wait(s.wakeup, 1, -1);
-        do_work(&s);                      /* never interrupted halfway */
+        do_work(&s);                          /* never interrupted halfway */
     }
-    libsystemd_set_stop_handler(NULL, NULL);  /* before freeing &s */
+    libsystemd_set_stop_semaphore(NULL);      /* before destroying the semaphore */
     cleanup(&s);
     return 0;
 }
@@ -184,26 +177,29 @@ A stop then runs:
 
 1. The restart-supervision callback is unregistered (a stop never triggers a
    restart).
-2. The process's stop handler is called, in the caller's context. It must
-   return at once - no blocking, no calls into libsystemd.
+2. The process's "stop requested" flag is set and its semaphore is posted
+   once. No code of the service runs in the stopper's context, so nothing the
+   service does can block this step.
 3. libsystemd waits up to `stop_timeout_ms` for the process to terminate on
    its own (return from `main()`, so its cleanup runs).
-4. If it has not, it is killed with `dmosi_process_kill()` as before, and a
-   warning is logged.
+4. If it has not - it ignored the request, or it hangs - it is killed with
+   `dmosi_process_kill()` as before, and a warning is logged.
 
-A process without a handler, a unit with `stop_timeout_ms=0`, and a unit
-stopping itself (the caller is the unit's own process) skip steps 2-3 and
-are killed at once - exactly the behavior before stop handlers existed.
+The stop therefore always completes within `stop_timeout_ms` (plus the kill),
+whatever the service does. A process that never registered, a unit with
+`stop_timeout_ms=0`, and a unit stopping itself (the caller is the unit's own
+process) skip steps 2-3 and are killed at once - exactly the behavior before
+graceful stop existed.
 
 The stop call blocks for up to `stop_timeout_ms` while it waits. Keep the
 timeout above the longest piece of work the service does between two checks
-of its stop flag.
+of `libsystemd_stop_requested()`.
 
 The registration belongs to the calling *process*, not to a unit name, so it
 follows the process a unit tracks - including one adopted with
 `libsystemd_notify_main_pid()`. It is dropped automatically when the process
-terminates. Clear it (`NULL` handler) before freeing the handler's argument:
-that call waits for a handler invocation still in progress.
+terminates. Clear it (`NULL`) before destroying the semaphore: that call
+waits for a post still in progress.
 
 ## Templates
 
