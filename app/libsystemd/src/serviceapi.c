@@ -8,6 +8,21 @@
 // its surface (see the libsystemd_services_t doc in libsystemd_types.h), so the
 // registry's own list handling includes it here instead.
 #include "dmlist.h"
+#include "stophandler.h"
+
+/**
+ * @brief Default for a unit's "stop_timeout_ms" key
+ *
+ * How long libsystemd_stop_service() waits for a service that registered a
+ * stop handler (libsystemd_set_stop_handler()) to exit on its own before it
+ * falls back to dmosi_process_kill().
+ */
+#define LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS  3000u
+
+/**
+ * @brief Poll period while waiting for a stopping service to exit
+ */
+#define LIBSYSTEMD_STOP_POLL_MS             10u
 
 /**
  * @brief Full definition of the opaque @ref libsystemd_service_t handle
@@ -29,6 +44,7 @@ struct libsystemd_service
     char* description;                  //!< From the optional "description" key, or NULL if unset. Owned copy.
     libsystemd_service_type_t type;                    //!< From the optional "type" key ("simple"/"oneshot"). Defaults to ::LIBSYSTEMD_SERVICE_TYPE_SIMPLE.
     libsystemd_restart_policy_t restart_policy;         //!< From the optional "restart" key ("no"/"always"/"on-failure"). Defaults to ::LIBSYSTEMD_RESTART_NO.
+    uint32_t stop_timeout_ms;           //!< From the optional "stop_timeout_ms" key: how long a stop waits for a service with a stop handler to exit on its own before killing it. 0 = kill at once. Defaults to ::LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS.
     char* exec;                         //!< Module name (or file path) to spawn, from the "exec" key. Owned copy.
     int argc;                           //!< Number of entries in argv (always >= 1, argv[0] == exec).
     char** argv;                        //!< NULL-terminated argument vector (argc+1 entries, each an owned copy).
@@ -1146,13 +1162,84 @@ static bool libsystemd_start_service_visitor(void* data, void* user_data)
 }
 
 /**
+ * @brief Wait until a process has terminated (or can no longer be found)
+ *
+ * The process is looked up by PID on every poll rather than held as a
+ * `dmosi_process_t`, so its structure going away while waiting is harmless.
+ *
+ * @param pid        Process to wait for.
+ * @param timeout_ms Upper bound of the wait.
+ *
+ * @retval true  The process is gone.
+ * @retval false It is still running after @p timeout_ms.
+ */
+static bool libsystemd_wait_for_exit(dmosi_process_id_t pid, uint32_t timeout_ms)
+{
+    uint32_t waited = 0;
+    for (;;)
+    {
+        dmosi_process_t process = dmosi_process_find_by_id(pid);
+        if (process == NULL || dmosi_process_get_state(process) == DMOSI_PROCESS_STATE_TERMINATED)
+        {
+            return true;
+        }
+        if (waited >= timeout_ms)
+        {
+            return false;
+        }
+        dmosi_thread_sleep(LIBSYSTEMD_STOP_POLL_MS);
+        waited += LIBSYSTEMD_STOP_POLL_MS;
+    }
+}
+
+/**
+ * @brief Ask a service's process to exit on its own, through its stop handler
+ *
+ * Skipped (returns false at once) when the unit's `stop_timeout_ms` is 0, when
+ * the process registered no handler with libsystemd_set_stop_handler(), and
+ * when the process is the caller itself - waiting for our own exit could only
+ * ever time out.
+ *
+ * @param service Service whose tracked `pid` is being stopped (must not be NULL).
+ *
+ * @retval true  The process exited on its own within `stop_timeout_ms`.
+ * @retval false It has to be killed (no handler, disabled, or it did not exit in time).
+ */
+static bool libsystemd_request_graceful_stop(libsystemd_service_t service)
+{
+    dmosi_process_id_t pid = (dmosi_process_id_t)service->pid;
+    dmosi_process_t self = dmosi_process_current();
+
+    if (service->stop_timeout_ms == 0 || (self != NULL && dmosi_process_get_id(self) == pid))
+    {
+        return false;
+    }
+    if (!libsystemd_stophandler_request(pid))
+    {
+        return false;
+    }
+    if (libsystemd_wait_for_exit(pid, service->stop_timeout_ms))
+    {
+        return true;
+    }
+
+    DMOD_LOG_WARN("Service '%s' did not stop within %u ms, killing it\n",
+                  service->unit_name, (unsigned)service->stop_timeout_ms);
+    return false;
+}
+
+/**
  * @brief Actually stop a service's process, without looking it up by name first
  *
  * Shared by libsystemd_stop_service() (which looks the service up by unit name
  * first) and libsystemd_stop_all_services_visitor() (which already has a direct
  * pointer while walking a registry that is about to be replaced/torn down).
  *
- * Resolves `service->pid` to a live `dmosi_process_t` and kills it via
+ * Resolves `service->pid` to a live `dmosi_process_t`. If that process
+ * registered a stop handler (libsystemd_set_stop_handler()), it is asked to
+ * exit on its own first and given up to the unit's `stop_timeout_ms`
+ * (libsystemd_request_graceful_stop()) - this blocks the caller for at most
+ * that long. Otherwise, or if it does not exit in time, it is killed via
  * `dmosi_process_kill()`. Always clears `service->pid` back to the "not
  * running" sentinel (-1) once the process is confirmed gone or killed, so a
  * subsequent libsystemd_start_service() call is never blocked by stale state.
@@ -1165,7 +1252,7 @@ static bool libsystemd_start_service_visitor(void* data, void* user_data)
  *
  * @param service Service to stop (must not be NULL).
  *
- * @retval 0      The service's process was found and killed successfully.
+ * @retval 0      The service's process was found and exited on request or was killed successfully.
  * @retval -ESRCH The service had no running process to stop (`pid` was already
  *                 <= 0, or the process it pointed to could no longer be found -
  *                 e.g. it already exited on its own).
@@ -1202,6 +1289,20 @@ static int libsystemd_stop_service_internal(libsystemd_service_t service)
     libsystemd_detach_exit_callback(service, process);
 
     DMOD_LOG_INFO("Stopping service '%s'\n", service->unit_name);
+
+    if (libsystemd_request_graceful_stop(service))
+    {
+        service->pid = -1;
+        return 0;
+    }
+
+    // Looked up again: after a graceful attempt the old handle may be stale.
+    process = dmosi_process_find_by_id((dmosi_process_id_t)service->pid);
+    if (process == NULL)
+    {
+        service->pid = -1;
+        return 0;
+    }
 
     int result = dmosi_process_kill(process, 0);
     if (result != 0)
@@ -2178,6 +2279,28 @@ static libsystemd_restart_policy_t libsystemd_parse_restart_policy(dmini_context
 }
 
 /**
+ * @brief Parse a unit's optional "stop_timeout_ms" key
+ *
+ * @param ctx  Unit's ini context (must not be NULL).
+ * @param exec The unit's `exec` value, used only in the warning message.
+ *
+ * @return The configured timeout, or ::LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS if
+ *         the key is absent or negative (the latter logged as a warning).
+ */
+static uint32_t libsystemd_parse_stop_timeout(dmini_context_t ctx, const char* exec)
+{
+    int value = dmini_get_int(ctx, NULL, "stop_timeout_ms", (int)LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS);
+    if (value < 0)
+    {
+        DMOD_LOG_WARN("Unit with exec '%s' has negative stop_timeout_ms %d, using %u\n",
+                      exec, value, (unsigned)LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS);
+        return LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS;
+    }
+
+    return (uint32_t)value;
+}
+
+/**
  * @brief Build a fresh `libsystemd_service_t` from an already-parsed ini context
  *
  * Shared tail end of both libsystemd_parse_unit_internal() (file-backed
@@ -2215,6 +2338,7 @@ static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_ser
     new_service->description = NULL;
     new_service->type = LIBSYSTEMD_SERVICE_TYPE_SIMPLE;
     new_service->restart_policy = LIBSYSTEMD_RESTART_NO;
+    new_service->stop_timeout_ms = LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS;
     new_service->exec = NULL;
     new_service->argc = 0;
     new_service->argv = NULL;
@@ -2232,6 +2356,7 @@ static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_ser
 
     new_service->type = libsystemd_parse_service_type(ctx, exec);
     new_service->restart_policy = libsystemd_parse_restart_policy(ctx, exec);
+    new_service->stop_timeout_ms = libsystemd_parse_stop_timeout(ctx, exec);
 
     bool ok = (new_service->exec = Dmod_StrDup(exec)) != NULL;
     ok = ok && libsystemd_build_argv(new_service, exec, args);
@@ -2906,6 +3031,13 @@ static int libsystemd_serviceapi_init(void)
         return -ENOMEM;
     }
 
+    int result = libsystemd_stophandler_init();
+    if (result != 0)
+    {
+        libsystemd_destroy_services(services);
+        return result;
+    }
+
     g_services = services;
 
     return 0;
@@ -2945,6 +3077,9 @@ static void libsystemd_serviceapi_deinit(void)
 
     libsystemd_destroy_devices(g_devices);
     g_devices = NULL;
+
+    // Last: stopping services above may still ask their stop handlers.
+    libsystemd_stophandler_deinit();
 }
 
 /**
