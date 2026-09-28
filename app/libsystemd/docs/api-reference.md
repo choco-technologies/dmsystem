@@ -18,6 +18,7 @@ a quick-reference summary, not a replacement for those.
 | `libsystemd_service_type_t` | enum | `LIBSYSTEMD_SERVICE_TYPE_SIMPLE` (default) / `LIBSYSTEMD_SERVICE_TYPE_ONESHOT` / `LIBSYSTEMD_SERVICE_TYPE_LIBRARY` - from the unit's `type` key, see [configuration.md](configuration.md#keys). |
 | `libsystemd_restart_policy_t` | enum | `LIBSYSTEMD_RESTART_NO` (default) / `LIBSYSTEMD_RESTART_ALWAYS` / `LIBSYSTEMD_RESTART_ON_FAILURE` - from the unit's `restart` key, see [configuration.md](configuration.md#keys). |
 | `libsystemd_service_info_t` | struct | `{ const char* unit_name; const char* description; libsystemd_service_type_t type; libsystemd_restart_policy_t restart_policy; libsystemd_service_status_t status; }` - passed to `libsystemd_list()`'s visitor. |
+| `libsystemd_stop_handler_t` | function pointer | `void (*)(void* arg)` - stop request handler registered with `libsystemd_set_stop_handler()`. Runs in the stopper's context; must only make the service leave and return at once. |
 | `libsystemd_visitor_t` | function pointer | `bool (*)(const libsystemd_service_info_t* info, void* user_ptr)` - return `false` to stop `libsystemd_list()` early. |
 
 ## Functions
@@ -114,10 +115,14 @@ For a `type=library` unit:
 
 ### `libsystemd_stop_service(const char* unit_name)`
 
-Looks `unit_name` up and stops it. For a `simple`/`oneshot` unit, kills its
-tracked process (`dmosi_process_kill`); if a restart-supervision callback is
-registered for the unit, unregisters it first, so a deliberate stop is never
-mistaken for a crash that needs restarting. For a `type=library` unit, instead
+Looks `unit_name` up and stops it. For a `simple`/`oneshot` unit, stops its
+tracked process: if a restart-supervision callback is registered for the
+unit, unregisters it first, so a deliberate stop is never mistaken for a
+crash that needs restarting. If the process registered a stop handler
+(`libsystemd_set_stop_handler()`), it is called and the process gets up to
+the unit's `stop_timeout_ms` to exit on its own - the call blocks meanwhile.
+Otherwise, or if it does not exit in time, it is killed
+(`dmosi_process_kill`). See [Graceful stop](configuration.md#graceful-stop). For a `type=library` unit, instead
 disables then unloads `exec` (`Dmod_DisableModule` + `Dmod_UnloadModule`) -
 disable before unload, since the dmod core refuses to unload a module that is
 still enabled.
@@ -153,6 +158,21 @@ exits right after adopting would kill what it just handed the unit to. See
   caller is not any unit's tracked main process.
 - `-ESRCH` - `pid` does not resolve to a live process.
 - `-ENOSYS` - process lookup is not connected on this build/platform.
+
+### `libsystemd_set_stop_handler(libsystemd_stop_handler_t handler, void* arg)`
+
+Registers `handler` as the calling process's stop request handler, replacing
+a previous one; `NULL` clears it. `libsystemd_stop_service()` calls it (in the
+stopper's context) before waiting up to `stop_timeout_ms` for the process to
+exit on its own, and kills the process only if it does not. The handler must
+only make the service leave - set a flag, post a semaphore - and return at
+once; it must not block or call into libsystemd. `arg` must stay valid until
+the handler is cleared or the process has terminated; clearing waits for an
+invocation still in progress. The registration is dropped automatically when
+the process terminates. See [Graceful stop](configuration.md#graceful-stop).
+
+- `-ESRCH` - the caller is not a dmosi process.
+- `-ENOMEM` - allocation failed, or the module is not initialized.
 
 ### `libsystemd_status(const char* unit_name, libsystemd_service_status_t* out_status)`
 

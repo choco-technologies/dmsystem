@@ -49,6 +49,19 @@ typedef struct
 } libsystemd_service_info_t;
 
 /**
+ * @brief Stop request handler registered by a service with libsystemd_set_stop_handler()
+ *
+ * Called by libsystemd_stop_service() in the *stopper's* context (whichever
+ * thread asked for the stop), before it waits for the service's process to
+ * exit. It must only make the service leave on its own - set a flag, post a
+ * semaphore the service is waiting on - and return at once: it must not
+ * block, and must not call back into libsystemd.
+ *
+ * @param arg The pointer passed to libsystemd_set_stop_handler().
+ */
+typedef void (*libsystemd_stop_handler_t)(void* arg);
+
+/**
  * @brief pointer to a visitor function
  */
 typedef bool (*libsystemd_visitor_t)(const libsystemd_service_info_t* info, void* user_ptr);

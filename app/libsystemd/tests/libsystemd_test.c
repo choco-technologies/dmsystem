@@ -776,3 +776,135 @@ DMOD_TEST_STEP(notify_device_added_substitutes_user_value_specifier)
     DMOD_TEST_EXPECT_NOT_NULL(state.info.description);
     DMOD_TEST_EXPECT_EQ(strcmp(state.info.description, "/dev/ttyPATH1"), 0);
 }
+
+/*
+ * Graceful stop (libsystemd_set_stop_handler() + "stop_timeout_ms").
+ *
+ * tests/fixtures/stop/ holds four units running the helper Application
+ * tests/stoppable (test_stoppable), which libsystemd_scan() starts right away:
+ * "cooperative" leaves main() when asked (exit status
+ * LIBSYSTEMD_TEST_STOPPABLE_EXIT), "stubborn" registers a handler but ignores
+ * it, "plain" registers none, and "no-grace" is cooperative but has
+ * stop_timeout_ms=0.
+ */
+#define LIBSYSTEMD_STOP_FIXTURES_DIR    LIBSYSTEMD_TEST_FIXTURES_DIR "/stop"
+#define LIBSYSTEMD_TEST_STOPPABLE_EXIT  42
+#define LIBSYSTEMD_TEST_STUBBORN_MS     300
+
+/**
+ * @brief Wait until @p unit_name's process is running (the helper got as far as main())
+ */
+static bool wait_until_running(const char* unit_name)
+{
+    for (int i = 0; i < 100; i++)
+    {
+        libsystemd_service_status_t status;
+        if (libsystemd_status(unit_name, &status) == 0 && status.state == DMOSI_PROCESS_STATE_RUNNING)
+        {
+            dmosi_thread_sleep(100);    /* let it reach its stop handler registration */
+            return true;
+        }
+        dmosi_thread_sleep(20);
+    }
+    return false;
+}
+
+/**
+ * @brief Stop @p unit_name and report how long libsystemd_stop_service() took
+ */
+static uint64_t stop_and_measure(const char* unit_name, int* result)
+{
+    uint64_t start = (uint64_t)Dmod_GetUptime();
+    *result = libsystemd_stop_service(unit_name);
+    return (uint64_t)Dmod_GetUptime() - start;
+}
+
+/**
+ * @brief Exit status of the unit's last process, or -1 if it is no longer known to dmosi
+ */
+static int last_exit_status(const char* unit_name)
+{
+    libsystemd_service_status_t status;
+    if (libsystemd_status(unit_name, &status) != 0)
+    {
+        return -1;
+    }
+    dmosi_process_t process = dmosi_process_find_by_id(status.pid);
+    return (process != NULL) ? dmosi_process_get_exit_status(process) : -1;
+}
+
+DMOD_TEST_STEP(stop_service_lets_cooperative_service_exit_on_its_own)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_STOP_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_TRUE(wait_until_running("cooperative"));
+
+    int result = -1;
+    uint64_t elapsed = stop_and_measure("cooperative", &result);
+    DMOD_TEST_EXPECT_EQ(result, 0);
+    DMOD_TEST_EXPECT_TRUE(elapsed < 2000);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("cooperative", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_TERMINATED);
+    /* main() returned - it was not killed */
+    DMOD_TEST_EXPECT_EQ(last_exit_status("cooperative"), LIBSYSTEMD_TEST_STOPPABLE_EXIT);
+}
+
+DMOD_TEST_STEP(stop_service_kills_service_ignoring_request_after_timeout)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_STOP_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_TRUE(wait_until_running("stubborn"));
+
+    int result = -1;
+    uint64_t elapsed = stop_and_measure("stubborn", &result);
+    DMOD_TEST_EXPECT_EQ(result, 0);
+    DMOD_TEST_EXPECT_TRUE(elapsed >= LIBSYSTEMD_TEST_STUBBORN_MS);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("stubborn", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_TERMINATED);
+    DMOD_TEST_EXPECT_TRUE(last_exit_status("stubborn") != LIBSYSTEMD_TEST_STOPPABLE_EXIT);
+}
+
+DMOD_TEST_STEP(stop_service_kills_service_without_handler_at_once)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_STOP_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_TRUE(wait_until_running("plain"));
+
+    int result = -1;
+    uint64_t elapsed = stop_and_measure("plain", &result);
+    DMOD_TEST_EXPECT_EQ(result, 0);
+    DMOD_TEST_EXPECT_TRUE(elapsed < LIBSYSTEMD_TEST_STUBBORN_MS);
+    DMOD_TEST_EXPECT_TRUE(last_exit_status("plain") != LIBSYSTEMD_TEST_STOPPABLE_EXIT);
+}
+
+DMOD_TEST_STEP(stop_service_skips_handler_when_stop_timeout_is_zero)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_STOP_FIXTURES_DIR), 0);
+    DMOD_TEST_EXPECT_TRUE(wait_until_running("no-grace"));
+
+    int result = -1;
+    stop_and_measure("no-grace", &result);
+    DMOD_TEST_EXPECT_EQ(result, 0);
+    DMOD_TEST_EXPECT_TRUE(last_exit_status("no-grace") != LIBSYSTEMD_TEST_STOPPABLE_EXIT);
+}
+
+static void count_stop_requests(void* arg)
+{
+    (*(int*)arg)++;
+}
+
+DMOD_TEST_STEP(set_stop_handler_registers_and_clears_for_calling_process)
+{
+    if (own_pid() <= 0)
+    {
+        return; /* no resolvable current process on this platform */
+    }
+
+    int requests = 0;
+    DMOD_TEST_EXPECT_EQ(libsystemd_set_stop_handler(NULL, NULL), 0);     /* nothing to clear */
+    DMOD_TEST_EXPECT_EQ(libsystemd_set_stop_handler(count_stop_requests, &requests), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_set_stop_handler(count_stop_requests, &requests), 0); /* replace */
+    DMOD_TEST_EXPECT_EQ(libsystemd_set_stop_handler(NULL, NULL), 0);
+    DMOD_TEST_EXPECT_EQ(requests, 0);    /* registering never calls it */
+}

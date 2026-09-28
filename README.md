@@ -103,6 +103,7 @@ Recognized keys:
 | `description` | unit name  | Implemented | Free-form text, surfaced via `libsystemd_list()`'s `libsystemd_service_info_t.description` and printed by `service list`/`service status` - not otherwise interpreted |
 | `type`        | `simple`   | Implemented | `simple` (default, expected to keep running), `oneshot` (expected to run to completion - a clean exit is logged as informational, not a warning), or `library` (`exec` names a **Library** module instead of an Application - start loads+enables it, stop disables+unloads it; no process is spawned) - see [app/libsystemd/docs/configuration.md](app/libsystemd/docs/configuration.md#service-type) |
 | `restart`     | `no`       | Implemented | `no` (default), `always`, or `on-failure` - restarts the unit when its process exits **on its own** (not on `service stop`), via `dmosi`'s process exit-callback API. See [app/libsystemd/docs/configuration.md](app/libsystemd/docs/configuration.md#restart-supervision) |
+| `stop_timeout_ms` | `3000` | Implemented | How long a stop waits for a service that registered a stop handler (`libsystemd_set_stop_handler()`) to leave `main()` on its own before killing it; `0` kills at once. Services without a handler are killed at once, as before. See [app/libsystemd/docs/configuration.md](app/libsystemd/docs/configuration.md#graceful-stop) |
 
 An unset stream key leaves that stream at whatever default the spawned module
 would otherwise get; `stdout`/`stderr`/`stdlog` may point at the same path (as
