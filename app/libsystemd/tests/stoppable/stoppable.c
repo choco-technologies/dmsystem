@@ -7,57 +7,65 @@
 /*
  * Stand-in service for the graceful stop steps in libsystemd_test.c.
  *
- *   test_stoppable cooperative   registers a stop handler that wakes the main
- *                                loop; returns TEST_STOPPABLE_EXIT_STATUS
- *   test_stoppable stubborn      registers a handler that ignores the request
- *   test_stoppable plain         registers nothing (killed right away)
+ *   test_stoppable cooperative   registers for stop requests and leaves main()
+ *                                when asked; returns TEST_STOPPABLE_EXIT_STATUS
+ *   test_stoppable hung          registers, then hangs (blocks forever on a
+ *                                semaphore nobody posts) and never looks at
+ *                                the request
+ *   test_stoppable plain         never registers (killed right away)
  */
 
 /** Returned from main() when leaving on a stop request - distinguishes a clean exit from a kill (status 0). */
 #define TEST_STOPPABLE_EXIT_STATUS  42
 
-typedef struct
+static int run_cooperative(dmosi_semaphore_t wakeup)
 {
-    dmosi_semaphore_t wakeup;
-    volatile bool stop;
-} stoppable_t;
-
-static void on_stop(void* arg)
-{
-    stoppable_t* s = (stoppable_t*)arg;
-    s->stop = true;
-    dmosi_semaphore_post(s->wakeup, 1);
+    libsystemd_set_stop_semaphore(wakeup);
+    while (!libsystemd_stop_requested())
+    {
+        dmosi_semaphore_wait(wakeup, 1, 1000);
+    }
+    libsystemd_set_stop_semaphore(NULL);
+    return TEST_STOPPABLE_EXIT_STATUS;
 }
 
-static void ignore_stop(void* arg)
+static int run_hung(dmosi_semaphore_t wakeup)
 {
-    (void)arg;
+    dmosi_semaphore_t never = dmosi_semaphore_create(0, 1);
+    libsystemd_set_stop_semaphore(wakeup);
+    for (;;)
+    {
+        dmosi_semaphore_wait(never, 1, -1);
+    }
+    return 0;
 }
 
 int main(int argc, char* argv[])
 {
     const char* mode = (argc > 1) ? argv[1] : "plain";
-    stoppable_t s = { .wakeup = dmosi_semaphore_create(0, 1), .stop = false };
-    if (s.wakeup == NULL)
+    dmosi_semaphore_t wakeup = dmosi_semaphore_create(0, 1);
+    if (wakeup == NULL)
     {
         return -ENOMEM;
     }
 
+    int status = 0;
     if (strcmp(mode, "cooperative") == 0)
     {
-        libsystemd_set_stop_handler(on_stop, &s);
+        status = run_cooperative(wakeup);
     }
-    else if (strcmp(mode, "stubborn") == 0)
+    else if (strcmp(mode, "hung") == 0)
     {
-        libsystemd_set_stop_handler(ignore_stop, &s);
+        status = run_hung(wakeup);
+    }
+    else
+    {
+        for (;;)
+        {
+            dmosi_semaphore_wait(wakeup, 1, 1000);
+        }
     }
 
-    while (!s.stop)
-    {
-        dmosi_semaphore_wait(s.wakeup, 1, 1000);
-    }
-
-    libsystemd_set_stop_handler(NULL, NULL);
-    dmosi_semaphore_destroy(s.wakeup);
-    return TEST_STOPPABLE_EXIT_STATUS;
+    dmosi_semaphore_destroy(wakeup);
+    return status;
 }

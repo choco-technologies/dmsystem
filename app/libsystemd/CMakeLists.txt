@@ -31,7 +31,7 @@ set(DMOD_MAL_IMPLS          )
 dmod_add_library(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
     # List of source files - can include C and C++ files
     src/serviceapi.c
-    src/stophandler.c
+    src/stoprequest.c
 )
 
 target_include_directories(${DMOD_MODULE_NAME}_if
