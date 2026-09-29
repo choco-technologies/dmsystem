@@ -1583,6 +1583,13 @@ static bool libsystemd_build_argv(libsystemd_service_t service, const char* exec
     return true;
 }
 
+// Relocated by the module loader (.got) - a pointer initialized with a
+// string literal elsewhere keeps its link-time address on target.
+static const char* libsystemd_key_stdin  DMOD_GLOBAL_POINTER = "stdin";
+static const char* libsystemd_key_stdout DMOD_GLOBAL_POINTER = "stdout";
+static const char* libsystemd_key_stderr DMOD_GLOBAL_POINTER = "stderr";
+static const char* libsystemd_key_stdlog DMOD_GLOBAL_POINTER = "stdlog";
+
 /**
  * @brief Build a service's stream redirection table from its "stdin"/"stdout"/"stderr"/"stdlog" ini keys
  *
@@ -1614,10 +1621,10 @@ static bool libsystemd_build_streams(dmini_context_t ctx, libsystemd_service_t s
         void* handle;
         const char* key;
     } candidates[4] = {
-        { DMOD_STDIN,  "stdin"  },
-        { DMOD_STDOUT, "stdout" },
-        { DMOD_STDERR, "stderr" },
-        { DMOD_STDLOG, "stdlog" },
+        { DMOD_STDIN,  libsystemd_key_stdin  },
+        { DMOD_STDOUT, libsystemd_key_stdout },
+        { DMOD_STDERR, libsystemd_key_stderr },
+        { DMOD_STDLOG, libsystemd_key_stdlog },
     };
 
     Dmod_StreamRedirection_t* entries = Dmod_Malloc(sizeof(Dmod_StreamRedirection_t) * 4);
