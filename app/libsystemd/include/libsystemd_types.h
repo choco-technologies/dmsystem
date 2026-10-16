@@ -26,7 +26,7 @@ typedef enum
 {
     LIBSYSTEMD_SERVICE_TYPE_SIMPLE,   //!< Default. The process is expected to keep running until stopped; an unexpected exit is logged as a warning.
     LIBSYSTEMD_SERVICE_TYPE_ONESHOT,  //!< The process is expected to run to completion and exit on its own; a clean (status 0) exit is not treated as a crash.
-    LIBSYSTEMD_SERVICE_TYPE_LIBRARY,  //!< "exec" names a Library-type DMOD module (see ::Dmod_ModuleType_Library), not a spawnable Application: starting the unit loads and enables that module, stopping it disables and unloads it - no process is ever spawned.
+    LIBSYSTEMD_SERVICE_TYPE_LIBRARY,  //!< "exec" names a Library-type DMOD module (see ::Dmod_ModuleType_Library), not a spawnable Application: plain units enable/disable it, while optional service lifecycle DIF callbacks manage each unit instance without unloading shared code. No process is spawned.
 } libsystemd_service_type_t;
 
 /**

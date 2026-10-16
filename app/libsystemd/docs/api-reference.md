@@ -78,7 +78,7 @@ Looks `unit_name` up in the global registry and starts it. For a `simple`/
 `Dmod_SpawnModule` so the unit's lifetime is never tied to whichever process
 happened to call this). For a `type=library` unit, instead loads and enables
 `exec` as a Library module (`Dmod_LoadModuleByName` + `Dmod_EnableModule`) -
-no process is spawned; see [configuration.md](configuration.md#typelibrary-services-backed-by-a-library-module-not-a-process).
+no process is spawned; see [configuration.md](configuration.md#typelibrary-a-service-backed-by-a-library-module).
 
 If `unit_name` is not already registered but is `<prefix>@<instance>`-shaped
 and `<prefix>@.ini` exists in the last-scanned units directory, it is
@@ -87,7 +87,9 @@ instantiated on the fly and added to the registry before being spawned - see
 This is the only place template instantiation happens outside of
 `libsystemd_scan()`/`libsystemd_parse_dir()`. `user_value` (may be `NULL`) is
 substituted for `%v` in the template's keys during that on-demand
-instantiation only - it has no effect if `unit_name` is already registered.
+instantiation. An inactive library template instance is also refreshed when
+a non-NULL value is supplied again. Active units and concrete units retain
+their current arguments.
 
 If the unit's `restart` key is not `no`, also registers a `dmosi` process-exit
 callback on the newly spawned process (best-effort - silently skipped if
@@ -108,7 +110,10 @@ For a `type=library` unit:
 - `-EINVAL` - `unit_name` was `NULL`.
 - `-ENOENT` - no unit with that name, and it could not be instantiated from a
   template either; or the module could not be found/loaded.
-- `-EALREADY` - the module is already enabled.
+- `-EALREADY` - the callback-backed unit is already active, or a plain library
+  module is already enabled.
+- `-ENOTSUP` - only one of the paired lifecycle callbacks is implemented.
+- Other callback errors propagate; a failed START leaves the unit inactive.
 - `-EIO` - the module was loaded but could not be enabled (e.g. it is not a
   Library module, or a required module could not be enabled).
 
@@ -123,14 +128,16 @@ semaphore posted, and it gets up to the unit's `stop_timeout_ms` to exit on
 its own - the call blocks meanwhile, but never longer, whatever the service does.
 Otherwise, or if it does not exit in time, it is killed
 (`dmosi_process_kill`). See [Graceful stop](configuration.md#graceful-stop). For a `type=library` unit, instead
-disables then unloads `exec` (`Dmod_DisableModule` + `Dmod_UnloadModule`) -
-disable before unload, since the dmod core refuses to unload a module that is
-still enabled.
+calls its STOP callback when the module implements the lifecycle DIF. Only
+that unit becomes inactive; shared module code stays enabled. Callback errors
+propagate and preserve active state. Plain libraries instead disable then
+unload `exec` (`Dmod_DisableModule` + `Dmod_UnloadModule`).
 
 - `-EINVAL` - `unit_name` was `NULL`.
 - `-ENOENT` - no unit with that name.
 - `-ESRCH` - the unit exists but has no running process to stop (or, for a
-  `type=library` unit, is neither loaded nor enabled).
+  `type=library` unit, its callback-backed instance is inactive or its plain
+  module is neither loaded nor enabled).
 - `-EIO` - (`type=library` only) disabling or unloading the module failed.
 
 ### `libsystemd_notify_main_pid(const char* unit_name, Dmod_Pid_t pid)`
@@ -188,10 +195,10 @@ Fills `*out_status` with the unit's current process state and PID. Reports
 can no longer be found (e.g. it exited on its own).
 
 For a `type=library` unit there is no process/PID at all - `pid` is always
-`0`, and `state` is read live from the module's own state (`Dmod_IsModuleEnabled`):
-`DMOSI_PROCESS_STATE_RUNNING` while enabled, `DMOSI_PROCESS_STATE_CREATED`
-otherwise (covering both "never started" and "stopped" - unlike a
-process-backed unit there is no tracked "last" identity to tell those apart).
+`0`. For callback-backed modules, `state` is RUNNING only while this unit has
+a successful START and the module remains enabled. Otherwise it is CREATED.
+For plain libraries, RUNNING follows `Dmod_IsModuleEnabled`; stopped and
+never-started instances both report CREATED.
 
 - `-EINVAL` - `unit_name`/`out_status` was `NULL`.
 - `-ENOENT` - no unit with that name.
@@ -255,3 +262,11 @@ by a later `libsystemd_scan()`/`libsystemd_load_rules()` replay.
   with the resolved name is currently registered.
 - `-ESRCH` - the resolved unit exists but has no running process to stop.
 - `-ENOMEM` - allocation failed while resolving the target.
+
+## Library-service instance lifecycle
+
+The enable/disable library lifecycle described above applies to plain libraries.
+Modules implementing both DIF callbacks in `libsystemd_service.h` instead receive
+per-unit START/STOP with expanded arguments. Unit state is independent of an
+already-enabled shared module; stop does not disconnect other API consumers.
+See [configuration](configuration.md#typelibrary-a-service-backed-by-a-library-module).

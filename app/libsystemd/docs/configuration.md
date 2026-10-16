@@ -61,54 +61,56 @@ never tied to whichever process happened to start it - see the comment in
 
 `library` is a different kind of unit altogether - see the next section.
 
-#### `type=library`: services backed by a Library module, not a process
+#### `type=library`: a service backed by a Library module
 
-`simple`/`oneshot` units both assume `exec` names an **Application**-type
-DMOD module - one with a `main()` that can be spawned as a process. Not every
-piece of functionality that needs to be started/stopped by `libsystemd` is
-shaped like that: a **Library** module (no `main()`, e.g. a protocol handler
-that does its job entirely from `dmod_init()`/`dmod_deinit()` once
-loaded/enabled - see
-[`dmicmp`](https://github.com/choco-technologies/dmicmp)) can't be spawned at
-all, only loaded and enabled into the running DMOD system.
-
-`type=library` covers exactly this case (named after `Dmod_ModuleType_Library`
-in the dmod core, the same vocabulary DMOD itself uses for the two kinds of
-module): `exec` names the Library module instead of an executable, and
-starting/stopping the unit maps to the DMOD loader's own module lifecycle
-instead of a process one:
-
-- **start** - loads the module if it is not already loaded
-  (`Dmod_LoadModuleByName`), then enables it (`Dmod_EnableModule`). Enabling
-  is what actually runs the module's `dmod_init()` and pulls in/enables its
-  required modules - a module left merely loaded never does anything (see the
-  dmod core's `Dmod_Enable`).
-- **stop** - disables the module (`Dmod_DisableModule`), then unloads it
-  (`Dmod_UnloadModule`) - disable before unload, since the dmod core refuses
-  to unload a module that is still enabled.
-
-Because there is no process, `args`/`stdin`/`stdout`/`stderr`/`stdlog` have no
-effect on a `library`-type unit, and `restart` supervision does not apply
-either (there is no process exit to trigger it) - only `after`/`requires`
-ordering behaves the same as for any other unit. `libsystemd_status()`/
-`service status` still work: they report `DMOSI_PROCESS_STATE_RUNNING`
-(`pid=0`) while the module is enabled and `DMOSI_PROCESS_STATE_CREATED`
-(`pid=0`) otherwise, read live from the module's own state
-(`Dmod_IsModuleEnabled`) rather than from any state `libsystemd` tracks
-itself.
+`exec` names a Library module. No process is spawned and status uses PID zero.
+For plain libraries, start loads/enables the module and stop disables/unloads
+it. For example:
 
 ```ini
-# icmp.ini
-description=Answer ICMP Echo Requests (ping)
 exec=dmicmp
 type=library
 ```
 
-`Dmod_EnableModule`/`Dmod_LoadModuleByName` (and their `Unload`/`Disable`
-counterparts) reject anything that is not a Library module, so pointing
-`type=library` at an Application-type module's name simply fails to start (see
-`libsystemd_start_service()`'s return codes) rather than doing something
-unexpected.
+Shared libraries can implement the paired lifecycle DIF from
+`libsystemd_service.h`. In that case module initialization and service instance
+lifetime are separate:
+
+- START enables the module if necessary, then calls `service_start(unit, argc,
+  argv)` with the fully expanded `exec`/`args` vector. This still happens when
+  API consumers enabled the module earlier. Each unit has its own active state.
+- STOP calls `service_stop(unit)`. Success clears only that unit's active state;
+  failure leaves it active. Other units and API consumers retain shared code.
+  Disabling/unloading the module remains a module-lifecycle operation.
+- Implement both callbacks or neither; an incomplete pair fails with ENOTSUP.
+  Callback arguments are borrowed for the call; copy anything retained.
+- Callback-backed status is RUNNING only after successful START and while the
+  module remains enabled. A loaded/enabled library alone is not a running unit.
+
+An RTC device rule can therefore start the UTC library with the reported path:
+
+```ini
+; dmutc@.ini
+exec=dmutc
+type=library
+args=%v
+```
+
+```ini
+; dmutc.rules
+[class=rtc]
+start=dmutc@%name
+```
+
+Here `%v` is the device event's actual path. Multiple RTCs produce separate
+unit instances using one shared module. Device removal stops the corresponding
+instance. A stopped template is re-expanded when a re-added device supplies a
+new `%v`; its previous path is not reused. Devices remembered before rules load
+are replayed through the same START path. No application shim or hardcoded device path is needed.
+
+Stream redirection does not apply to library units. `args` is ignored for plain
+libraries without lifecycle DIF. Process restart supervision does not apply;
+`after`/`requires` ordering remains available. A non-Library `exec` fails enable.
 
 ### Restart supervision
 

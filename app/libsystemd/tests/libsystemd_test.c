@@ -1,6 +1,7 @@
 #define DMOD_ENABLE_REGISTRATION ON
 #include "dmod_test.h"
 #include "libsystemd.h"
+#include "dmtestlibrary.h"
 #include "dmosi.h"
 #include <errno.h>
 #include <string.h>
@@ -923,4 +924,83 @@ DMOD_TEST_STEP(set_stop_semaphore_registers_and_clears_for_calling_process)
     DMOD_TEST_EXPECT_EQ(libsystemd_set_stop_semaphore(NULL), 0);
     dmosi_semaphore_destroy(first);
     dmosi_semaphore_destroy(second);
+}
+
+DMOD_TEST_STEP(library_units_bind_devices_even_when_module_was_auto_enabled)
+{
+    /* Importing dmtestlibrary's API enables the library before its service.
+     * Starting a unit must still call its lifecycle handler, not EALREADY. */
+    DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleEnabled("dmtestlibrary"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEST_FIXTURES_DIR "/lifecycle"),0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("rtc","pre","/clocks/pre"),-ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_TEST_FIXTURES_DIR "/lifecycle-rules"),0);
+    DMOD_TEST_EXPECT_TRUE(dmtestlibrary_active("clock@pre"));
+    char path[128];
+    DMOD_TEST_EXPECT_EQ(dmtestlibrary_path("clock@pre",path,sizeof(path)),0);
+    DMOD_TEST_EXPECT_EQ(strcmp(path,"/clocks/pre"),0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("rtc","other","/different/rtc"),0);
+    DMOD_TEST_EXPECT_TRUE(dmtestlibrary_active("clock@other"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("clock@pre",NULL),-EALREADY);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("clock@bad","/reject"),-EINVAL);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("clock@bad",&status),0);
+    DMOD_TEST_EXPECT_EQ(status.state,DMOSI_PROCESS_STATE_CREATED);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("clock@other",&status),0);
+    DMOD_TEST_EXPECT_EQ(status.state,DMOSI_PROCESS_STATE_RUNNING);
+    DMOD_TEST_EXPECT_EQ(status.pid,0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("rtc","pre"),0);
+    DMOD_TEST_EXPECT_FALSE(dmtestlibrary_active("clock@pre"));
+    DMOD_TEST_EXPECT_TRUE(dmtestlibrary_active("clock@other"));
+    DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleEnabled("dmtestlibrary"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("clock@pre",&status),0);
+    DMOD_TEST_EXPECT_EQ(status.state,DMOSI_PROCESS_STATE_CREATED);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_added("rtc","pre","/clocks/moved"),0);
+    DMOD_TEST_EXPECT_TRUE(dmtestlibrary_active("clock@pre"));
+    DMOD_TEST_EXPECT_EQ(dmtestlibrary_path("clock@pre",path,sizeof(path)),0);
+    DMOD_TEST_EXPECT_EQ(strcmp(path,"/clocks/moved"),0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("rtc","pre"),0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_notify_device_removed("rtc","other"),0);
+    DMOD_TEST_EXPECT_FALSE(dmtestlibrary_active("clock@other"));
+    DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleEnabled("dmtestlibrary"));
+}
+
+DMOD_TEST_STEP(library_callbacks_start_on_first_load_and_on_restart)
+{
+    DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleEnabled("dmtestcold"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEST_FIXTURES_DIR "/lifecycle"),0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("cold@rtc","/cold/clock"),0);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("cold@rtc",&status),0);
+    DMOD_TEST_EXPECT_EQ(status.state,DMOSI_PROCESS_STATE_RUNNING);
+    DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("cold@rtc"),0);
+    DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleEnabled("dmtestcold"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("cold@rtc",&status),0);
+    DMOD_TEST_EXPECT_EQ(status.state,DMOSI_PROCESS_STATE_CREATED);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("cold@rtc",NULL),0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("cold@rtc",&status),0);
+    DMOD_TEST_EXPECT_EQ(status.state,DMOSI_PROCESS_STATE_RUNNING);
+    DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("cold@rtc"),0);
+}
+
+DMOD_TEST_STEP(plain_library_retains_enable_disable_unload_and_restart)
+{
+    DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleLoaded("dmtestplain"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_TEST_FIXTURES_DIR "/lifecycle"), 0);
+    libsystemd_service_status_t status;
+    for (int cycle = 0; cycle < 2; ++cycle)
+    {
+        DMOD_TEST_EXPECT_EQ(libsystemd_start_service("plain@legacy", "/ignored/argument"), 0);
+        DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleLoaded("dmtestplain"));
+        DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleEnabled("dmtestplain"));
+        DMOD_TEST_EXPECT_EQ(libsystemd_status("plain@legacy", &status), 0);
+        DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_RUNNING);
+        DMOD_TEST_EXPECT_EQ(status.pid, 0);
+        DMOD_TEST_EXPECT_EQ(libsystemd_start_service("plain@legacy", NULL), -EALREADY);
+        DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("plain@legacy"), 0);
+        DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleEnabled("dmtestplain"));
+        DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleLoaded("dmtestplain"));
+        DMOD_TEST_EXPECT_EQ(libsystemd_status("plain@legacy", &status), 0);
+        DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_CREATED);
+        DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("plain@legacy"), -ESRCH);
+    }
 }

@@ -1,5 +1,7 @@
 #define DMOD_ENABLE_REGISTRATION ON
+#define ENABLE_DIF_REGISTRATIONS
 #include "libsystemd.h"
+#include "libsystemd_service.h"
 #include <errno.h>
 #include <string.h>
 #include "dmini.h"
@@ -45,6 +47,8 @@ struct libsystemd_service
     libsystemd_service_type_t type;                    //!< From the optional "type" key ("simple"/"oneshot"). Defaults to ::LIBSYSTEMD_SERVICE_TYPE_SIMPLE.
     libsystemd_restart_policy_t restart_policy;         //!< From the optional "restart" key ("no"/"always"/"on-failure"). Defaults to ::LIBSYSTEMD_RESTART_NO.
     uint32_t stop_timeout_ms;           //!< From the optional "stop_timeout_ms" key: how long a stop waits for a service registered for stop requests to exit on its own before killing it. 0 = kill at once. Defaults to ::LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS.
+    bool from_template;                // Allows a stopped device unit to receive a fresh event value.
+    bool library_started;              // Callback-backed unit instance, independent of module enabled state.
     char* exec;                         //!< Module name (or file path) to spawn, from the "exec" key. Owned copy.
     int argc;                           //!< Number of entries in argv (always >= 1, argv[0] == exec).
     char** argv;                        //!< NULL-terminated argument vector (argc+1 entries, each an owned copy).
@@ -887,107 +891,71 @@ static void libsystemd_detach_exit_callback(libsystemd_service_t service, dmosi_
 }
 
 /**
- * @brief Actually start a ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY unit, without looking it up by name first
- *
- * Counterpart of libsystemd_start_service_internal() for a unit whose `exec`
- * names a Library-type DMOD module rather than a spawnable Application:
- * "starting" it means loading and enabling that module
- * (`Dmod_LoadModuleByName()` + `Dmod_EnableModule()`), not spawning a
- * process. No `argc`/`argv`/stream redirection applies (those are meaningless
- * for a module that is never run as a process), and there is no PID to track
- * or restart-supervision callback to attach - libsystemd_fill_status() reads
- * the module's live loaded/enabled state directly (via `Dmod_IsModuleLoaded()`/
- * `Dmod_IsModuleEnabled()`) instead of a tracked `pid`.
- *
- * `Dmod_LoadModuleByName()` is itself idempotent for a Library module already
- * loaded (returns the existing context rather than failing - see the dmod
- * core), so this only calls it when the module is not already loaded; a
- * module left loaded but not enabled by some earlier partial failure is still
- * picked up and enabled here rather than treated as "already started". If
- * enabling fails and this call is the one that loaded the module (it was not
- * already loaded beforehand), the load is undone before returning - most
- * commonly hit by pointing `type=library` at an Application-type module by
- * mistake: loading it still succeeds (the dmod core only enforces "Library
- * only" on enable), but leaving it loaded would leak a fresh, unshared
- * Application context on every failed start (see `Dmod_LoadModuleByName()` in
- * the dmod core - unlike a Library module, an already-loaded Application
- * module is never reused).
- *
- * @param service Service to start (must not be NULL); `service->exec` is the module name.
- *
- * @retval 0        The module is now loaded and enabled.
- * @retval -EALREADY The module was already enabled.
- * @retval -ENOENT  The module could not be found/loaded.
- * @retval -EIO     The module was loaded but `Dmod_EnableModule()` failed
- *                    (e.g. it is not a Library module, or one of its required
- *                    modules could not be enabled).
+ * Start a Library unit. Modules implementing the paired service START/STOP DIF
+ * are enabled once and receive expanded argv per unit instance. Module enable
+ * alone does not mean a callback-backed unit is running; API dependencies may
+ * have enabled the library before its device arrived. Plain libraries keep
+ * the original load/enable lifecycle and EALREADY behavior.
  */
 static int libsystemd_start_library_service_internal(libsystemd_service_t service)
 {
-    if (Dmod_IsModuleEnabled(service->exec))
-    {
-        return -EALREADY;
-    }
-
-    DMOD_LOG_INFO("Loading library service '%s' (module '%s')\n", service->unit_name, service->exec);
-
+    bool enabled = Dmod_IsModuleEnabled(service->exec);
     bool already_loaded = Dmod_IsModuleLoaded(service->exec);
-    if (!already_loaded && Dmod_LoadModuleByName(service->exec) == NULL)
-    {
-        return -ENOENT;
-    }
-
-    if (!Dmod_EnableModule(service->exec, false, NULL))
-    {
-        if (!already_loaded)
-        {
-            Dmod_UnloadModule(service->exec, true);
-        }
+    if (!already_loaded && Dmod_LoadModuleByName(service->exec) == NULL) return -ENOENT;
+    // DIF resolution is only valid on an enabled module. The very first
+    // device event must work, not just a retry after another API enabled it.
+    if (!Dmod_EnableModule(service->exec, false, NULL)) {
+        if (!already_loaded) Dmod_UnloadModule(service->exec, true);
         return -EIO;
     }
-
+    Dmod_Context_t* module = Dmod_GetModuleContext(service->exec);
+    dmod_libsystemd_service_start_t start = Dmod_GetDifFunction(module, dmod_libsystemd_service_start_sig);
+    dmod_libsystemd_service_stop_t stop = Dmod_GetDifFunction(module, dmod_libsystemd_service_stop_sig);
+    if ((start == NULL) != (stop == NULL)) {
+        if (!already_loaded && Dmod_DisableModule(service->exec, false))
+            Dmod_UnloadModule(service->exec, false);
+        return -ENOTSUP;
+    }
+    if (start == NULL) return enabled ? -EALREADY : 0;
+    if (service->library_started && enabled) return -EALREADY;
+    service->library_started = false;
+    int rc = start(service->unit_name, service->argc, (const char* const*)service->argv);
+    if (rc != 0) return rc;
+    service->library_started = true;
     return 0;
 }
 
 /**
- * @brief Actually stop a ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY unit, without looking it up by name first
- *
- * Counterpart of libsystemd_stop_service_internal() for a library-type unit:
- * "stopping" it means disabling and then unloading the module
- * (`Dmod_DisableModule()` + `Dmod_UnloadModule()`), the reverse order of
- * libsystemd_start_library_service_internal() - `Dmod_Unload()` in the dmod
- * core refuses to unload a module that is still enabled (see `dmod_system.c`),
- * so disabling first is required, not just symmetrical.
- *
- * @param service Service to stop (must not be NULL); `service->exec` is the module name.
- *
- * @retval 0      The module is now disabled and unloaded (or was already unloaded entirely).
- * @retval -ESRCH The module was neither loaded nor enabled - nothing to stop.
- * @retval -EIO   `Dmod_DisableModule()`/`Dmod_UnloadModule()` failed (e.g. another
- *                  still-enabled module requires this one).
+ * Stop only the callback-backed unit's resources, keeping shared module code
+ * available to other units/API consumers. STOP errors preserve active state.
+ * A plain library without lifecycle DIF retains disable/unload behavior.
  */
 static int libsystemd_stop_library_service_internal(libsystemd_service_t service)
 {
     bool loaded = Dmod_IsModuleLoaded(service->exec);
     bool enabled = Dmod_IsModuleEnabled(service->exec);
-
-    if (!loaded && !enabled)
-    {
-        return -ESRCH;
+    if (!loaded && !enabled) {
+        bool active = service->library_started;
+        service->library_started = false;
+        return active ? 0 : -ESRCH;
     }
-
-    DMOD_LOG_INFO("Unloading library service '%s' (module '%s')\n", service->unit_name, service->exec);
-
-    if (enabled && !Dmod_DisableModule(service->exec, false))
-    {
-        return -EIO;
+    if (!enabled) {
+        if (service->library_started) {service->library_started = false; return 0;}
+        return Dmod_UnloadModule(service->exec, false) ? 0 : -EIO;
     }
-
-    if (loaded && !Dmod_UnloadModule(service->exec, false))
-    {
-        return -EIO;
+    Dmod_Context_t* module = Dmod_GetModuleContext(service->exec);
+    dmod_libsystemd_service_stop_t stop = Dmod_GetDifFunction(module, dmod_libsystemd_service_stop_sig);
+    if (stop != NULL) {
+        if (!service->library_started) return -ESRCH;
+        int rc = enabled ? stop(service->unit_name) : 0;
+        if (rc != 0) return rc;
+        service->library_started = false;
+        // The library may still serve other units or API consumers. The unit
+        // owns its callback state, not the lifetime of shared module code.
+        return 0;
     }
-
+    if (enabled && !Dmod_DisableModule(service->exec, false)) return -EIO;
+    if (loaded && !Dmod_UnloadModule(service->exec, false)) return -EIO;
     return 0;
 }
 
@@ -1410,7 +1378,12 @@ static void libsystemd_fill_status(libsystemd_service_t service, libsystemd_serv
 {
     if (service->type == LIBSYSTEMD_SERVICE_TYPE_LIBRARY)
     {
-        out_status->state = Dmod_IsModuleEnabled(service->exec) ? DMOSI_PROCESS_STATE_RUNNING : DMOSI_PROCESS_STATE_CREATED;
+        bool running = Dmod_IsModuleEnabled(service->exec);
+        Dmod_Context_t* module = Dmod_GetModuleContext(service->exec);
+        if (running && module != NULL && (Dmod_GetDifFunction(module, dmod_libsystemd_service_start_sig) != NULL ||
+            Dmod_GetDifFunction(module, dmod_libsystemd_service_stop_sig) != NULL))
+            running = running && service->library_started;
+        out_status->state = running ? DMOSI_PROCESS_STATE_RUNNING : DMOSI_PROCESS_STATE_CREATED;
         out_status->pid = 0;
         return;
     }
@@ -2346,6 +2319,8 @@ static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_ser
     new_service->type = LIBSYSTEMD_SERVICE_TYPE_SIMPLE;
     new_service->restart_policy = LIBSYSTEMD_RESTART_NO;
     new_service->stop_timeout_ms = LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS;
+    new_service->from_template = false;
+    new_service->library_started = false;
     new_service->exec = NULL;
     new_service->argc = 0;
     new_service->argv = NULL;
@@ -2524,6 +2499,7 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
     }
 
     new_service->unit_name = unit_name;
+    new_service->from_template = true;
     *service = new_service;
 
     return 0;
@@ -2592,6 +2568,30 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
     }
 
     return service;
+}
+
+/* A removed/re-added device may retain its unit name but report a different
+ * absolute path. Re-expand an inactive library template with the new event;
+ * never reuse the old %v or change an active instance behind its callback. */
+static int libsystemd_refresh_library_instance(libsystemd_service_t service, const char* user_value)
+{
+    if (!service->from_template || service->type != LIBSYSTEMD_SERVICE_TYPE_LIBRARY ||
+        service->library_started || user_value == NULL) return 0;
+    if (Dmod_IsModuleEnabled(service->exec)) {
+        Dmod_Context_t* module = Dmod_GetModuleContext(service->exec);
+        if (Dmod_GetDifFunction(module, dmod_libsystemd_service_start_sig) == NULL) return 0;
+    }
+    char* prefix = NULL; char* instance = NULL;
+    if (!libsystemd_split_instance_name(service->unit_name, &prefix, &instance)) return -ENOMEM;
+    libsystemd_template_t* tmpl = dmlist_find(g_services->templates, prefix, libsystemd_compare_template_by_prefix);
+    libsystemd_service_t fresh = NULL;
+    int rc = tmpl == NULL ? -ENOENT : libsystemd_instantiate_from_template(tmpl->dir_path, prefix, instance, user_value, &fresh);
+    Dmod_Free(prefix); Dmod_Free(instance);
+    if (rc != 0) return rc;
+    struct libsystemd_service old = *service;
+    *service = *fresh; *fresh = old;
+    libsystemd_destroy_service(fresh);
+    return 0;
 }
 
 /**
@@ -3158,8 +3158,9 @@ int dmod_deinit(void)
  * @param user_value Optional caller-supplied value, substituted for `%v` in
  *                     the template's keys if @p unit_name is instantiated
  *                     on demand (see above) - pass NULL if not needed. Has no
- *                     effect if @p unit_name already exists in the registry,
- *                     since only on-demand instantiation expands specifiers.
+ *                     effect on active/concrete units. An inactive library
+ *                     template instance is refreshed with a new device value
+ *                     so a re-added device cannot reuse a stale %v path.
  *
  * @retval 0         The service was found (or instantiated) and spawned successfully.
  * @retval -EINVAL   @p unit_name was NULL.
@@ -3188,6 +3189,7 @@ dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_nam
     }
 
     libsystemd_service_t service = libsystemd_find_service(g_services, unit_name);
+    bool existed = service != NULL;
     if (service == NULL)
     {
         service = libsystemd_instantiate_service_on_demand(unit_name, user_value);
@@ -3197,6 +3199,8 @@ dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_nam
         return -ENOENT;
     }
 
+    int rc = existed ? libsystemd_refresh_library_instance(service, user_value) : 0;
+    if (rc != 0) return rc;
     return libsystemd_start_service_internal(service);
 }
 

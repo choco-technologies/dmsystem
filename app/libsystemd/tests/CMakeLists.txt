@@ -5,6 +5,7 @@ set(DMOD_STACK_SIZE         1024)
 set(DMOD_PRIORITY           0)
 
 add_subdirectory(stoppable)
+add_subdirectory(lifecycle)
 
 dmod_add_test(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
     libsystemd_test.c
@@ -18,6 +19,7 @@ dmod_link_modules(${DMOD_MODULE_NAME}
 
 target_link_libraries(${DMOD_MODULE_NAME}
     libsystemd_if
+    dmtestlibrary_if
     )
 
 # Absolute paths to the example unit files (shipped, user-facing) and to the
