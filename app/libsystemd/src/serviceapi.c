@@ -193,6 +193,37 @@ static dmlist_context_t* g_devices = NULL;
  */
 static dmlist_context_t* g_config_dirs = NULL;
 
+/**
+ * @brief Guards the registry lists - @ref g_services (units and templates), @ref g_rules,
+ *        @ref g_devices, @ref g_config_dirs - against concurrent threads
+ *
+ * libsystemd is called from several threads: dmdevfs's hot-plug thread
+ * (device notifications), mountcfg's (configuration directories), the shell
+ * (`service`), systemd at boot. Two of them instantiating the same unit at
+ * once registered it twice. Recursive, and held only while a list is read or
+ * changed: never while a unit is spawned, a module enabled or disabled, or a
+ * stopping unit waited for - those may need another thread that calls into
+ * libsystemd (a stopping automount unmounts, and mountcfg unloads that mount's
+ * units). The fields of one service (pid, ...) are not guarded by it.
+ */
+static dmosi_mutex_t g_registry_lock = NULL;
+
+static void libsystemd_lock(void)
+{
+    if (g_registry_lock != NULL)
+    {
+        dmosi_mutex_lock(g_registry_lock);
+    }
+}
+
+static void libsystemd_unlock(void)
+{
+    if (g_registry_lock != NULL)
+    {
+        dmosi_mutex_unlock(g_registry_lock);
+    }
+}
+
 // Defined with the configuration directory API at the end of this file.
 static int libsystemd_parse_dir_from(const char* dir_path, const char* source, libsystemd_services_t* services);
 static void libsystemd_merge_config_dirs_units(void);
@@ -512,11 +543,13 @@ static int libsystemd_compare_device(const void* data1, const void* data2)
  */
 static void libsystemd_remember_device(const char* device_class, const char* device_name, const char* user_value)
 {
+    libsystemd_lock();
     if (g_devices == NULL)
     {
         g_devices = dmlist_create();
         if (g_devices == NULL)
         {
+            libsystemd_unlock();
             return;
         }
     }
@@ -524,12 +557,14 @@ static void libsystemd_remember_device(const char* device_class, const char* dev
     libsystemd_device_key_t key = { .device_class = device_class, .device_name = device_name };
     if (dmlist_find(g_devices, &key, libsystemd_compare_device) != NULL)
     {
+        libsystemd_unlock();
         return;
     }
 
     libsystemd_device_t* device = Dmod_Malloc(sizeof(libsystemd_device_t));
     if (device == NULL)
     {
+        libsystemd_unlock();
         return;
     }
 
@@ -544,6 +579,7 @@ static void libsystemd_remember_device(const char* device_class, const char* dev
         Dmod_Free(device->user_value);
         Dmod_Free(device);
     }
+    libsystemd_unlock();
 }
 
 /**
@@ -563,24 +599,23 @@ static void libsystemd_remember_device(const char* device_class, const char* dev
  */
 static void libsystemd_forget_device(const char* device_class, const char* device_name)
 {
-    if (g_devices == NULL)
-    {
-        return;
-    }
-
+    libsystemd_lock();
     libsystemd_device_key_t key = { .device_class = device_class, .device_name = device_name };
-
-    libsystemd_device_t* device = (libsystemd_device_t*)dmlist_find(g_devices, &key, libsystemd_compare_device);
-    if (device == NULL)
+    libsystemd_device_t* device = (g_devices != NULL)
+        ? (libsystemd_device_t*)dmlist_find(g_devices, &key, libsystemd_compare_device) : NULL;
+    if (device != NULL)
     {
-        return;
+        dmlist_remove(g_devices, &key, libsystemd_compare_device);
     }
+    libsystemd_unlock();
 
-    dmlist_remove(g_devices, &key, libsystemd_compare_device);
-
-    Dmod_Free(device->device_class);
-    Dmod_Free(device->device_name);
-    Dmod_Free(device);
+    if (device != NULL)
+    {
+        Dmod_Free(device->device_class);
+        Dmod_Free(device->device_name);
+        Dmod_Free(device->user_value);
+        Dmod_Free(device);
+    }
 }
 
 /**
@@ -691,7 +726,10 @@ static libsystemd_service_t libsystemd_find_service(libsystemd_services_t servic
         return NULL;
     }
 
-    return (libsystemd_service_t)dmlist_find(services->services, unit_name, libsystemd_compare_by_unit_name);
+    libsystemd_lock();
+    libsystemd_service_t service = (libsystemd_service_t)dmlist_find(services->services, unit_name, libsystemd_compare_by_unit_name);
+    libsystemd_unlock();
+    return service;
 }
 
 /**
@@ -717,7 +755,10 @@ static libsystemd_service_t libsystemd_find_service_by_pid(libsystemd_services_t
         return NULL;
     }
 
-    return (libsystemd_service_t)dmlist_find(services->services, &pid, libsystemd_compare_by_pid);
+    libsystemd_lock();
+    libsystemd_service_t service = (libsystemd_service_t)dmlist_find(services->services, &pid, libsystemd_compare_by_pid);
+    libsystemd_unlock();
+    return service;
 }
 
 /**
@@ -3077,7 +3118,12 @@ static int libsystemd_resolve_device_targets(const char* device_class, const cha
         .targets = targets,
         .error = 0,
     };
-    dmlist_foreach(g_rules, libsystemd_collect_matching_rule_targets_visitor, &ctx);
+    libsystemd_lock();
+    if (g_rules != NULL)
+    {
+        dmlist_foreach(g_rules, libsystemd_collect_matching_rule_targets_visitor, &ctx);
+    }
+    libsystemd_unlock();
 
     if (ctx.error != 0)
     {
@@ -3165,10 +3211,39 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
  */
 static void libsystemd_replay_pending_devices(void)
 {
-    if (g_devices != NULL)
+    // A copy, taken under the lock: starting a unit is never done holding it (see g_registry_lock)
+    dmlist_context_t* devices = dmlist_create();
+    if (devices == NULL)
     {
-        dmlist_foreach(g_devices, libsystemd_replay_device_visitor, NULL);
+        return;
     }
+
+    libsystemd_lock();
+    size_t count = (g_devices != NULL) ? dmlist_size(g_devices) : 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        const libsystemd_device_t* device = (const libsystemd_device_t*)dmlist_get(g_devices, i);
+        libsystemd_device_t* copy = Dmod_Malloc(sizeof(libsystemd_device_t));
+        if (copy == NULL)
+        {
+            continue;
+        }
+        copy->device_class = Dmod_StrDup(device->device_class);
+        copy->device_name = Dmod_StrDup(device->device_name);
+        copy->user_value = (device->user_value != NULL) ? Dmod_StrDup(device->user_value) : NULL;
+        if (copy->device_class == NULL || copy->device_name == NULL ||
+            (device->user_value != NULL && copy->user_value == NULL) || !dmlist_push_back(devices, copy))
+        {
+            Dmod_Free(copy->device_class);
+            Dmod_Free(copy->device_name);
+            Dmod_Free(copy->user_value);
+            Dmod_Free(copy);
+        }
+    }
+    libsystemd_unlock();
+
+    dmlist_foreach(devices, libsystemd_replay_device_visitor, NULL);
+    libsystemd_destroy_devices(devices);
 }
 
 /**
@@ -3196,6 +3271,11 @@ static void libsystemd_replay_pending_devices(void)
  */
 static int libsystemd_serviceapi_init(void)
 {
+    if (g_registry_lock == NULL && (g_registry_lock = dmosi_mutex_create(true)) == NULL)
+    {
+        return -ENOMEM;
+    }
+
     if (g_services != NULL)
     {
         return 0;
@@ -3266,6 +3346,12 @@ static void libsystemd_serviceapi_deinit(void)
 
     // Last: stopping services above may still send stop requests.
     libsystemd_stoprequest_deinit();
+
+    if (g_registry_lock != NULL)
+    {
+        dmosi_mutex_destroy(g_registry_lock);
+        g_registry_lock = NULL;
+    }
 }
 
 /**
@@ -3367,18 +3453,17 @@ dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_nam
         return -EINVAL;
     }
 
+    // Looked up and, if need be, instantiated in one go - two threads starting
+    // the same instance must not register it twice
+    libsystemd_lock();
     libsystemd_service_t service = libsystemd_find_service(g_services, unit_name);
     bool existed = service != NULL;
     if (service == NULL)
     {
         service = libsystemd_instantiate_service_on_demand(unit_name, user_value);
     }
-    if (service == NULL)
-    {
-        return -ENOENT;
-    }
-
-    int rc = existed ? libsystemd_refresh_library_instance(service, user_value) : 0;
+    int rc = (service == NULL) ? -ENOENT : (existed ? libsystemd_refresh_library_instance(service, user_value) : 0);
+    libsystemd_unlock();
     if (rc != 0) return rc;
     return libsystemd_start_service_internal(service);
 }
@@ -3609,7 +3694,9 @@ dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, 
     }
 
     libsystemd_list_ctx_t ctx = { .visitor = visitor, .user_ptr = user_ptr };
+    libsystemd_lock();
     dmlist_foreach(g_services->services, libsystemd_list_visitor, &ctx);
+    libsystemd_unlock();
 
     return 0;
 }
@@ -3685,8 +3772,11 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
         return result;
     }
 
-    libsystemd_stop_all_services(g_services);
-    libsystemd_destroy_services(g_services);
+    // The new generation replaces the previous one at once - the registry is
+    // never missing for another thread - and the previous one is stopped
+    // outside the lock (see g_registry_lock), before the new one starts.
+    libsystemd_lock();
+    libsystemd_services_t previous = g_services;
     g_services = parsed;
 
     char* units_dir = Dmod_StrDup(path);
@@ -3701,14 +3791,20 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
 
     libsystemd_resolve_starting_order(g_services->services);
     dmlist_sort(g_services->services, libsystemd_compare_by_starting_order);
+    size_t count = dmlist_size(g_services->services);
+    libsystemd_unlock();
+
+    libsystemd_stop_all_services(previous);
+    libsystemd_destroy_services(previous);
 
     // By index, over the services there are now: a unit started here may load a
-    // configuration directory (the module that follows mounts is told about the
-    // mounts there are at once), which appends its own units and starts them itself.
-    size_t count = dmlist_size(g_services->services);
+    // configuration directory, which appends its own units and starts them itself.
     for (size_t i = 0; i < count; i++)
     {
-        libsystemd_start_service_visitor(dmlist_get(g_services->services, i), NULL);
+        libsystemd_lock();
+        libsystemd_service_t service = (libsystemd_service_t)dmlist_get(g_services->services, i);
+        libsystemd_unlock();
+        libsystemd_start_service_visitor(service, NULL);
     }
 
     libsystemd_replay_pending_devices();
@@ -3777,11 +3873,14 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
         return result;
     }
 
-    libsystemd_destroy_rules(g_rules);
+    libsystemd_lock();
+    dmlist_context_t* previous = g_rules;
     g_rules = parsed;
 
     // The rules of the mount points' configuration directories stay.
     libsystemd_merge_config_dirs_rules();
+    libsystemd_unlock();
+    libsystemd_destroy_rules(previous);
 
     libsystemd_replay_pending_devices();
 
@@ -4519,14 +4618,14 @@ static void libsystemd_merge_config_dirs_rules(void)
  */
 static void libsystemd_start_config_dir_services(const char* mount_point)
 {
-    libsystemd_resolve_starting_order(g_services->services);
-
     dmlist_context_t* to_start = dmlist_create();
     if (to_start == NULL)
     {
         return;
     }
 
+    libsystemd_lock();
+    libsystemd_resolve_starting_order(g_services->services);
     size_t count = dmlist_size(g_services->services);
     for (size_t i = 0; i < count; i++)
     {
@@ -4536,6 +4635,7 @@ static void libsystemd_start_config_dir_services(const char* mount_point)
             DMOD_LOG_WARN("Cannot start service '%s' - out of memory\n", service->unit_name);
         }
     }
+    libsystemd_unlock();
 
     dmlist_sort(to_start, libsystemd_compare_by_starting_order);
     dmlist_foreach(to_start, libsystemd_start_service_visitor, NULL);
@@ -4614,20 +4714,25 @@ dmod_libsystemd_api_declaration(1.0, int, _add_config_dir, (const char* mount_po
     {
         return -ENOMEM;
     }
+
+    libsystemd_lock();
     bool is_scanned = g_units_dir != NULL && libsystemd_same_path(units_dir, g_units_dir);
     Dmod_Free(units_dir);
     if (is_scanned || (g_config_dirs != NULL && dmlist_find(g_config_dirs, mount_point, libsystemd_compare_string) != NULL))
     {
+        libsystemd_unlock();
         return -EALREADY;
     }
 
     if (g_config_dirs == NULL && (g_config_dirs = dmlist_create()) == NULL)
     {
+        libsystemd_unlock();
         return -ENOMEM;
     }
     char* entry = Dmod_StrDup(mount_point);
     if (entry == NULL || !dmlist_push_back(g_config_dirs, entry))
     {
+        libsystemd_unlock();
         Dmod_Free(entry);
         return -ENOMEM;
     }
@@ -4637,9 +4742,11 @@ dmod_libsystemd_api_declaration(1.0, int, _add_config_dir, (const char* mount_po
     if (units_result == -ENOENT && rules_result == -ENOENT)
     {
         dmlist_remove(g_config_dirs, entry, libsystemd_compare_pointer);
+        libsystemd_unlock();
         Dmod_Free(entry);
         return -ENOENT;
     }
+    libsystemd_unlock();
 
     DMOD_LOG_INFO("Loaded the configuration directory of '%s'\n", entry);
 
@@ -4677,27 +4784,35 @@ dmod_libsystemd_api_declaration(1.0, int, _remove_config_dir, (const char* mount
         return -EINVAL;
     }
 
+    dmlist_context_t* removed = dmlist_create();
+    if (removed == NULL)
+    {
+        return -ENOMEM;
+    }
+
+    libsystemd_lock();
     char* entry = (g_config_dirs != NULL) ? (char*)dmlist_find(g_config_dirs, mount_point, libsystemd_compare_string) : NULL;
     if (entry == NULL)
     {
+        libsystemd_unlock();
+        dmlist_destroy(removed);
         return -ENOENT;
     }
+    dmlist_remove(g_config_dirs, entry, libsystemd_compare_pointer);
 
     DMOD_LOG_INFO("Unloading the configuration directory of '%s'\n", entry);
 
     if (g_services != NULL)
     {
-        // Backwards: the units started last stop first.
+        // Backwards: the units started last stop first. Taken out of the registry
+        // here, stopped below - outside the lock (see g_registry_lock).
         for (size_t i = dmlist_size(g_services->services); i-- > 0; )
         {
             libsystemd_service_t service = (libsystemd_service_t)dmlist_get(g_services->services, i);
-            if (!libsystemd_is_from(service->source, entry))
+            if (libsystemd_is_from(service->source, entry) && dmlist_push_back(removed, service))
             {
-                continue;
+                dmlist_remove_at(g_services->services, i);
             }
-            libsystemd_stop_all_services_visitor(service, NULL);
-            dmlist_remove_at(g_services->services, i);
-            libsystemd_destroy_service(service);
         }
 
         for (size_t i = dmlist_size(g_services->templates); i-- > 0; )
@@ -4728,9 +4843,17 @@ dmod_libsystemd_api_declaration(1.0, int, _remove_config_dir, (const char* mount
         Dmod_Free(rule->source);
         Dmod_Free(rule);
     }
-
-    dmlist_remove(g_config_dirs, entry, libsystemd_compare_pointer);
+    libsystemd_unlock();
     Dmod_Free(entry);
+
+    libsystemd_service_t service = (libsystemd_service_t)dmlist_pop_front(removed);
+    while (service != NULL)
+    {
+        libsystemd_stop_all_services_visitor(service, NULL);
+        libsystemd_destroy_service(service);
+        service = (libsystemd_service_t)dmlist_pop_front(removed);
+    }
+    dmlist_destroy(removed);
 
     return 0;
 }
