@@ -263,6 +263,28 @@ by a later `libsystemd_scan()`/`libsystemd_load_rules()` replay.
 - `-ESRCH` - the resolved unit exists but has no running process to stop.
 - `-ENOMEM` - allocation failed while resolving the target.
 
+### `libsystemd_add_config_dir(const char* mount_point)`
+
+Loads the configuration directory of a mount point - `<mount_point>/cfg/services`
+and `<mount_point>/cfg/rules` - in addition to what is loaded, and starts its
+units. `%m` expands to `mount_point` in them. A unit or template whose name is
+taken already is ignored. See
+[configuration](configuration.md#configuration-directories-of-mount-points).
+
+- `-EINVAL` - `mount_point` was `NULL`.
+- `-EALREADY` - loaded already, or it is the units directory of `libsystemd_scan()`.
+- `-ENOENT` - neither `cfg/services` nor `cfg/rules` is there; nothing is loaded.
+- `-ENOMEM` - allocation failed.
+
+### `libsystemd_remove_config_dir(const char* mount_point)`
+
+Stops and removes every unit that came from the configuration directory of
+`mount_point` (template instances included) and removes its templates and
+rules. Blocks for up to the units' `stop_timeout_ms`.
+
+- `-EINVAL` - `mount_point` was `NULL`.
+- `-ENOENT` - its configuration directory is not loaded.
+
 ## Library-service instance lifecycle
 
 The enable/disable library lifecycle described above applies to plain libraries.

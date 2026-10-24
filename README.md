@@ -179,6 +179,17 @@ for the full format, and
 [`app/libsystemd/examples/rules/`](app/libsystemd/examples/rules) for a
 runnable example.
 
+### Configuration directories of mount points
+
+A mounted file system may bring its own units and rules, in
+`<mount point>/cfg/services` and `<mount point>/cfg/rules`.
+`libsystemd_add_config_dir(mount_point)` adds them to what is loaded and starts
+the units; `libsystemd_remove_config_dir(mount_point)` stops and removes exactly
+them. In such a unit `%m` is the mount point (`exec=%m/bin/app.dmfc`), so it
+uses the module and the files of its own card. The module that follows mounts
+calls both - see
+[`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#configuration-directories-of-mount-points).
+
 ## Building
 
 ### Using CMake

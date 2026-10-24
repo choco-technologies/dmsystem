@@ -234,11 +234,13 @@ case-sensitive):
 | `%p` | The template prefix (e.g. `getty`) |
 | `%n` | The full instantiated unit name (e.g. `getty@tty1`) |
 | `%v` | The caller-supplied `user_value` passed to `libsystemd_start_service()`/`libsystemd_notify_device_added()`, or an empty string if none was given (see [Device rules](#device-rules)) |
+| `%m` | The mount point whose configuration directory the unit (or its template) comes from, without a trailing `/` - empty for the units directory of `libsystemd_scan()` (see [Configuration directories of mount points](#configuration-directories-of-mount-points)) |
 | `%%` | A literal `%` |
 
 An unrecognized `%<char>` sequence (or a trailing `%`) is left untouched.
-Specifier expansion only happens for instance files - plain (non-`@`) unit
-files are never scanned for `%` and can freely contain a literal `%`.
+Specifier expansion only happens for instance files - in a plain (non-`@`)
+unit file only `%m` is expanded, anything else (a literal `%`, `%%`) is
+taken as is.
 
 ```ini
 # getty@.ini - the template
@@ -388,3 +390,46 @@ piece is enough to leave a device pending, and either one showing up later
 is enough to retry it. A device stops being remembered - and is never
 retried again - once `libsystemd_notify_device_removed()` is called for the
 same `(class, name)` pair, even if it was never successfully started.
+
+## Configuration directories of mount points
+
+Besides the units directory of `libsystemd_scan()` and the rules directory of
+`libsystemd_load_rules()`, every mounted file system may bring its own
+configuration, in the same layout:
+
+```
+<mount point>/cfg/services/   units (and templates)
+<mount point>/cfg/rules/      device rules
+```
+
+`libsystemd_add_config_dir(mount_point)` loads it: its units, templates and
+rules are **added** to what is loaded - nothing is reloaded or restarted - and
+its units are started in their dependency order (`requires`/`after` may name
+units from anywhere). `libsystemd_remove_config_dir(mount_point)` stops every
+unit that came from there - template instances started from its templates too
+- and removes its units, templates and rules; everything else stays. A full
+reload (`libsystemd_scan()`, `libsystemd_load_rules()`) keeps the loaded
+configuration directories.
+
+libsystemd itself does not follow mounts - it does not depend on the file
+system. The module that does (on dmod-boot: dmdevfs's `mountcfg`, with dmvfs's
+mount listener) calls these two functions for every mount and unmount, the
+unmount before the file system goes away, so its units stop while their files
+are still there. The configuration directory of the root file system is the
+units directory of `libsystemd_scan()` itself (`/cfg/services`), so it is not
+loaded twice.
+
+In every unit of such a directory `%m` is the mount point, so a unit can name
+the module and the files on its own file system - and stays bound to it even
+with several cards carrying the same module:
+
+```ini
+; /mnt/SD/cfg/services/carhmi.ini
+description=Car HMI demo
+exec=%m/bin/carhmi.dmfc
+args=%m/views/carhmi_view/carhmi.dmv
+```
+
+A unit or template whose name is taken already - by the firmware or by a
+mount point loaded before - is logged and ignored: the first one stays.
+

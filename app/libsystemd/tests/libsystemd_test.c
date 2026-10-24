@@ -1004,3 +1004,155 @@ DMOD_TEST_STEP(plain_library_retains_enable_disable_unload_and_restart)
         DMOD_TEST_EXPECT_EQ(libsystemd_stop_service("plain@legacy"), -ESRCH);
     }
 }
+
+/*
+ * Configuration directories of mount points (libsystemd_add_config_dir()).
+ * The fixture directories tests/fixtures/mount_a, mount_b, ... stand for mounted file systems:
+ * mount_a and mount_b have cfg/services (and mount_a cfg/rules), mount_empty
+ * has no cfg/ at all. Every step unloads what it loaded - dmod_test_setup()
+ * rescans the examples, which keeps loaded configuration directories.
+ */
+#define LIBSYSTEMD_MOUNT_A      LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_a"
+#define LIBSYSTEMD_MOUNT_B      LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_b"
+#define LIBSYSTEMD_MOUNT_EMPTY  LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_empty"
+#define LIBSYSTEMD_MOUNT_ROOT   LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_root"
+
+/**
+ * @brief Closure of find_description_visitor(): the description of one unit
+ */
+typedef struct
+{
+    const char* unit_name;
+    char description[256];
+    bool found;
+} unit_description_t;
+
+static bool find_description_visitor(const libsystemd_service_info_t* info, void* user_ptr)
+{
+    unit_description_t* query = (unit_description_t*)user_ptr;
+    if (strcmp(info->unit_name, query->unit_name) != 0)
+    {
+        return true;
+    }
+    query->found = true;
+    Dmod_SnPrintf(query->description, sizeof(query->description), "%s", info->description != NULL ? info->description : "");
+    return false;
+}
+
+static int count_units(void)
+{
+    unit_summary_t summary = { 0 };
+    libsystemd_list(count_units_visitor, &summary);
+    return summary.count;
+}
+
+DMOD_TEST_STEP(config_dir_rejects_null_mount_point)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(NULL), -EINVAL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(NULL), -EINVAL);
+}
+
+DMOD_TEST_STEP(config_dir_without_cfg_is_not_loaded)
+{
+    int units = count_units();
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_EMPTY), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(LIBSYSTEMD_MOUNT_EMPTY), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(count_units(), units);
+}
+
+DMOD_TEST_STEP(config_dir_units_are_added_started_and_removed)
+{
+    int units = count_units();
+    DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleEnabled("dmtestplain"));
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_A), -EALREADY);
+
+    // Added to the units there were (the template is not a unit), and started
+    DMOD_TEST_EXPECT_EQ(count_units(), units + 1);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_RUNNING);
+    DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleEnabled("dmtestplain"));
+
+    // %m is the mount point
+    unit_description_t query = { .unit_name = "mounted" };
+    libsystemd_list(find_description_visitor, &query);
+    DMOD_TEST_EXPECT_TRUE(query.found);
+    DMOD_TEST_EXPECT_EQ(strcmp(query.description, "from " LIBSYSTEMD_MOUNT_A), 0);
+
+    // Unloaded: stopped and gone, the rest untouched
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+    DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleEnabled("dmtestplain"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(count_units(), units);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("networking", &status), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(LIBSYSTEMD_MOUNT_A), -ENOENT);
+}
+
+DMOD_TEST_STEP(config_dir_keeps_the_first_definition_of_a_unit)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_B), 0);
+
+    unit_description_t query = { .unit_name = "mounted" };
+    libsystemd_list(find_description_visitor, &query);
+    DMOD_TEST_EXPECT_EQ(strcmp(query.description, "from " LIBSYSTEMD_MOUNT_A), 0);
+
+    // mount_b's copy was never loaded, so unloading mount_b leaves mount_a's
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(LIBSYSTEMD_MOUNT_B), 0);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_RUNNING);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), -ENOENT);
+}
+
+DMOD_TEST_STEP(config_dir_rules_start_instances_bound_to_the_mount_point)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+
+    // mount_a's rule, mount_a's template ("dmtool" is not loadable: the
+    // instance is registered, its start fails)
+    libsystemd_notify_device_added("mountdev", "dev1", NULL);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev1", &status), 0);
+    unit_description_t query = { .unit_name = "tool@dev1" };
+    libsystemd_list(find_description_visitor, &query);
+    DMOD_TEST_EXPECT_EQ(strcmp(query.description, LIBSYSTEMD_MOUNT_A " dev1"), 0);
+
+    // The instance, the template and the rule go away with the directory
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev1", &status), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("tool@dev2", NULL), -ENOENT);
+    libsystemd_notify_device_added("mountdev", "dev3", NULL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev3", &status), -ENOENT);
+
+    libsystemd_notify_device_removed("mountdev", "dev1");
+    libsystemd_notify_device_removed("mountdev", "dev3");
+}
+
+DMOD_TEST_STEP(config_dir_survives_a_full_reload)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_EXAMPLES_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_TEST_FIXTURES_DIR "/rules"), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_RUNNING);
+    libsystemd_notify_device_added("mountdev", "dev4", NULL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev4", &status), 0);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_remove_config_dir(LIBSYSTEMD_MOUNT_A), 0);
+    libsystemd_notify_device_removed("mountdev", "dev4");
+}
+
+DMOD_TEST_STEP(config_dir_of_the_scanned_units_directory_is_not_loaded_twice)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_MOUNT_ROOT "/cfg/services/"), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_ROOT), -EALREADY);
+    DMOD_TEST_EXPECT_EQ(count_units(), 1);
+}
