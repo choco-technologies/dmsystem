@@ -68,7 +68,6 @@ struct libsystemd_service
     Dmod_Pid_t pid;                     //!< PID of the process currently tracked for this unit, or <= 0 if never started/not running.
     Dmod_Pid_t last_pid;                //!< PID of the most recent run, retained after `pid` is released so status can tell "never started" from "exited"; <= 0 only if the unit has never run.
     dmosi_process_exit_callback_handle_t exit_callback_handle;  //!< Handle of the dmosi exit callback registered for the current run (see libsystemd_attach_exit_callback()), or NULL if none is registered (not currently running, or registration failed/unsupported).
-    char* source;                       //!< Mount point whose configuration directory the unit (or its template) comes from (see libsystemd_add_config_dir()), or NULL for the units directory of libsystemd_scan(). Owned copy.
 };
 
 /**
@@ -85,7 +84,6 @@ typedef struct
 {
     char* prefix;    //!< Template prefix, e.g. "console" for "console@.ini". Owned copy.
     char* dir_path;  //!< Directory "<prefix>@.ini" was found in (may be nested under the scanned units directory). Owned copy.
-    char* source;    //!< Mount point of the configuration directory it comes from, or NULL (see libsystemd_service::source). Owned copy.
 } libsystemd_template_t;
 
 /**
@@ -141,7 +139,6 @@ typedef struct
     char* class_name;      //!< Device class this rule applies to (the part after "class=" in its `[class=...]` section name). Owned copy.
     char* start_template;  //!< Value of that section's "start" key (started when a device of the class appears), with "%name" substituted for the device name at match time, or NULL. Owned copy.
     char* remove_template; //!< Value of that section's "remove" key (started when a device of the class goes away - see libsystemd_notify_device_removed()), "%name" substituted as above, or NULL. Owned copy.
-    char* source;          //!< Mount point of the configuration directory it comes from, or NULL (see libsystemd_service::source). Owned copy.
 } libsystemd_rule_t;
 
 /**
@@ -186,30 +183,12 @@ typedef struct
 static dmlist_context_t* g_devices = NULL;
 
 /**
- * @brief Name of the configuration directory a mount point may have
- *
- * `<mount point>/cfg/services` holds units and `<mount point>/cfg/rules` device
- * rules, the same layout as the firmware's own `/cfg` (see libsystemd_add_config_dir()).
- */
-#define LIBSYSTEMD_CONFIG_DIR_NAME  "cfg"
-
-/**
- * @brief Mount points whose configuration directory is loaded (owned `char*` each), or NULL
- *
- * Added by libsystemd_add_config_dir() and removed by libsystemd_remove_config_dir() -
- * when a file system is mounted or unmounted (the module that follows mounts
- * calls them). Kept so that a full reload (libsystemd_scan(), libsystemd_load_rules())
- * loads their units and rules again instead of dropping them.
- */
-static dmlist_context_t* g_config_dirs = NULL;
-
-/**
  * @brief Guards the registry lists - @ref g_services (units and templates), @ref g_rules,
- *        @ref g_devices, @ref g_config_dirs - against concurrent threads
+ *        @ref g_devices - against concurrent threads
  *
- * libsystemd is called from several threads: dmdevfs's hot-plug thread
- * (device notifications and configuration directories), the shell
- * (`service`), systemd at boot. Two of them instantiating the same unit at
+ * libsystemd is called from several threads: dmdevfs's hot-plug thread and
+ * dmvfs's mount reports (device notifications), the shell (`service`),
+ * systemd at boot. Two of them instantiating the same unit at
  * once registered it twice. Recursive, and held only while a list is read or
  * changed: never while a unit is spawned, a module enabled or disabled, or a
  * stopping unit waited for - those may need another thread that calls into
@@ -233,12 +212,6 @@ static void libsystemd_unlock(void)
         dmosi_mutex_unlock(g_registry_lock);
     }
 }
-
-// Defined with the configuration directory API at the end of this file.
-static int libsystemd_parse_dir_from(const char* dir_path, const char* source, libsystemd_services_t* services);
-static void libsystemd_merge_config_dirs_units(void);
-static void libsystemd_merge_config_dirs_rules(void);
-static void libsystemd_destroy_config_dirs(void);
 
 /**
  * @brief Closure passed to libsystemd_dependency_order_visitor() while walking one service's dependency lists
@@ -360,7 +333,6 @@ static void libsystemd_destroy_service(libsystemd_service_t service)
 
     libsystemd_destroy_name_list(service->required);
     libsystemd_destroy_name_list(service->after);
-    Dmod_Free(service->source);
 
     Dmod_Free(service);
 }
@@ -413,7 +385,6 @@ static void libsystemd_destroy_services(libsystemd_services_t services)
         {
             Dmod_Free(tmpl->prefix);
             Dmod_Free(tmpl->dir_path);
-            Dmod_Free(tmpl->source);
             Dmod_Free(tmpl);
             tmpl = (libsystemd_template_t*)dmlist_pop_front(services->templates);
         }
@@ -459,7 +430,6 @@ static void libsystemd_destroy_rules(dmlist_context_t* rules)
         Dmod_Free(rule->class_name);
         Dmod_Free(rule->start_template);
         Dmod_Free(rule->remove_template);
-        Dmod_Free(rule->source);
         Dmod_Free(rule);
         rule = (libsystemd_rule_t*)dmlist_pop_front(rules);
     }
@@ -2059,128 +2029,36 @@ static char* libsystemd_build_unit_name(const char* prefix, const char* instance
 }
 
 /**
- * @brief The text `%m` expands to for a unit from @p source
- *
- * The mount point the unit's configuration directory is on, without a
- * trailing '/', so "%m/bin/app.dmfc" is a path on that file system:
- * "/mnt/SD" for a unit from /mnt/SD/cfg/services, "" for one from the root
- * file system or from the units directory of libsystemd_scan() (@p source NULL).
- * Only the first libsystemd_mount_specifier_length() characters count.
- *
- * @param source Mount point (libsystemd_service::source), or NULL.
- *
- * @return The text, never NULL.
- */
-static const char* libsystemd_mount_specifier_value(const char* source)
-{
-    return (source != NULL) ? source : "";
-}
-
-/**
- * @brief Length of the text `%m` expands to (see libsystemd_mount_specifier_value())
- */
-static size_t libsystemd_mount_specifier_length(const char* source)
-{
-    const char* value = libsystemd_mount_specifier_value(source);
-    size_t len = strlen(value);
-    while (len > 0 && value[len - 1] == '/')
-    {
-        len--;
-    }
-    return len;
-}
-
-/**
- * @brief Expand only `%m` in a single string
- *
- * For a unit that is not a template instance, whose keys are otherwise taken
- * verbatim (see libsystemd_parse_unit_internal()): `%m` is the only specifier
- * that means something for it. Every other `%` sequence, `%%` included, is
- * copied through unchanged.
- *
- * @param value  String to expand (must not be NULL).
- * @param source Mount point the unit comes from, or NULL (see libsystemd_mount_specifier_value()).
- *
- * @return Newly heap-allocated expanded string, owned by the caller (free
- *         with Dmod_Free()), or NULL if allocation failed.
- */
-static char* libsystemd_substitute_mount_specifier(const char* value, const char* source)
-{
-    const char* mount_point = libsystemd_mount_specifier_value(source);
-    size_t mount_point_len = libsystemd_mount_specifier_length(source);
-
-    size_t out_len = 0;
-    for (const char* scan = value; *scan != '\0'; )
-    {
-        if (scan[0] == '%' && scan[1] == 'm')
-        {
-            out_len += mount_point_len;
-            scan += 2;
-            continue;
-        }
-        out_len += 1;
-        scan += 1;
-    }
-
-    char* result = Dmod_Malloc(out_len + 1);
-    if (result == NULL)
-    {
-        return NULL;
-    }
-
-    char* dst = result;
-    for (const char* scan = value; *scan != '\0'; )
-    {
-        if (scan[0] == '%' && scan[1] == 'm')
-        {
-            memcpy(dst, mount_point, mount_point_len);
-            dst += mount_point_len;
-            scan += 2;
-            continue;
-        }
-        *dst++ = *scan++;
-    }
-    *dst = '\0';
-
-    return result;
-}
-
-/**
  * @brief Expand systemd-style `%`-specifiers in a single string
  *
  * Recognized specifiers: `%i`/`%I` (instance name), `%p` (template prefix),
  * `%n` (full instantiated unit name, "<prefix>@<instance>"), `%v` (caller-supplied
  * user value, see @ref libsystemd_notify_device_added/@ref libsystemd_start_service),
- * `%m` (mount point the unit's configuration directory is on, see
- * libsystemd_mount_specifier_value()), `%%` (a literal `%`). An unrecognized
- * `%<char>` sequence (or a trailing `%` at the end of the string) is copied
- * through verbatim, unexpanded.
+ * `%%` (a literal `%`). An unrecognized `%<char>` sequence (or a trailing `%`
+ * at the end of the string) is copied through verbatim, unexpanded.
  *
  * @param value      String to expand (must not be NULL).
  * @param prefix     Template prefix, substituted for `%p` (must not be NULL).
  * @param instance   Instance name, substituted for `%i`/`%I` (must not be NULL).
  * @param unit_name  Full "<prefix>@<instance>" unit name, substituted for `%n` (must not be NULL).
  * @param user_value Caller-supplied value, substituted for `%v`, or NULL to expand `%v` to an empty string.
- * @param source     Mount point the unit comes from (libsystemd_service::source), or NULL - see libsystemd_mount_specifier_value().
  *
  * @return Newly heap-allocated expanded string, owned by the caller (free
  *         with Dmod_Free()), or NULL if allocation failed.
  *
  * @par Example
  * @code
- * char* expanded = libsystemd_substitute_specifiers("--tty %i", "getty", "tty1", "getty@tty1", NULL, NULL);
+ * char* expanded = libsystemd_substitute_specifiers("--tty %i", "getty", "tty1", "getty@tty1", NULL);
  * // expanded == "--tty tty1"
  * @endcode
  */
-static char* libsystemd_substitute_specifiers(const char* value, const char* prefix, const char* instance, const char* unit_name, const char* user_value, const char* source)
+static char* libsystemd_substitute_specifiers(const char* value, const char* prefix, const char* instance, const char* unit_name, const char* user_value)
 {
     if (user_value == NULL)
     {
         user_value = "";
     }
 
-    const char* mount_point = libsystemd_mount_specifier_value(source);
-    size_t mount_point_len = libsystemd_mount_specifier_length(source);
     size_t prefix_len = strlen(prefix);
     size_t instance_len = strlen(instance);
     size_t unit_name_len = strlen(unit_name);
@@ -2193,12 +2071,11 @@ static char* libsystemd_substitute_specifiers(const char* value, const char* pre
         {
             switch (scan[1])
             {
-                case 'i': case 'I': out_len += instance_len;    scan += 2; continue;
-                case 'p':           out_len += prefix_len;      scan += 2; continue;
-                case 'n':           out_len += unit_name_len;   scan += 2; continue;
-                case 'v':           out_len += user_value_len;  scan += 2; continue;
-                case 'm':           out_len += mount_point_len; scan += 2; continue;
-                case '%':           out_len += 1;               scan += 2; continue;
+                case 'i': case 'I': out_len += instance_len;   scan += 2; continue;
+                case 'p':           out_len += prefix_len;     scan += 2; continue;
+                case 'n':           out_len += unit_name_len;  scan += 2; continue;
+                case 'v':           out_len += user_value_len; scan += 2; continue;
+                case '%':           out_len += 1;              scan += 2; continue;
                 default: break; /* unknown specifier: copied through as-is below */
             }
         }
@@ -2221,12 +2098,11 @@ static char* libsystemd_substitute_specifiers(const char* value, const char* pre
             size_t replacement_len = 0;
             switch (scan[1])
             {
-                case 'i': case 'I': replacement = instance;    replacement_len = instance_len;    break;
-                case 'p':           replacement = prefix;      replacement_len = prefix_len;      break;
-                case 'n':           replacement = unit_name;   replacement_len = unit_name_len;   break;
-                case 'v':           replacement = user_value;  replacement_len = user_value_len;  break;
-                case 'm':           replacement = mount_point; replacement_len = mount_point_len; break;
-                case '%':           replacement = "%";         replacement_len = 1;               break;
+                case 'i': case 'I': replacement = instance;    replacement_len = instance_len;   break;
+                case 'p':           replacement = prefix;      replacement_len = prefix_len;     break;
+                case 'n':           replacement = unit_name;   replacement_len = unit_name_len;  break;
+                case 'v':           replacement = user_value;  replacement_len = user_value_len; break;
+                case '%':           replacement = "%";         replacement_len = 1;              break;
                 default: break;
             }
 
@@ -2260,13 +2136,12 @@ static char* libsystemd_substitute_specifiers(const char* value, const char* pre
  * @param instance   Instance name, forwarded to libsystemd_substitute_specifiers().
  * @param unit_name  Full unit name, forwarded to libsystemd_substitute_specifiers().
  * @param user_value Caller-supplied value, forwarded to libsystemd_substitute_specifiers() (may be NULL).
- * @param source     Mount point the unit comes from, forwarded to libsystemd_substitute_specifiers() (may be NULL).
  *
  * @retval true  Every key was expanded successfully.
  * @retval false Allocation failed part-way through; @p ctx is left with
  *                whatever subset of keys had already been expanded.
  */
-static bool libsystemd_apply_specifiers(dmini_context_t ctx, const char* prefix, const char* instance, const char* unit_name, const char* user_value, const char* source)
+static bool libsystemd_apply_specifiers(dmini_context_t ctx, const char* prefix, const char* instance, const char* unit_name, const char* user_value)
 {
     int count = dmini_key_count(ctx, NULL);
 
@@ -2284,45 +2159,7 @@ static bool libsystemd_apply_specifiers(dmini_context_t ctx, const char* prefix,
             continue;
         }
 
-        char* expanded = libsystemd_substitute_specifiers(value, prefix, instance, unit_name, user_value, source);
-        if (expanded == NULL)
-        {
-            return false;
-        }
-
-        dmini_set_string(ctx, NULL, key, expanded);
-        Dmod_Free(expanded);
-    }
-
-    return true;
-}
-
-/**
- * @brief Expand only `%m` in every key of an ini context's global section, in place
- *
- * The libsystemd_apply_specifiers() counterpart for a unit that is not a
- * template instance - see libsystemd_substitute_mount_specifier().
- *
- * @param ctx    Ini context to expand in place (must not be NULL).
- * @param source Mount point the unit comes from, or NULL.
- *
- * @retval true  Every key was expanded successfully.
- * @retval false Allocation failed part-way through.
- */
-static bool libsystemd_apply_mount_specifier(dmini_context_t ctx, const char* source)
-{
-    int count = dmini_key_count(ctx, NULL);
-
-    for (int i = 0; i < count; i++)
-    {
-        const char* key = dmini_key_name(ctx, NULL, i);
-        const char* value = (key != NULL) ? dmini_get_string(ctx, NULL, key, NULL) : NULL;
-        if (value == NULL || strchr(value, '%') == NULL)
-        {
-            continue;
-        }
-
-        char* expanded = libsystemd_substitute_mount_specifier(value, source);
+        char* expanded = libsystemd_substitute_specifiers(value, prefix, instance, unit_name, user_value);
         if (expanded == NULL)
         {
             return false;
@@ -2547,7 +2384,6 @@ static int libsystemd_build_service_from_ctx(dmini_context_t ctx, libsystemd_ser
     new_service->pid = -1;
     new_service->last_pid = -1;
     new_service->exit_callback_handle = NULL;
-    new_service->source = NULL;
 
     const char* args = dmini_get_string(ctx, NULL, "args", NULL);
     const char* description = dmini_get_string(ctx, NULL, "description", NULL);
@@ -2657,8 +2493,6 @@ static bool libsystemd_split_instance_name(const char* unit_name, char** out_pre
  * @param prefix     Template prefix, e.g. "getty" (must not be NULL).
  * @param instance   Instance name, e.g. "tty1" (must not be NULL).
  * @param user_value Caller-supplied value substituted for `%v`, or NULL to expand `%v` to an empty string.
- * @param source     Mount point the template comes from (libsystemd_template_t::source), substituted
- *                     for `%m` and kept as the instance's own source, or NULL.
  * @param service    Receives the newly allocated service on success, with
  *                     `unit_name` already set to "<prefix>@<instance>" (must not be NULL).
  *
@@ -2669,7 +2503,7 @@ static bool libsystemd_split_instance_name(const char* unit_name, char** out_pre
  *                   from `dmini_parse_file` on the template (e.g.
  *                   `DMINI_ERR_FILE` if "<prefix>@.ini" does not exist).
  */
-static int libsystemd_instantiate_from_template(const char* units_dir, const char* prefix, const char* instance, const char* user_value, const char* source, libsystemd_service_t* service)
+static int libsystemd_instantiate_from_template(const char* units_dir, const char* prefix, const char* instance, const char* user_value, libsystemd_service_t* service)
 {
     char* template_path = libsystemd_build_template_path(units_dir, prefix);
     if (template_path == NULL)
@@ -2699,7 +2533,7 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
         return -ENOMEM;
     }
 
-    if (!libsystemd_apply_specifiers(ctx, prefix, instance, unit_name, user_value, source))
+    if (!libsystemd_apply_specifiers(ctx, prefix, instance, unit_name, user_value))
     {
         dmini_destroy(ctx);
         Dmod_Free(unit_name);
@@ -2718,11 +2552,6 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
 
     new_service->unit_name = unit_name;
     new_service->from_template = true;
-    if (source != NULL && (new_service->source = Dmod_StrDup(source)) == NULL)
-    {
-        libsystemd_destroy_service(new_service);
-        return -ENOMEM;
-    }
     *service = new_service;
 
     return 0;
@@ -2774,7 +2603,7 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
     }
 
     libsystemd_service_t service = NULL;
-    int result = libsystemd_instantiate_from_template(tmpl->dir_path, prefix, instance, user_value, tmpl->source, &service);
+    int result = libsystemd_instantiate_from_template(tmpl->dir_path, prefix, instance, user_value, &service);
 
     Dmod_Free(prefix);
     Dmod_Free(instance);
@@ -2808,7 +2637,7 @@ static int libsystemd_refresh_library_instance(libsystemd_service_t service, con
     if (!libsystemd_split_instance_name(service->unit_name, &prefix, &instance)) return -ENOMEM;
     libsystemd_template_t* tmpl = dmlist_find(g_services->templates, prefix, libsystemd_compare_template_by_prefix);
     libsystemd_service_t fresh = NULL;
-    int rc = tmpl == NULL ? -ENOENT : libsystemd_instantiate_from_template(tmpl->dir_path, prefix, instance, user_value, tmpl->source, &fresh);
+    int rc = tmpl == NULL ? -ENOENT : libsystemd_instantiate_from_template(tmpl->dir_path, prefix, instance, user_value, &fresh);
     Dmod_Free(prefix); Dmod_Free(instance);
     if (rc != 0) return rc;
     struct libsystemd_service old = *service;
@@ -2836,7 +2665,7 @@ static int libsystemd_refresh_library_instance(libsystemd_service_t service, con
  *         are non-fatal to the overall libsystemd_load_rules() pass, exactly
  *         like a single bad unit file doesn't abort libsystemd_parse_dir().
  */
-static void libsystemd_parse_rules_file(const char* file_path, const char* source, dmlist_context_t* rules)
+static void libsystemd_parse_rules_file(const char* file_path, dmlist_context_t* rules)
 {
     DMOD_LOG_INFO("Analyzing rules file '%s'\n", file_path);
 
@@ -2888,15 +2717,13 @@ static void libsystemd_parse_rules_file(const char* file_path, const char* sourc
         rule->class_name = Dmod_StrDup(class_name);
         rule->start_template = (start_template != NULL) ? Dmod_StrDup(start_template) : NULL;
         rule->remove_template = (remove_template != NULL) ? Dmod_StrDup(remove_template) : NULL;
-        rule->source = (source != NULL) ? Dmod_StrDup(source) : NULL;
         if (rule->class_name == NULL || (start_template != NULL && rule->start_template == NULL) ||
-            (remove_template != NULL && rule->remove_template == NULL) || (source != NULL && rule->source == NULL) ||
+            (remove_template != NULL && rule->remove_template == NULL) ||
             !dmlist_push_back(rules, rule))
         {
             Dmod_Free(rule->class_name);
             Dmod_Free(rule->start_template);
         Dmod_Free(rule->remove_template);
-            Dmod_Free(rule->source);
             Dmod_Free(rule);
         }
     }
@@ -2922,7 +2749,7 @@ static void libsystemd_parse_rules_file(const char* file_path, const char* sourc
  * @note A subdirectory that fails to open is logged via DMOD_LOG_WARN() and
  *       skipped - one bad subdirectory must not abort the whole scan.
  */
-static int libsystemd_parse_rules_dir_walk(const char* rules_dir, const char* source, dmlist_context_t* rules)
+static int libsystemd_parse_rules_dir_walk(const char* rules_dir, dmlist_context_t* rules)
 {
     void* dir = Dmod_OpenDir(rules_dir);
     if (dir == NULL)
@@ -2944,7 +2771,7 @@ static int libsystemd_parse_rules_dir_walk(const char* rules_dir, const char* so
             char* sub_dir_path = libsystemd_join_path(rules_dir, entry->name);
             if (sub_dir_path != NULL)
             {
-                int result = libsystemd_parse_rules_dir_walk(sub_dir_path, source, rules);
+                int result = libsystemd_parse_rules_dir_walk(sub_dir_path, rules);
                 if (result != 0)
                 {
                     DMOD_LOG_WARN("Failed to scan rules subdirectory '%s' (%d)\n", sub_dir_path, result);
@@ -2962,7 +2789,7 @@ static int libsystemd_parse_rules_dir_walk(const char* rules_dir, const char* so
             if (file_path != NULL)
             {
                 DMOD_LOG_INFO("Detected rules file '%s'\n", file_path);
-                libsystemd_parse_rules_file(file_path, source, rules);
+                libsystemd_parse_rules_file(file_path, rules);
                 Dmod_Free(file_path);
             }
         }
@@ -2992,7 +2819,7 @@ static int libsystemd_parse_rules_dir_walk(const char* rules_dir, const char* so
  * @retval -ENOENT @p rules_dir does not exist / cannot be opened.
  * @retval -ENOMEM Allocation of the registry or its underlying dmlist failed.
  */
-static int libsystemd_parse_rules_dir(const char* rules_dir, const char* source, dmlist_context_t** out_rules)
+static int libsystemd_parse_rules_dir(const char* rules_dir, dmlist_context_t** out_rules)
 {
     dmlist_context_t* rules = dmlist_create();
     if (rules == NULL)
@@ -3000,7 +2827,7 @@ static int libsystemd_parse_rules_dir(const char* rules_dir, const char* source,
         return -ENOMEM;
     }
 
-    int result = libsystemd_parse_rules_dir_walk(rules_dir, source, rules);
+    int result = libsystemd_parse_rules_dir_walk(rules_dir, rules);
     if (result != 0)
     {
         libsystemd_destroy_rules(rules);
@@ -3347,8 +3174,6 @@ static int libsystemd_serviceapi_init(void)
  */
 static void libsystemd_serviceapi_deinit(void)
 {
-    libsystemd_destroy_config_dirs();
-
     libsystemd_stop_all_services(g_services);
     libsystemd_destroy_services(g_services);
     g_services = NULL;
@@ -3756,9 +3581,7 @@ dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, 
  *
  * @note Calling this again later is a full reload: unit files that disappeared
  *       since the last scan are dropped, and every service - even ones whose
- *       ini file did not change - is stopped and restarted. The units of the
- *       loaded configuration directories of mount points (libsystemd_add_config_dir())
- *       are loaded again with them.
+ *       ini file did not change - is stopped and restarted.
  *
  * @par Example
  * @code
@@ -3804,9 +3627,6 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
         g_units_dir = units_dir;
     }
 
-    // A full reload, but of this directory only: the mount points' units stay.
-    libsystemd_merge_config_dirs_units();
-
     libsystemd_resolve_starting_order(g_services->services);
     dmlist_sort(g_services->services, libsystemd_compare_by_starting_order);
     size_t count = dmlist_size(g_services->services);
@@ -3815,8 +3635,8 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
     libsystemd_stop_all_services(previous);
     libsystemd_destroy_services(previous);
 
-    // By index, over the services there are now: a unit started here may load a
-    // configuration directory, which appends its own units and starts them itself.
+    // By index, over the services there are now: a unit started here may start another one
+    // (a device rule), which registers an instance of a template - appending to the list.
     for (size_t i = 0; i < count; i++)
     {
         libsystemd_lock();
@@ -3861,9 +3681,8 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
  *
  * @param rules_dir Directory to scan, recursively, for rule ".ini"/".rules" files (e.g. "/etc/dmsystem/rules").
  *
- * @retval 0       Rules were (re-)loaded; @ref g_rules now reflects @p rules_dir and
- *                   the loaded configuration directories of mount points (any
- *                   previously loaded rules, from a different directory or the
+ * @retval 0       Rules were (re-)loaded; @ref g_rules now reflects @p rules_dir only
+ *                   (any previously loaded rules, from a different directory or the
  *                   same one, are discarded first).
  * @retval -EINVAL @p rules_dir was NULL.
  * @retval -ENOENT @p rules_dir does not exist / cannot be opened.
@@ -3885,7 +3704,7 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
     DMOD_LOG_INFO("Starting scan of rules directory '%s'\n", rules_dir);
 
     dmlist_context_t* parsed = NULL;
-    int result = libsystemd_parse_rules_dir(rules_dir, NULL, &parsed);
+    int result = libsystemd_parse_rules_dir(rules_dir, &parsed);
     if (result != 0)
     {
         return result;
@@ -3894,9 +3713,6 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
     libsystemd_lock();
     dmlist_context_t* previous = g_rules;
     g_rules = parsed;
-
-    // The rules of the mount points' configuration directories stay.
-    libsystemd_merge_config_dirs_rules();
     libsystemd_unlock();
     libsystemd_destroy_rules(previous);
 
@@ -4159,8 +3975,8 @@ static char* libsystemd_mount_device_name(const char* mount_point)
  * with the mount point as its value (%v) - and the rules decide what that means:
  *
  *     [class=mount]
- *     start=mountcfg@%name            # when it is mounted
- *     remove=mountcfg-unload@%name    # when it is about to be unmounted
+ *     start=mounted@%name             # when it is mounted
+ *     remove=unmounted@%name          # when it is about to be unmounted
  *
  * The call comes in the thread that mounts or unmounts, and whatever the rules start for a mount point does its
  * work in a process of its own, with the stack its module asks for. An unmount does not go on until the "remove"
@@ -4221,9 +4037,6 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
  *                        for a non-templated parse.
  * @param prefix        Template prefix (e.g. "getty"), or NULL.
  * @param instance      Instance name (e.g. "tty1"), or NULL.
- * @param source        Mount point the unit comes from (libsystemd_service::source) - substituted for
- *                        `%m` (in a plain unit `%m` is the only specifier expanded) and kept by the
- *                        service - or NULL.
  * @param service       Receives the newly allocated service on success (must not be NULL).
  *
  * @retval 0       `*service` now points to a fully populated service (unit_name is NULL,
@@ -4236,7 +4049,7 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
  *                   `DMINI_ERR_FILE` if the file could not be opened) - a
  *                   failure to parse @p template_path is never propagated.
  */
-static int libsystemd_parse_unit_internal(const char* file_path, const char* template_path, const char* prefix, const char* instance, const char* source, libsystemd_service_t* service)
+static int libsystemd_parse_unit_internal(const char* file_path, const char* template_path, const char* prefix, const char* instance, libsystemd_service_t* service)
 {
     if (file_path == NULL || service == NULL)
     {
@@ -4264,7 +4077,7 @@ static int libsystemd_parse_unit_internal(const char* file_path, const char* tem
     if (prefix != NULL && instance != NULL)
     {
         char* unit_name = libsystemd_build_unit_name(prefix, instance);
-        if (unit_name == NULL || !libsystemd_apply_specifiers(ctx, prefix, instance, unit_name, NULL, source))
+        if (unit_name == NULL || !libsystemd_apply_specifiers(ctx, prefix, instance, unit_name, NULL))
         {
             Dmod_Free(unit_name);
             dmini_destroy(ctx);
@@ -4272,21 +4085,9 @@ static int libsystemd_parse_unit_internal(const char* file_path, const char* tem
         }
         Dmod_Free(unit_name);
     }
-    else if (!libsystemd_apply_mount_specifier(ctx, source))
-    {
-        dmini_destroy(ctx);
-        return -ENOMEM;
-    }
 
     result = libsystemd_build_service_from_ctx(ctx, service);
     dmini_destroy(ctx);
-
-    if (result == 0 && source != NULL && ((*service)->source = Dmod_StrDup(source)) == NULL)
-    {
-        libsystemd_destroy_service(*service);
-        *service = NULL;
-        return -ENOMEM;
-    }
 
     return result;
 }
@@ -4324,7 +4125,7 @@ static int libsystemd_parse_unit_internal(const char* file_path, const char* tem
  */
 dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, libsystemd_service_t* service ))
 {
-    return libsystemd_parse_unit_internal(file_path, NULL, NULL, NULL, NULL, service);
+    return libsystemd_parse_unit_internal(file_path, NULL, NULL, NULL, service);
 }
 
 /**
@@ -4336,7 +4137,6 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, 
  * - a ".ini" file is parsed exactly as documented on libsystemd_parse_dir().
  *
  * @param dir_path Directory to scan (recursively).
- * @param source   Mount point the units come from (libsystemd_service::source), or NULL.
  * @param services Registry to append parsed units to (must already be allocated).
  *
  * @retval 0       @p dir_path was scanned (possibly zero units were found/parsed).
@@ -4346,7 +4146,7 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, 
  *       skipped, exactly like a unit file that fails to parse - one bad
  *       subdirectory must not abort the whole scan.
  */
-static int libsystemd_parse_dir_walk(const char* dir_path, const char* source, libsystemd_services_t services)
+static int libsystemd_parse_dir_walk(const char* dir_path, libsystemd_services_t services)
 {
     void* dir = Dmod_OpenDir(dir_path);
     if (dir == NULL)
@@ -4368,7 +4168,7 @@ static int libsystemd_parse_dir_walk(const char* dir_path, const char* source, l
             char* sub_dir_path = libsystemd_join_path(dir_path, entry->name);
             if (sub_dir_path != NULL)
             {
-                int result = libsystemd_parse_dir_walk(sub_dir_path, source, services);
+                int result = libsystemd_parse_dir_walk(sub_dir_path, services);
                 if (result != 0)
                 {
                     DMOD_LOG_WARN("Failed to scan units subdirectory '%s' (%d)\n", sub_dir_path, result);
@@ -4395,12 +4195,9 @@ static int libsystemd_parse_dir_walk(const char* dir_path, const char* source, l
                 {
                     tmpl->prefix = prefix;
                     tmpl->dir_path = Dmod_StrDup(dir_path);
-                    tmpl->source = (source != NULL) ? Dmod_StrDup(source) : NULL;
-                    if (tmpl->dir_path == NULL || (source != NULL && tmpl->source == NULL) ||
-                        !dmlist_push_back(services->templates, tmpl))
+                    if (tmpl->dir_path == NULL || !dmlist_push_back(services->templates, tmpl))
                     {
                         Dmod_Free(tmpl->dir_path);
-                        Dmod_Free(tmpl->source);
                         Dmod_Free(tmpl);
                     }
                     else
@@ -4417,7 +4214,7 @@ static int libsystemd_parse_dir_walk(const char* dir_path, const char* source, l
                     char* template_path = (kind == LIBSYSTEMD_UNIT_INSTANCE) ? libsystemd_build_template_path(dir_path, prefix) : NULL;
 
                     libsystemd_service_t service = NULL;
-                    int result = libsystemd_parse_unit_internal(file_path, template_path, prefix, instance, source, &service);
+                    int result = libsystemd_parse_unit_internal(file_path, template_path, prefix, instance, &service);
                     if (result == 0)
                     {
                         service->unit_name = libsystemd_make_unit_name(entry->name);
@@ -4499,23 +4296,6 @@ static int libsystemd_parse_dir_walk(const char* dir_path, const char* source, l
  */
 dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, libsystemd_services_t* services ))
 {
-    return libsystemd_parse_dir_from(dir_path, NULL, services);
-}
-
-/**
- * @brief libsystemd_parse_dir() for the units of a mount point's configuration directory
- *
- * Every unit and template parsed gets @p source (see libsystemd_service::source),
- * which `%m` expands to.
- *
- * @param dir_path Directory to scan, recursively.
- * @param source   Mount point the units come from, or NULL.
- * @param services Receives the newly allocated registry on success (must not be NULL).
- *
- * @return As libsystemd_parse_dir().
- */
-static int libsystemd_parse_dir_from(const char* dir_path, const char* source, libsystemd_services_t* services)
-{
     if (dir_path == NULL || services == NULL)
     {
         return -EINVAL;
@@ -4535,7 +4315,7 @@ static int libsystemd_parse_dir_from(const char* dir_path, const char* source, l
         return -ENOMEM;
     }
 
-    int result = libsystemd_parse_dir_walk(dir_path, source, new_services);
+    int result = libsystemd_parse_dir_walk(dir_path, new_services);
     if (result != 0)
     {
         libsystemd_destroy_services(new_services);
@@ -4547,461 +4327,3 @@ static int libsystemd_parse_dir_from(const char* dir_path, const char* source, l
     return 0;
 }
 
-// ============================================================================
-//                Configuration directories of mount points
-// ============================================================================
-
-/**
- * @brief Build "<mount point>/cfg/<sub_dir>" (see LIBSYSTEMD_CONFIG_DIR_NAME)
- *
- * @return Newly heap-allocated path, owned by the caller, or NULL if allocation failed.
- */
-static char* libsystemd_config_dir_path(const char* mount_point, const char* sub_dir)
-{
-    char* config_dir = libsystemd_join_path(mount_point, LIBSYSTEMD_CONFIG_DIR_NAME);
-    if (config_dir == NULL)
-    {
-        return NULL;
-    }
-
-    char* path = libsystemd_join_path(config_dir, sub_dir);
-    Dmod_Free(config_dir);
-
-    return path;
-}
-
-/**
- * @brief Whether two paths name the same directory, trailing '/' aside
- */
-static bool libsystemd_same_path(const char* path1, const char* path2)
-{
-    size_t len1 = strlen(path1);
-    size_t len2 = strlen(path2);
-    while (len1 > 1 && path1[len1 - 1] == '/')
-    {
-        len1--;
-    }
-    while (len2 > 1 && path2[len2 - 1] == '/')
-    {
-        len2--;
-    }
-
-    return len1 == len2 && strncmp(path1, path2, len1) == 0;
-}
-
-/**
- * @brief dmlist_find() comparator matching a `char*` entry by its text
- */
-static int libsystemd_compare_string(const void* data1, const void* data2)
-{
-    return strcmp((const char*)data1, (const char*)data2);
-}
-
-/**
- * @brief dmlist_remove() comparator matching an entry by its address
- */
-static int libsystemd_compare_pointer(const void* data1, const void* data2)
-{
-    return (data1 == data2) ? 0 : 1;
-}
-
-/**
- * @brief Whether something comes from the configuration directory of @p mount_point
- *
- * @param source A libsystemd_service::source / libsystemd_template_t::source / libsystemd_rule_t::source.
- */
-static bool libsystemd_is_from(const char* source, const char* mount_point)
-{
-    return source != NULL && strcmp(source, mount_point) == 0;
-}
-
-/**
- * @brief Add the units and templates of `<mount_point>/cfg/services` to @ref g_services, without starting them
- *
- * A unit or template whose name is taken already - by the units directory of
- * libsystemd_scan() or by a mount point loaded before - is logged and ignored:
- * the first one stays.
- *
- * @retval 0       The directory was read (possibly with no units in it).
- * @retval -ENOENT There is no such directory.
- * @retval -ENOMEM Allocation failed (some units may have been added).
- */
-static int libsystemd_merge_config_dir_units(const char* mount_point)
-{
-    char* units_dir = libsystemd_config_dir_path(mount_point, "services");
-    if (units_dir == NULL)
-    {
-        return -ENOMEM;
-    }
-
-    libsystemd_services_t parsed = NULL;
-    int result = libsystemd_parse_dir_from(units_dir, mount_point, &parsed);
-    Dmod_Free(units_dir);
-    if (result != 0)
-    {
-        return result;
-    }
-
-    libsystemd_service_t service = (libsystemd_service_t)dmlist_pop_front(parsed->services);
-    while (service != NULL)
-    {
-        if (libsystemd_find_service(g_services, service->unit_name) != NULL)
-        {
-            DMOD_LOG_WARN("Unit '%s' of '%s' is defined already - ignored\n", service->unit_name, mount_point);
-            libsystemd_destroy_service(service);
-        }
-        else if (!dmlist_push_back(g_services->services, service))
-        {
-            libsystemd_destroy_service(service);
-            result = -ENOMEM;
-        }
-        service = (libsystemd_service_t)dmlist_pop_front(parsed->services);
-    }
-
-    libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_pop_front(parsed->templates);
-    while (tmpl != NULL)
-    {
-        bool taken = dmlist_find(g_services->templates, tmpl->prefix, libsystemd_compare_template_by_prefix) != NULL;
-        if (taken)
-        {
-            DMOD_LOG_WARN("Template '%s@' of '%s' is defined already - ignored\n", tmpl->prefix, mount_point);
-        }
-        if (taken || !dmlist_push_back(g_services->templates, tmpl))
-        {
-            result = taken ? result : -ENOMEM;
-            Dmod_Free(tmpl->prefix);
-            Dmod_Free(tmpl->dir_path);
-            Dmod_Free(tmpl->source);
-            Dmod_Free(tmpl);
-        }
-        tmpl = (libsystemd_template_t*)dmlist_pop_front(parsed->templates);
-    }
-
-    libsystemd_destroy_services(parsed);
-
-    return result;
-}
-
-/**
- * @brief Add the rules of `<mount_point>/cfg/rules` to @ref g_rules
- *
- * @retval 0       The directory was read (possibly with no rules in it).
- * @retval -ENOENT There is no such directory.
- * @retval -ENOMEM Allocation failed (some rules may have been added).
- */
-static int libsystemd_merge_config_dir_rules(const char* mount_point)
-{
-    char* rules_dir = libsystemd_config_dir_path(mount_point, "rules");
-    if (rules_dir == NULL)
-    {
-        return -ENOMEM;
-    }
-
-    dmlist_context_t* parsed = NULL;
-    int result = libsystemd_parse_rules_dir(rules_dir, mount_point, &parsed);
-    Dmod_Free(rules_dir);
-    if (result != 0)
-    {
-        return result;
-    }
-
-    if (g_rules == NULL)
-    {
-        g_rules = parsed;
-        return 0;
-    }
-
-    libsystemd_rule_t* rule = (libsystemd_rule_t*)dmlist_pop_front(parsed);
-    while (rule != NULL)
-    {
-        if (!dmlist_push_back(g_rules, rule))
-        {
-            Dmod_Free(rule->class_name);
-            Dmod_Free(rule->start_template);
-        Dmod_Free(rule->remove_template);
-            Dmod_Free(rule->source);
-            Dmod_Free(rule);
-            result = -ENOMEM;
-        }
-        rule = (libsystemd_rule_t*)dmlist_pop_front(parsed);
-    }
-    dmlist_destroy(parsed);
-
-    return result;
-}
-
-/**
- * @brief Add the units of every loaded configuration directory again - after libsystemd_scan() replaced @ref g_services
- */
-static void libsystemd_merge_config_dirs_units(void)
-{
-    size_t count = (g_config_dirs != NULL) ? dmlist_size(g_config_dirs) : 0;
-    for (size_t i = 0; i < count; i++)
-    {
-        libsystemd_merge_config_dir_units((const char*)dmlist_get(g_config_dirs, i));
-    }
-}
-
-/**
- * @brief Add the rules of every loaded configuration directory again - after libsystemd_load_rules() replaced @ref g_rules
- */
-static void libsystemd_merge_config_dirs_rules(void)
-{
-    size_t count = (g_config_dirs != NULL) ? dmlist_size(g_config_dirs) : 0;
-    for (size_t i = 0; i < count; i++)
-    {
-        libsystemd_merge_config_dir_rules((const char*)dmlist_get(g_config_dirs, i));
-    }
-}
-
-/**
- * @brief Start the units of one configuration directory, in their dependency order
- *
- * Their starting_order is resolved against the whole registry (a unit may come
- * after one of the firmware's), but the registry itself is not reordered - this
- * may run while libsystemd_scan() is walking it (see libsystemd_add_config_dir()).
- *
- * @param mount_point Mount point whose units are started.
- */
-static void libsystemd_start_config_dir_services(const char* mount_point)
-{
-    dmlist_context_t* to_start = dmlist_create();
-    if (to_start == NULL)
-    {
-        return;
-    }
-
-    libsystemd_lock();
-    libsystemd_resolve_starting_order(g_services->services);
-    size_t count = dmlist_size(g_services->services);
-    for (size_t i = 0; i < count; i++)
-    {
-        libsystemd_service_t service = (libsystemd_service_t)dmlist_get(g_services->services, i);
-        if (libsystemd_is_from(service->source, mount_point) && !dmlist_push_back(to_start, service))
-        {
-            DMOD_LOG_WARN("Cannot start service '%s' - out of memory\n", service->unit_name);
-        }
-    }
-    libsystemd_unlock();
-
-    dmlist_sort(to_start, libsystemd_compare_by_starting_order);
-    dmlist_foreach(to_start, libsystemd_start_service_visitor, NULL);
-    dmlist_destroy(to_start);
-}
-
-/**
- * @brief Free every entry of @ref g_config_dirs and the list itself
- */
-static void libsystemd_destroy_config_dirs(void)
-{
-    if (g_config_dirs == NULL)
-    {
-        return;
-    }
-
-    char* mount_point = (char*)dmlist_pop_front(g_config_dirs);
-    while (mount_point != NULL)
-    {
-        Dmod_Free(mount_point);
-        mount_point = (char*)dmlist_pop_front(g_config_dirs);
-    }
-    dmlist_destroy(g_config_dirs);
-    g_config_dirs = NULL;
-}
-
-/**
- * @brief Load the configuration directory of a mount point
- *
- * A mount point may have a configuration directory with the same layout as the
- * firmware's own: units in `<mount_point>/cfg/services` and device rules in
- * `<mount_point>/cfg/rules`. They are added to what libsystemd_scan() and
- * libsystemd_load_rules() loaded - nothing is reloaded or restarted - and the
- * new units are started, in their dependency order. A unit or template whose
- * name is taken already is logged and ignored: the first one stays.
- *
- * In every unit of the directory, `%m` expands to @p mount_point (without a
- * trailing '/'), so a unit can name the module and the files on its own file
- * system: `exec=%m/bin/app.dmfc`, `args=%m/views/app/app.dmv`. Units and
- * template instances started from it keep that binding, and
- * libsystemd_remove_config_dir() stops exactly them - even with several cards
- * carrying the same module.
- *
- * Called by a service the rules start when a mount appears (on dmod-boot
- * mountcfg) - libsystemd itself only reports mounts as devices of class "mount"
- * (dmfsi's _mount_changed dif) and does not depend on dmvfs. The configuration directory of the root file system is the units
- * directory of libsystemd_scan() itself, so it is not loaded twice. Safe to call
- * from a unit libsystemd_scan() is starting: the units already there keep their
- * place, the new ones are appended.
- *
- * @param mount_point Mount point of the file system (e.g. "/mnt/SD").
- *
- * @retval 0         Loaded.
- * @retval -EINVAL   @p mount_point is NULL.
- * @retval -EALREADY Loaded already, or it is the units directory of libsystemd_scan().
- * @retval -ENOENT   Neither `cfg/services` nor `cfg/rules` is there - nothing is loaded.
- * @retval -ENOMEM   Allocation failed.
- *
- * @note Like the rest of this module, not serialized against other calls into it.
- */
-dmod_libsystemd_api_declaration(1.0, int, _add_config_dir, (const char* mount_point))
-{
-    if (mount_point == NULL)
-    {
-        return -EINVAL;
-    }
-
-    int result = libsystemd_serviceapi_init();
-    if (result != 0)
-    {
-        return result;
-    }
-
-    char* units_dir = libsystemd_config_dir_path(mount_point, "services");
-    if (units_dir == NULL)
-    {
-        return -ENOMEM;
-    }
-
-    libsystemd_lock();
-    bool is_scanned = g_units_dir != NULL && libsystemd_same_path(units_dir, g_units_dir);
-    Dmod_Free(units_dir);
-    if (is_scanned || (g_config_dirs != NULL && dmlist_find(g_config_dirs, mount_point, libsystemd_compare_string) != NULL))
-    {
-        libsystemd_unlock();
-        return -EALREADY;
-    }
-
-    if (g_config_dirs == NULL && (g_config_dirs = dmlist_create()) == NULL)
-    {
-        libsystemd_unlock();
-        return -ENOMEM;
-    }
-    char* entry = Dmod_StrDup(mount_point);
-    if (entry == NULL || !dmlist_push_back(g_config_dirs, entry))
-    {
-        libsystemd_unlock();
-        Dmod_Free(entry);
-        return -ENOMEM;
-    }
-
-    int units_result = libsystemd_merge_config_dir_units(entry);
-    int rules_result = libsystemd_merge_config_dir_rules(entry);
-    if (units_result == -ENOENT && rules_result == -ENOENT)
-    {
-        dmlist_remove(g_config_dirs, entry, libsystemd_compare_pointer);
-        libsystemd_unlock();
-        Dmod_Free(entry);
-        return -ENOENT;
-    }
-    libsystemd_unlock();
-
-    DMOD_LOG_INFO("Loaded the configuration directory of '%s'\n", entry);
-
-    libsystemd_start_config_dir_services(entry);
-
-    // Its rules may match devices reported before.
-    libsystemd_replay_pending_devices();
-
-    return (units_result == -ENOMEM || rules_result == -ENOMEM) ? -ENOMEM : 0;
-}
-
-/**
- * @brief Unload the configuration directory of a mount point
- *
- * Stops (gracefully, so this may block for up to their stop_timeout_ms) and
- * removes every unit that came from the configuration directory of
- * @p mount_point - template instances too - and removes its templates and
- * rules. What came from anywhere else stays as it is.
- *
- * Called by the module that follows mounts before @p mount_point is
- * unmounted: the units stop while their files are still there.
- *
- * @param mount_point Mount point given to libsystemd_add_config_dir().
- *
- * @retval 0       Unloaded.
- * @retval -EINVAL @p mount_point is NULL.
- * @retval -ENOENT Its configuration directory is not loaded.
- *
- * @note Like the rest of this module, not serialized against other calls into it.
- */
-dmod_libsystemd_api_declaration(1.0, int, _remove_config_dir, (const char* mount_point))
-{
-    if (mount_point == NULL)
-    {
-        return -EINVAL;
-    }
-
-    dmlist_context_t* removed = dmlist_create();
-    if (removed == NULL)
-    {
-        return -ENOMEM;
-    }
-
-    libsystemd_lock();
-    char* entry = (g_config_dirs != NULL) ? (char*)dmlist_find(g_config_dirs, mount_point, libsystemd_compare_string) : NULL;
-    if (entry == NULL)
-    {
-        libsystemd_unlock();
-        dmlist_destroy(removed);
-        return -ENOENT;
-    }
-    dmlist_remove(g_config_dirs, entry, libsystemd_compare_pointer);
-
-    DMOD_LOG_INFO("Unloading the configuration directory of '%s'\n", entry);
-
-    if (g_services != NULL)
-    {
-        // Backwards: the units started last stop first. Taken out of the registry
-        // here, stopped below - outside the lock (see g_registry_lock).
-        for (size_t i = dmlist_size(g_services->services); i-- > 0; )
-        {
-            libsystemd_service_t service = (libsystemd_service_t)dmlist_get(g_services->services, i);
-            if (libsystemd_is_from(service->source, entry) && dmlist_push_back(removed, service))
-            {
-                dmlist_remove_at(g_services->services, i);
-            }
-        }
-
-        for (size_t i = dmlist_size(g_services->templates); i-- > 0; )
-        {
-            libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_get(g_services->templates, i);
-            if (!libsystemd_is_from(tmpl->source, entry))
-            {
-                continue;
-            }
-            dmlist_remove_at(g_services->templates, i);
-            Dmod_Free(tmpl->prefix);
-            Dmod_Free(tmpl->dir_path);
-            Dmod_Free(tmpl->source);
-            Dmod_Free(tmpl);
-        }
-    }
-
-    for (size_t i = (g_rules != NULL) ? dmlist_size(g_rules) : 0; i-- > 0; )
-    {
-        libsystemd_rule_t* rule = (libsystemd_rule_t*)dmlist_get(g_rules, i);
-        if (!libsystemd_is_from(rule->source, entry))
-        {
-            continue;
-        }
-        dmlist_remove_at(g_rules, i);
-        Dmod_Free(rule->class_name);
-        Dmod_Free(rule->start_template);
-        Dmod_Free(rule->remove_template);
-        Dmod_Free(rule->source);
-        Dmod_Free(rule);
-    }
-    libsystemd_unlock();
-    Dmod_Free(entry);
-
-    libsystemd_service_t service = (libsystemd_service_t)dmlist_pop_front(removed);
-    while (service != NULL)
-    {
-        libsystemd_stop_all_services_visitor(service, NULL);
-        libsystemd_destroy_service(service);
-        service = (libsystemd_service_t)dmlist_pop_front(removed);
-    }
-    dmlist_destroy(removed);
-
-    return 0;
-}

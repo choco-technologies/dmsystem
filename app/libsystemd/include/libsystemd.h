@@ -21,7 +21,4 @@ dmod_libsystemd_api(1.0, int, _load_rules, (const char* rules_dir));
 dmod_libsystemd_api(1.0, int, _notify_device_added, (const char* device_class, const char* device_name, const char* user_value));
 dmod_libsystemd_api(1.0, int, _notify_device_removed, (const char* device_class, const char* device_name));
 
-dmod_libsystemd_api(1.0, int, _add_config_dir, (const char* mount_point));
-dmod_libsystemd_api(1.0, int, _remove_config_dir, (const char* mount_point));
-
 #endif // LIBSYSTEMD_H
