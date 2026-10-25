@@ -4680,7 +4680,7 @@ static void libsystemd_destroy_config_dirs(void)
  * carrying the same module.
  *
  * Called for every mount by the module that follows mounts (dmdevfs's
- * mountcfg, with dmvfs's mount listener) - libsystemd itself does not depend on
+ * mountcfg, through dmvfs's _mount_changed DIF) - libsystemd itself does not depend on
  * dmvfs. The configuration directory of the root file system is the units
  * directory of libsystemd_scan() itself, so it is not loaded twice. Safe to call
  * from a unit libsystemd_scan() is starting: the units already there keep their

@@ -413,7 +413,7 @@ configuration directories.
 
 libsystemd itself does not follow mounts - it does not depend on the file
 system. The module that does (on dmod-boot: dmdevfs's `mountcfg`, with dmvfs's
-mount listener) calls these two functions for every mount and unmount, the
+`_mount_changed` DIF) calls these two functions for every mount and unmount, the
 unmount before the file system goes away, so its units stop while their files
 are still there. The configuration directory of the root file system is the
 units directory of `libsystemd_scan()` itself (`/cfg/services`), so it is not
