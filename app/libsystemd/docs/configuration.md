@@ -234,11 +234,13 @@ case-sensitive):
 | `%p` | The template prefix (e.g. `getty`) |
 | `%n` | The full instantiated unit name (e.g. `getty@tty1`) |
 | `%v` | The caller-supplied `user_value` passed to `libsystemd_start_service()`/`libsystemd_notify_device_added()`, or an empty string if none was given (see [Device rules](#device-rules)) |
+| `%m` | The mount point whose configuration directory the unit (or its template) comes from, without a trailing `/` - empty for the units directory of `libsystemd_scan()` (see [Configuration directories of mount points](#configuration-directories-of-mount-points)) |
 | `%%` | A literal `%` |
 
 An unrecognized `%<char>` sequence (or a trailing `%`) is left untouched.
-Specifier expansion only happens for instance files - plain (non-`@`) unit
-files are never scanned for `%` and can freely contain a literal `%`.
+Specifier expansion only happens for instance files - in a plain (non-`@`)
+unit file only `%m` is expanded, anything else (a literal `%`, `%%`) is
+taken as is.
 
 ```ini
 # getty@.ini - the template
@@ -388,10 +390,12 @@ have `start`, `remove` or both.
 libsystemd implements dmfsi's `_mount_changed` dif, which dmvfs calls after every
 mount and before every unmount, and reports it as a device of class `mount`:
 named after the mount point (`/mnt/SD` -> `mnt_SD`, `/ext` -> `ext`, `/` ->
-`root`), its value (`%v`) the mount point. It does nothing else - what a mount
-means is up to the rules (see the example above): the unit they start does its
-work in a process of its own, with the stack its module asks for, and the
-`remove` unit is done before the file system goes away.
+`root`), its value (`%v`) the mount point. What a mount means beyond its own
+configuration directory (see [Configuration directories of mount
+points](#configuration-directories-of-mount-points)) is up to the rules (see the
+example above): the unit they start does its work in a process of its own, with
+the stack its module asks for, and the `remove` unit is done before the file
+system goes away.
 
 ### Devices reported before rules/units exist yet
 
@@ -416,3 +420,51 @@ piece is enough to leave a device pending, and either one showing up later
 is enough to retry it. A device stops being remembered - and is never
 retried again - once `libsystemd_notify_device_removed()` is called for the
 same `(class, name)` pair, even if it was never successfully started.
+
+## Configuration directories of mount points
+
+Besides the units directory of `libsystemd_scan()` and the rules directory of
+`libsystemd_load_rules()`, every mounted file system may bring its own
+configuration, in the same layout:
+
+```
+<mount point>/cfg/services/   units (and templates)
+<mount point>/cfg/rules/      device rules
+```
+
+libsystemd loads it by itself, from the `_mount_changed` dif (see above): when a
+file system is mounted, its units, templates and rules are **added** to what is
+loaded - nothing is reloaded or restarted - and its units are started in their
+dependency order (`requires`/`after` may name units from anywhere). When it is
+about to be unmounted, libsystemd first runs the rules' `remove` units, then
+stops every unit that came from there - template instances started from its
+templates too - and removes its units, templates and rules; everything else
+stays. The unmount waits for all of it, so the units stop while their files are
+still there. A mount point without `cfg/services` and `cfg/rules` is left
+alone. A full reload (`libsystemd_scan()`, `libsystemd_load_rules()`) keeps the
+loaded configuration directories, and so does a mount reported before the first
+scan. The configuration directory of the root file system is the units
+directory of `libsystemd_scan()` itself (`/cfg/services`), so it is not loaded
+twice.
+
+The call comes in the thread that mounts, so loading a directory and starting
+its units takes that thread's stack: on dmod-boot automount's, which peaked at
+2.6 kB with one unit from a card (module loaded from the FAT file system) and a
+one-shot `devscan` - more than the 2 kB it was released with, so it needs 4 kB.
+Work that is not libsystemd's own is better left to a one-shot unit started by a
+rule (a process of its own). The module search path is invalidated before the
+units start, so a module on the new file system (`/mnt/<label>/bin`) is found.
+
+In every unit of such a directory `%m` is the mount point, so a unit can name
+the module and the files on its own file system - and stays bound to it even
+with several cards carrying the same module:
+
+```ini
+; /mnt/SD/cfg/services/carhmi.ini
+description=Car HMI demo
+exec=%m/bin/carhmi.dmfc
+args=%m/views/carhmi_view/carhmi.dmv
+```
+
+A unit or template whose name is taken already - by the firmware or by a
+mount point loaded before - is logged and ignored: the first one stays.

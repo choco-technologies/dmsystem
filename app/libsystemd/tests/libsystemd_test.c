@@ -1109,3 +1109,126 @@ DMOD_TEST_STEP(a_rule_with_only_remove_runs_on_removal_only)
     DMOD_TEST_EXPECT_NOT_NULL(description_of("gone@x"));
     DMOD_TEST_EXPECT_EQ(strcmp(description_of("gone@x"), "gone /value"), 0);
 }
+
+/*
+ * Configuration directories of mount points: a mount loads <mount point>/cfg/services and <mount point>/cfg/rules, an
+ * unmount drops them. The fixture directories tests/fixtures/mount_a, mount_b, ... stand for mounted file systems
+ * (their paths are the mount points): mount_a and mount_b have cfg/services (and mount_a cfg/rules), mount_empty
+ * has no cfg/ at all. Every step unmounts what it mounted - dmod_test_setup() rescans the examples, which keeps
+ * loaded configuration directories.
+ */
+#define LIBSYSTEMD_MOUNT_A      LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_a"
+#define LIBSYSTEMD_MOUNT_B      LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_b"
+#define LIBSYSTEMD_MOUNT_EMPTY  LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_empty"
+#define LIBSYSTEMD_MOUNT_ROOT   LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_root"
+
+static int count_units(void)
+{
+    unit_summary_t summary = { 0 };
+    libsystemd_list(count_units_visitor, &summary);
+    return summary.count;
+}
+
+DMOD_TEST_STEP(a_mount_without_cfg_changes_nothing)
+{
+    int units = count_units();
+    call_mount_changed(LIBSYSTEMD_MOUNT_EMPTY, true);
+    DMOD_TEST_EXPECT_EQ(count_units(), units);
+    call_mount_changed(LIBSYSTEMD_MOUNT_EMPTY, false);
+    DMOD_TEST_EXPECT_EQ(count_units(), units);
+}
+
+DMOD_TEST_STEP(mount_adds_starts_and_unmount_removes_the_units_of_cfg_services)
+{
+    int units = count_units();
+    DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleEnabled("dmtestplain"));
+
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, true);
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, true);       // reported twice: loaded once
+
+    // Added to the units there were (the template is not a unit), and started
+    DMOD_TEST_EXPECT_EQ(count_units(), units + 1);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_RUNNING);
+    DMOD_TEST_EXPECT_TRUE(Dmod_IsModuleEnabled("dmtestplain"));
+
+    // %m is the mount point
+    DMOD_TEST_EXPECT_NOT_NULL(description_of("mounted"));
+    DMOD_TEST_EXPECT_EQ(strcmp(description_of("mounted"), "from " LIBSYSTEMD_MOUNT_A), 0);
+
+    // Unmounted: stopped and gone, the rest untouched
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, false);
+    DMOD_TEST_EXPECT_FALSE(Dmod_IsModuleEnabled("dmtestplain"));
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(count_units(), units);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("networking", &status), 0);
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, false);      // again: nothing to do
+    DMOD_TEST_EXPECT_EQ(count_units(), units);
+}
+
+DMOD_TEST_STEP(a_unit_of_two_mount_points_stays_the_first_one)
+{
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, true);
+    call_mount_changed(LIBSYSTEMD_MOUNT_B, true);
+
+    DMOD_TEST_EXPECT_EQ(strcmp(description_of("mounted"), "from " LIBSYSTEMD_MOUNT_A), 0);
+
+    // mount_b's copy was never loaded, so unmounting mount_b leaves mount_a's
+    call_mount_changed(LIBSYSTEMD_MOUNT_B, false);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_RUNNING);
+
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, false);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), -ENOENT);
+}
+
+DMOD_TEST_STEP(rules_of_a_mount_point_start_instances_bound_to_it)
+{
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, true);
+
+    // mount_a's rule, mount_a's template ("dmtool" is not loadable: the
+    // instance is registered, its start fails)
+    libsystemd_notify_device_added("mountdev", "dev1", NULL);
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev1", &status), 0);
+    DMOD_TEST_EXPECT_NOT_NULL(description_of("tool@dev1"));
+    DMOD_TEST_EXPECT_EQ(strcmp(description_of("tool@dev1"), LIBSYSTEMD_MOUNT_A " dev1"), 0);
+
+    // The instance, the template and the rule go away with the unmount
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, false);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev1", &status), -ENOENT);
+    DMOD_TEST_EXPECT_EQ(libsystemd_start_service("tool@dev2", NULL), -ENOENT);
+    libsystemd_notify_device_added("mountdev", "dev3", NULL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev3", &status), -ENOENT);
+
+    libsystemd_notify_device_removed("mountdev", "dev1");
+    libsystemd_notify_device_removed("mountdev", "dev3");
+}
+
+DMOD_TEST_STEP(the_cfg_of_a_mount_point_survives_a_full_reload)
+{
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, true);
+
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_EXAMPLES_DIR), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_TEST_FIXTURES_DIR "/rules"), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted", &status), 0);
+    DMOD_TEST_EXPECT_EQ(status.state, DMOSI_PROCESS_STATE_RUNNING);
+    libsystemd_notify_device_added("mountdev", "dev4", NULL);
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("tool@dev4", &status), 0);
+
+    call_mount_changed(LIBSYSTEMD_MOUNT_A, false);
+    libsystemd_notify_device_removed("mountdev", "dev4");
+}
+
+DMOD_TEST_STEP(the_scanned_units_directory_is_not_loaded_twice_as_a_mount)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_MOUNT_ROOT "/cfg/services/"), 0);
+    call_mount_changed(LIBSYSTEMD_MOUNT_ROOT, true);
+    DMOD_TEST_EXPECT_EQ(count_units(), 1);
+    call_mount_changed(LIBSYSTEMD_MOUNT_ROOT, false);
+    DMOD_TEST_EXPECT_EQ(count_units(), 1);
+}
