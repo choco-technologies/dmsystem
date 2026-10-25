@@ -1,7 +1,9 @@
+#define ENABLE_DIF_REGISTRATIONS    ON
 #define DMOD_ENABLE_REGISTRATION ON
 #include "dmod_test.h"
 #include "libsystemd.h"
 #include "dmtestlibrary.h"
+#include "dmfsi.h"
 #include "dmosi.h"
 #include <errno.h>
 #include <string.h>
@@ -1155,4 +1157,85 @@ DMOD_TEST_STEP(config_dir_of_the_scanned_units_directory_is_not_loaded_twice)
     DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_MOUNT_ROOT "/cfg/services/"), 0);
     DMOD_TEST_EXPECT_EQ(libsystemd_add_config_dir(LIBSYSTEMD_MOUNT_ROOT), -EALREADY);
     DMOD_TEST_EXPECT_EQ(count_units(), 1);
+}
+
+/*
+ * Mounts as devices: dmvfs calls dmfsi's _mount_changed dif in every module implementing it, libsystemd reports the
+ * mount point as a device of class "mount" and the rules decide what that means - "start" for a mount, the new
+ * "remove" key for an unmount (fixtures/mount_events). The modules the units name are not loadable here, so what is
+ * checked is that the right instances were resolved and registered, with the mount point as %v.
+ */
+#define LIBSYSTEMD_MOUNT_EVENTS_DIR LIBSYSTEMD_TEST_FIXTURES_DIR "/mount_events"
+
+static void call_mount_changed(const char* mount_point, bool mounted)
+{
+    dmod_dmfsi_mount_changed_t mount_changed =
+        (dmod_dmfsi_mount_changed_t)Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig);
+    if (mount_changed != NULL)
+    {
+        mount_changed(mount_point, mounted);
+    }
+}
+
+static const char* description_of(const char* unit)
+{
+    static unit_description_t query;
+    memset(&query, 0, sizeof(query));
+    query.unit_name = unit;
+    libsystemd_list(find_description_visitor, &query);
+    return query.found ? query.description : NULL;
+}
+
+DMOD_TEST_STEP(mount_changed_dif_is_implemented)
+{
+    DMOD_TEST_EXPECT_NOT_NULL(Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig));
+}
+
+DMOD_TEST_STEP(mount_is_reported_as_a_device_the_start_rule_matches)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_MOUNT_EVENTS_DIR "/units"), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_MOUNT_EVENTS_DIR "/rules"), 0);
+
+    libsystemd_service_status_t status;
+    DMOD_TEST_EXPECT_EQ(libsystemd_status("mounted@mnt_SD", &status), -ENOENT);
+
+    call_mount_changed("/mnt/SD", true);
+
+    // Named after the mount point, the mount point is %v
+    DMOD_TEST_EXPECT_NOT_NULL(description_of("mounted@mnt_SD"));
+    DMOD_TEST_EXPECT_EQ(strcmp(description_of("mounted@mnt_SD"), "mounted /mnt/SD"), 0);
+
+    call_mount_changed("/ext", true);
+    DMOD_TEST_EXPECT_NOT_NULL(description_of("mounted@ext"));
+    call_mount_changed("/", true);
+    DMOD_TEST_EXPECT_NOT_NULL(description_of("mounted@root"));
+}
+
+DMOD_TEST_STEP(unmount_starts_the_remove_unit_with_the_mount_point)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_MOUNT_EVENTS_DIR "/units"), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_MOUNT_EVENTS_DIR "/rules"), 0);
+
+    call_mount_changed("/mnt/SD", true);
+    DMOD_TEST_EXPECT_NULL(description_of("gone@mnt_SD"));
+
+    // %v is what the mount was reported with, remembered until now
+    call_mount_changed("/mnt/SD", false);
+    DMOD_TEST_EXPECT_NOT_NULL(description_of("gone@mnt_SD"));
+    DMOD_TEST_EXPECT_EQ(strcmp(description_of("gone@mnt_SD"), "gone /mnt/SD"), 0);
+}
+
+DMOD_TEST_STEP(a_rule_with_only_remove_runs_on_removal_only)
+{
+    DMOD_TEST_EXPECT_EQ(libsystemd_scan(LIBSYSTEMD_MOUNT_EVENTS_DIR "/units"), 0);
+    DMOD_TEST_EXPECT_EQ(libsystemd_load_rules(LIBSYSTEMD_MOUNT_EVENTS_DIR "/rules"), 0);
+
+    // Nothing is started when such a device appears ...
+    libsystemd_notify_device_added("removeonly", "x", "/value");
+    DMOD_TEST_EXPECT_NULL(description_of("gone@x"));
+
+    // ... and the unit when it goes away
+    libsystemd_notify_device_removed("removeonly", "x");
+    DMOD_TEST_EXPECT_NOT_NULL(description_of("gone@x"));
+    DMOD_TEST_EXPECT_EQ(strcmp(description_of("gone@x"), "gone /value"), 0);
 }

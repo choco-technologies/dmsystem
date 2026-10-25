@@ -367,6 +367,34 @@ set, same "full reload" semantics as `libsystemd_scan()`. A runnable copy of
 the example above lives in
 [`app/libsystemd/examples/rules/`](../examples/rules).
 
+### Starting something when a device goes away: `remove`
+
+A rule section may also have a `remove` key, started when a device of that class
+goes away (`libsystemd_notify_device_removed()`), in the same `%name`/`%v`
+terms - `%v` is the value the device was reported with:
+
+```ini
+[class=mount]
+start=mountcfg@%name
+remove=mountcfg-unload@%name
+```
+
+On removal libsystemd first stops the units `start` started (as before), then
+starts the `remove` ones **and waits for them** (up to 20 s each) before it
+returns - the removal is usually still going on in its caller (a file system
+that is being unmounted) and must not go on before they are done. A section may
+have `start`, `remove` or both.
+
+### Mounts as devices: the `mount` class
+
+libsystemd implements dmfsi's `_mount_changed` dif, which dmvfs calls after every
+mount and before every unmount, and reports it as a device of class `mount`:
+named after the mount point (`/mnt/SD` -> `mnt_SD`, `/ext` -> `ext`, `/` ->
+`root`), its value (`%v`) the mount point. It does nothing else - what a mount
+means is up to the rules (see the example above): the unit they start does its
+work in a process of its own, with the stack its module asks for, and the
+`remove` unit is done before the file system goes away.
+
 ### Devices reported before rules/units exist yet
 
 A driver module is typically loaded (and starts reporting devices) *before*
@@ -411,11 +439,11 @@ unit that came from there - template instances started from its templates too
 reload (`libsystemd_scan()`, `libsystemd_load_rules()`) keeps the loaded
 configuration directories.
 
-libsystemd itself does not follow mounts - it does not depend on the file
-system. The module that does (on dmod-boot: dmdevfs, which implements dmfsi's
-`_mount_changed` dif that dmvfs calls) calls these two functions for every mount
-and unmount, the unmount before the file system goes away, so its units stop while their files
-are still there. The configuration directory of the root file system is the
+libsystemd does not load these by itself on a mount: it reports the mount as a
+device of class `mount` (see above), and a service started by a rule calls these
+two functions - on dmod-boot `mountcfg`, from dmdevfs - when the mount appears
+and, from a `remove` unit, before the file system goes away, so its units stop
+while their files are still there. The configuration directory of the root file system is the
 units directory of `libsystemd_scan()` itself (`/cfg/services`), so it is not
 loaded twice.
 

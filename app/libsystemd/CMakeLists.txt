@@ -40,10 +40,12 @@ target_include_directories(${DMOD_MODULE_NAME}_if
         )
 
 # To depend on another module's headers, use:
+# dmfsi: the _mount_changed dif libsystemd implements (reports mounts as device events) - a header only
 dmod_link_modules(${DMOD_MODULE_NAME}
     dmlist
     dmini
     dmosi
+    dmfsi
 )
 
 add_subdirectory(tests)

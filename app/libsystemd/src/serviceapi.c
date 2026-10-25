@@ -6,6 +6,7 @@
 #include <string.h>
 #include "dmini.h"
 #include "dmosi.h"
+#include "dmfsi.h"
 // Not pulled in by libsystemd.h: the public API deliberately keeps dmlist out of
 // its surface (see the libsystemd_services_t doc in libsystemd_types.h), so the
 // registry's own list handling includes it here instead.
@@ -20,6 +21,14 @@
  * it falls back to dmosi_process_kill().
  */
 #define LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS  3000u
+
+/**
+ * @brief How long libsystemd_notify_device_removed() waits for each unit a rule's "remove" key started
+ *
+ * A device is going away - a file system is being unmounted - and the unit has to be done before that goes on. Long
+ * enough for stopping a few services (each may take its stop_timeout_ms); the unit is left running after that.
+ */
+#define LIBSYSTEMD_REMOVE_WAIT_MS           20000u
 
 /**
  * @brief Poll period while waiting for a stopping service to exit
@@ -130,7 +139,8 @@ static char* g_units_dir = NULL;
 typedef struct
 {
     char* class_name;      //!< Device class this rule applies to (the part after "class=" in its `[class=...]` section name). Owned copy.
-    char* start_template;  //!< Value of that section's "start" key, with "%name" substituted for the device name at match time. Owned copy.
+    char* start_template;  //!< Value of that section's "start" key (started when a device of the class appears), with "%name" substituted for the device name at match time, or NULL. Owned copy.
+    char* remove_template; //!< Value of that section's "remove" key (started when a device of the class goes away - see libsystemd_notify_device_removed()), "%name" substituted as above, or NULL. Owned copy.
     char* source;          //!< Mount point of the configuration directory it comes from, or NULL (see libsystemd_service::source). Owned copy.
 } libsystemd_rule_t;
 
@@ -448,6 +458,7 @@ static void libsystemd_destroy_rules(dmlist_context_t* rules)
     {
         Dmod_Free(rule->class_name);
         Dmod_Free(rule->start_template);
+        Dmod_Free(rule->remove_template);
         Dmod_Free(rule->source);
         Dmod_Free(rule);
         rule = (libsystemd_rule_t*)dmlist_pop_front(rules);
@@ -2862,7 +2873,8 @@ static void libsystemd_parse_rules_file(const char* file_path, const char* sourc
         }
 
         const char* start_template = dmini_get_string(ctx, section_name, "start", NULL);
-        if (start_template == NULL)
+        const char* remove_template = dmini_get_string(ctx, section_name, "remove", NULL);
+        if (start_template == NULL && remove_template == NULL)
         {
             continue;
         }
@@ -2874,13 +2886,16 @@ static void libsystemd_parse_rules_file(const char* file_path, const char* sourc
         }
 
         rule->class_name = Dmod_StrDup(class_name);
-        rule->start_template = Dmod_StrDup(start_template);
+        rule->start_template = (start_template != NULL) ? Dmod_StrDup(start_template) : NULL;
+        rule->remove_template = (remove_template != NULL) ? Dmod_StrDup(remove_template) : NULL;
         rule->source = (source != NULL) ? Dmod_StrDup(source) : NULL;
-        if (rule->class_name == NULL || rule->start_template == NULL || (source != NULL && rule->source == NULL) ||
+        if (rule->class_name == NULL || (start_template != NULL && rule->start_template == NULL) ||
+            (remove_template != NULL && rule->remove_template == NULL) || (source != NULL && rule->source == NULL) ||
             !dmlist_push_back(rules, rule))
         {
             Dmod_Free(rule->class_name);
             Dmod_Free(rule->start_template);
+        Dmod_Free(rule->remove_template);
             Dmod_Free(rule->source);
             Dmod_Free(rule);
         }
@@ -3027,6 +3042,7 @@ static void libsystemd_destroy_targets(dmlist_context_t* targets)
  */
 typedef struct
 {
+    bool removal;              //!< true: collect the "remove" templates (a device went away), false: the "start" ones.
     const char* device_class;  //!< Class being matched against every rule (borrowed).
     const char* device_name;   //!< Device name to substitute for "%name" (borrowed).
     dmlist_context_t* targets; //!< Collects one newly allocated target `char*` per matching rule (borrowed).
@@ -3055,12 +3071,13 @@ static bool libsystemd_collect_matching_rule_targets_visitor(void* data, void* u
     libsystemd_rule_t* rule = (libsystemd_rule_t*)data;
     libsystemd_rule_match_ctx_t* ctx = (libsystemd_rule_match_ctx_t*)user_data;
 
-    if (strcmp(rule->class_name, ctx->device_class) != 0)
+    const char* unit_template = ctx->removal ? rule->remove_template : rule->start_template;
+    if (strcmp(rule->class_name, ctx->device_class) != 0 || unit_template == NULL)
     {
         return true;
     }
 
-    char* target = libsystemd_substitute_device_name(rule->start_template, ctx->device_name);
+    char* target = libsystemd_substitute_device_name(unit_template, ctx->device_name);
     if (target == NULL)
     {
         ctx->error = -ENOMEM;
@@ -3099,7 +3116,7 @@ static bool libsystemd_collect_matching_rule_targets_visitor(void* data, void* u
  * @retval -ENOENT No rules have been loaded yet, or none of them match @p device_class.
  * @retval -ENOMEM Allocation failed.
  */
-static int libsystemd_resolve_device_targets(const char* device_class, const char* device_name, dmlist_context_t** out_targets)
+static int libsystemd_resolve_device_targets(const char* device_class, const char* device_name, bool removal, dmlist_context_t** out_targets)
 {
     if (g_rules == NULL)
     {
@@ -3113,6 +3130,7 @@ static int libsystemd_resolve_device_targets(const char* device_class, const cha
     }
 
     libsystemd_rule_match_ctx_t ctx = {
+        .removal = removal,
         .device_class = device_class,
         .device_name = device_name,
         .targets = targets,
@@ -3171,7 +3189,7 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
     DMOD_LOG_INFO("Replaying remembered device (class=%s, name=%s)\n", device->device_class, device->device_name);
 
     dmlist_context_t* targets = NULL;
-    int result = libsystemd_resolve_device_targets(device->device_class, device->device_name, &targets);
+    int result = libsystemd_resolve_device_targets(device->device_class, device->device_name, false, &targets);
     if (result != 0)
     {
         return true;
@@ -3951,7 +3969,7 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
     libsystemd_remember_device(device_class, device_name, user_value);
 
     dmlist_context_t* targets = NULL;
-    int result = libsystemd_resolve_device_targets(device_class, device_name, &targets);
+    int result = libsystemd_resolve_device_targets(device_class, device_name, false, &targets);
     if (result != 0)
     {
         return result;
@@ -4018,30 +4036,158 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* d
 
     DMOD_LOG_INFO("Device removed (class=%s, name=%s)\n", device_class, device_name);
 
+    // The value it was reported with, for the "remove" units (they get it as %v): read before the device is forgotten.
+    char* user_value = NULL;
+    libsystemd_lock();
+    {
+        libsystemd_device_key_t key = { .device_class = device_class, .device_name = device_name };
+        const libsystemd_device_t* device = (g_devices != NULL)
+            ? (const libsystemd_device_t*)dmlist_find(g_devices, &key, libsystemd_compare_device) : NULL;
+        if (device != NULL && device->user_value != NULL)
+        {
+            user_value = Dmod_StrDup(device->user_value);
+        }
+    }
+    libsystemd_unlock();
+
     libsystemd_forget_device(device_class, device_name);
 
+    int first_error = 0;
     dmlist_context_t* targets = NULL;
-    int result = libsystemd_resolve_device_targets(device_class, device_name, &targets);
+    int result = libsystemd_resolve_device_targets(device_class, device_name, false, &targets);
     if (result != 0)
     {
-        return result;
+        first_error = result;
+    }
+    else
+    {
+        char* target = (char*)dmlist_pop_front(targets);
+        while (target != NULL)
+        {
+            int target_result = libsystemd_stop_service(target);
+            if (target_result != 0 && first_error == 0)
+            {
+                first_error = target_result;
+            }
+            Dmod_Free(target);
+            target = (char*)dmlist_pop_front(targets);
+        }
+        dmlist_destroy(targets);
     }
 
-    int first_error = 0;
-    char* target = (char*)dmlist_pop_front(targets);
-    while (target != NULL)
+    // What the rules want done when such a device goes away (e.g. a service cleaning up after a file system). The
+    // caller is still inside the removal - an unmount, say - so each unit is waited for, up to
+    // LIBSYSTEMD_REMOVE_WAIT_MS.
+    targets = NULL;
+    if (libsystemd_resolve_device_targets(device_class, device_name, true, &targets) == 0)
     {
-        int target_result = libsystemd_stop_service(target);
-        if (target_result != 0 && first_error == 0)
+        char* target = (char*)dmlist_pop_front(targets);
+        while (target != NULL)
         {
-            first_error = target_result;
+            int target_result = libsystemd_start_service(target, user_value);
+            libsystemd_service_status_t status;
+            if (target_result == 0 && libsystemd_status(target, &status) == 0 && status.pid > 0)
+            {
+                if (!libsystemd_wait_for_exit((dmosi_process_id_t)status.pid, LIBSYSTEMD_REMOVE_WAIT_MS))
+                {
+                    DMOD_LOG_WARN("Unit '%s' started for the removal of %s/%s did not finish within %u ms\n",
+                                  target, device_class, device_name, (unsigned)LIBSYSTEMD_REMOVE_WAIT_MS);
+                }
+            }
+            else if (target_result != 0 && target_result != -EALREADY)
+            {
+                DMOD_LOG_WARN("Failed to start '%s' for the removal of device (class=%s, name=%s) (%d)\n",
+                              target, device_class, device_name, target_result);
+            }
+            Dmod_Free(target);
+            target = (char*)dmlist_pop_front(targets);
         }
-        Dmod_Free(target);
-        target = (char*)dmlist_pop_front(targets);
+        dmlist_destroy(targets);
     }
-    dmlist_destroy(targets);
+    Dmod_Free(user_value);
 
     return first_error;
+}
+
+/**
+ * @brief Device class mounts are reported under (see the _mount_changed dif below)
+ */
+#define LIBSYSTEMD_MOUNT_CLASS  "mount"
+
+/**
+ * @brief Build the device name of a mount point: the path without its leading '/' and with '/' replaced by '_'
+ *
+ * Unit names cannot contain '/': "/ext" -> "ext", "/mnt/SD" -> "mnt_SD", "/" -> "root".
+ *
+ * @return Newly heap-allocated name, owned by the caller (free with Dmod_Free()), or NULL if allocation failed.
+ */
+static char* libsystemd_mount_device_name(const char* mount_point)
+{
+    while (*mount_point == '/')
+    {
+        mount_point++;
+    }
+    if (*mount_point == '\0')
+    {
+        return Dmod_StrDup("root");
+    }
+
+    char* name = Dmod_StrDup(mount_point);
+    if (name == NULL)
+    {
+        return NULL;
+    }
+    size_t len = strlen(name);
+    while (len > 0 && name[len - 1] == '/')
+    {
+        name[--len] = '\0';
+    }
+    for (char* c = name; *c != '\0'; c++)
+    {
+        if (*c == '/')
+        {
+            *c = '_';
+        }
+    }
+    return name;
+}
+
+/**
+ * @brief dmfsi's _mount_changed dif (called by dmvfs): a file system was mounted or is about to be unmounted
+ *
+ * libsystemd only reports it, as a device of class "mount" - named after the mount point ("/mnt/SD" -> "mnt_SD"),
+ * with the mount point as its value (%v) - and the rules decide what that means:
+ *
+ *     [class=mount]
+ *     start=mountcfg@%name            # when it is mounted
+ *     remove=mountcfg-unload@%name    # when it is about to be unmounted
+ *
+ * The call comes in the thread that mounts or unmounts, and whatever the rules start for a mount point does its
+ * work in a process of its own, with the stack its module asks for. An unmount does not go on until the "remove"
+ * units are done (libsystemd_notify_device_removed()).
+ */
+dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const char* mount_point, bool mounted) )
+{
+    if (mount_point == NULL)
+    {
+        return;
+    }
+
+    char* name = libsystemd_mount_device_name(mount_point);
+    if (name == NULL)
+    {
+        return;
+    }
+
+    if (mounted)
+    {
+        libsystemd_notify_device_added(LIBSYSTEMD_MOUNT_CLASS, name, mount_point);
+    }
+    else
+    {
+        libsystemd_notify_device_removed(LIBSYSTEMD_MOUNT_CLASS, name);
+    }
+    Dmod_Free(name);
 }
 
 /**
@@ -4572,6 +4718,7 @@ static int libsystemd_merge_config_dir_rules(const char* mount_point)
         {
             Dmod_Free(rule->class_name);
             Dmod_Free(rule->start_template);
+        Dmod_Free(rule->remove_template);
             Dmod_Free(rule->source);
             Dmod_Free(rule);
             result = -ENOMEM;
@@ -4679,9 +4826,9 @@ static void libsystemd_destroy_config_dirs(void)
  * libsystemd_remove_config_dir() stops exactly them - even with several cards
  * carrying the same module.
  *
- * Called for every mount by the module that follows mounts (dmdevfs, which
- * implements dmfsi's _mount_changed dif) - libsystemd itself does not depend on
- * dmvfs. The configuration directory of the root file system is the units
+ * Called by a service the rules start when a mount appears (on dmod-boot
+ * mountcfg) - libsystemd itself only reports mounts as devices of class "mount"
+ * (dmfsi's _mount_changed dif) and does not depend on dmvfs. The configuration directory of the root file system is the units
  * directory of libsystemd_scan() itself, so it is not loaded twice. Safe to call
  * from a unit libsystemd_scan() is starting: the units already there keep their
  * place, the new ones are appended.
@@ -4840,6 +4987,7 @@ dmod_libsystemd_api_declaration(1.0, int, _remove_config_dir, (const char* mount
         dmlist_remove_at(g_rules, i);
         Dmod_Free(rule->class_name);
         Dmod_Free(rule->start_template);
+        Dmod_Free(rule->remove_template);
         Dmod_Free(rule->source);
         Dmod_Free(rule);
     }

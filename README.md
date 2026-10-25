@@ -179,6 +179,10 @@ for the full format, and
 [`app/libsystemd/examples/rules/`](app/libsystemd/examples/rules) for a
 runnable example.
 
+A rule section may also have a `remove` key: a unit started when a device of the
+class goes away, waited for before the removal goes on (a file system being
+unmounted).
+
 ### Configuration directories of mount points
 
 A mounted file system may bring its own units and rules, in
@@ -186,8 +190,10 @@ A mounted file system may bring its own units and rules, in
 `libsystemd_add_config_dir(mount_point)` adds them to what is loaded and starts
 the units; `libsystemd_remove_config_dir(mount_point)` stops and removes exactly
 them. In such a unit `%m` is the mount point (`exec=%m/bin/app.dmfc`), so it
-uses the module and the files of its own card. The module that follows mounts
-calls both - see
+uses the module and the files of its own card. libsystemd only reports mounts
+as devices of class `mount` (dmfsi's `_mount_changed` dif); a service started by
+a rule - with `start` for a mount and the new `remove` key for an unmount - calls
+both functions. See
 [`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#configuration-directories-of-mount-points).
 
 ## Building
