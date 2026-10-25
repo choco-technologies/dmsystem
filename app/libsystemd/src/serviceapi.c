@@ -198,12 +198,12 @@ static dmlist_context_t* g_config_dirs = NULL;
  *        @ref g_devices, @ref g_config_dirs - against concurrent threads
  *
  * libsystemd is called from several threads: dmdevfs's hot-plug thread
- * (device notifications), mountcfg's (configuration directories), the shell
+ * (device notifications and configuration directories), the shell
  * (`service`), systemd at boot. Two of them instantiating the same unit at
  * once registered it twice. Recursive, and held only while a list is read or
  * changed: never while a unit is spawned, a module enabled or disabled, or a
  * stopping unit waited for - those may need another thread that calls into
- * libsystemd (a stopping automount unmounts, and mountcfg unloads that mount's
+ * libsystemd (a stopping automount unmounts, which unloads that mount's
  * units). The fields of one service (pid, ...) are not guarded by it.
  */
 static dmosi_mutex_t g_registry_lock = NULL;
@@ -4679,8 +4679,8 @@ static void libsystemd_destroy_config_dirs(void)
  * libsystemd_remove_config_dir() stops exactly them - even with several cards
  * carrying the same module.
  *
- * Called for every mount by the module that follows mounts (dmdevfs's
- * mountcfg, through dmfsi's _mount_changed dif) - libsystemd itself does not depend on
+ * Called for every mount by the module that follows mounts (dmdevfs, which
+ * implements dmfsi's _mount_changed dif) - libsystemd itself does not depend on
  * dmvfs. The configuration directory of the root file system is the units
  * directory of libsystemd_scan() itself, so it is not loaded twice. Safe to call
  * from a unit libsystemd_scan() is starting: the units already there keep their

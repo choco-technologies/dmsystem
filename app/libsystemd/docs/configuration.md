@@ -412,9 +412,9 @@ reload (`libsystemd_scan()`, `libsystemd_load_rules()`) keeps the loaded
 configuration directories.
 
 libsystemd itself does not follow mounts - it does not depend on the file
-system. The module that does (on dmod-boot: dmdevfs's `mountcfg`, through
-dmfsi's `_mount_changed` dif, which dmvfs calls) calls these two functions for every mount and unmount, the
-unmount before the file system goes away, so its units stop while their files
+system. The module that does (on dmod-boot: dmdevfs, which implements dmfsi's
+`_mount_changed` dif that dmvfs calls) calls these two functions for every mount
+and unmount, the unmount before the file system goes away, so its units stop while their files
 are still there. The configuration directory of the root file system is the
 units directory of `libsystemd_scan()` itself (`/cfg/services`), so it is not
 loaded twice.
