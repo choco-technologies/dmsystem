@@ -251,6 +251,11 @@ here does not mean the device was dropped; a later `libsystemd_scan()`/
 
 ### `libsystemd_notify_device_removed(const char* device_class, const char* device_name)`
 
+After the units the `start` keys started are stopped, the units named by the
+`remove` keys of the matching rules are started (`%v` is the value the device was
+reported with) and waited for, up to 20 s each. See
+[configuration](configuration.md#starting-something-when-a-device-goes-away-remove).
+
 Resolves `(device_class, device_name)` exactly like
 `libsystemd_notify_device_added()` and calls `libsystemd_stop_service()` on
 the result instead of starting it. Also forgets the device (regardless of

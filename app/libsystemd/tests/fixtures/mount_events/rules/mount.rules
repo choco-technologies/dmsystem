@@ -1,0 +1,9 @@
+# Mounts are devices of the class "mount" (dmfsi's _mount_changed dif): named after the mount point, the mount
+# point is their value (%v).
+[class=mount]
+start=mounted@%name
+remove=gone@%name
+
+# A section with only "remove" is a rule too
+[class=removeonly]
+remove=gone@%name

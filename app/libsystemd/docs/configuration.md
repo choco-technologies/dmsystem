@@ -365,6 +365,34 @@ set, same "full reload" semantics as `libsystemd_scan()`. A runnable copy of
 the example above lives in
 [`app/libsystemd/examples/rules/`](../examples/rules).
 
+### Starting something when a device goes away: `remove`
+
+A rule section may also have a `remove` key, started when a device of that class
+goes away (`libsystemd_notify_device_removed()`), in the same `%name`/`%v`
+terms - `%v` is the value the device was reported with:
+
+```ini
+[class=mount]
+start=mounted@%name
+remove=unmounted@%name
+```
+
+On removal libsystemd first stops the units `start` started (as before), then
+starts the `remove` ones **and waits for them** (up to 20 s each) before it
+returns - the removal is usually still going on in its caller (a file system
+that is being unmounted) and must not go on before they are done. A section may
+have `start`, `remove` or both.
+
+### Mounts as devices: the `mount` class
+
+libsystemd implements dmfsi's `_mount_changed` dif, which dmvfs calls after every
+mount and before every unmount, and reports it as a device of class `mount`:
+named after the mount point (`/mnt/SD` -> `mnt_SD`, `/ext` -> `ext`, `/` ->
+`root`), its value (`%v`) the mount point. It does nothing else - what a mount
+means is up to the rules (see the example above): the unit they start does its
+work in a process of its own, with the stack its module asks for, and the
+`remove` unit is done before the file system goes away.
+
 ### Devices reported before rules/units exist yet
 
 A driver module is typically loaded (and starts reporting devices) *before*

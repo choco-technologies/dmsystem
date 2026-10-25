@@ -179,6 +179,13 @@ for the full format, and
 [`app/libsystemd/examples/rules/`](app/libsystemd/examples/rules) for a
 runnable example.
 
+A rule section may also have a `remove` key: a unit started when a device of the
+class goes away, waited for before the removal goes on (a file system being
+unmounted). libsystemd implements dmfsi's `_mount_changed` dif and reports every
+mount and unmount that way, as a device of class `mount` - what a mount means is
+up to the rules and the services they start. See
+[`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#mounts-as-devices-the-mount-class).
+
 ## Building
 
 ### Using CMake
