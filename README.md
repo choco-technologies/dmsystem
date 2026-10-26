@@ -186,6 +186,16 @@ mount and unmount that way, as a device of class `mount` - what a mount means is
 up to the rules and the services they start. See
 [`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#mounts-as-devices-the-mount-class).
 
+### Configuration directories of mount points
+
+A mounted file system may bring its own units and rules, in
+`<mount point>/cfg/services` and `<mount point>/cfg/rules`. libsystemd loads
+them by itself when the file system is mounted (from the `_mount_changed` dif)
+and starts the units; before it is unmounted it stops and removes exactly them.
+In such a unit `%m` is the mount point (`exec=%m/bin/app.dmfc`), so it uses the
+module and the files of its own card. See
+[`app/libsystemd/docs/configuration.md`](app/libsystemd/docs/configuration.md#configuration-directories-of-mount-points).
+
 ## Building
 
 ### Using CMake
