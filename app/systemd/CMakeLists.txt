@@ -5,7 +5,7 @@ set(DMOD_MODULE_NAME        systemd)
 set(DMOD_AUTHOR_NAME        "Patryk Kubiak")
 
 # Stack size for the module (should be integer)
-set(DMOD_STACK_SIZE         2048)
+set(DMOD_STACK_SIZE         3584)
 
 # Priority for the thread of the module (should be integer)
 #
