@@ -1,5 +1,6 @@
 #define DMOD_ENABLE_REGISTRATION ON
 #define ENABLE_DIF_REGISTRATIONS
+#include "libsystemd_core.h"
 #include "libsystemd.h"
 #include "libsystemd_service.h"
 #include <errno.h>
@@ -16,14 +17,14 @@
 /**
  * @brief Default for a unit's "stop_timeout_ms" key
  *
- * How long libsystemd_stop_service() waits for a service that registered for
- * stop requests (libsystemd_set_stop_semaphore()) to exit on its own before
+ * How long libsystemd_core_stop_service() waits for a service that registered for
+ * stop requests (libsystemd_core_set_stop_semaphore()) to exit on its own before
  * it falls back to dmosi_process_kill().
  */
 #define LIBSYSTEMD_DEFAULT_STOP_TIMEOUT_MS  3000u
 
 /**
- * @brief How long libsystemd_notify_device_removed() waits for each unit a rule's "remove" key started
+ * @brief How long libsystemd_core_notify_device_removed() waits for each unit a rule's "remove" key started
  *
  * A device is going away - a file system is being unmounted - and the unit has to be done before that goes on. Long
  * enough for stopping a few services (each may take its stop_timeout_ms); the unit is left running after that.
@@ -41,12 +42,12 @@
  * The public API only ever hands out this structure behind the opaque
  * `libsystemd_service_t` pointer declared in libsystemd_types.h, so callers outside
  * this file cannot read or modify its fields directly - they must go through
- * libsystemd_start_service()/libsystemd_stop_service()/libsystemd_status()/libsystemd_list().
+ * libsystemd_core_start_service()/libsystemd_core_stop_service()/libsystemd_core_status()/libsystemd_core_list().
  *
  * A `libsystemd_service_t` is created by libsystemd_parse_unit_internal()
- * (called from libsystemd_parse_dir(), via the public libsystemd_parse_file()
+ * (called from libsystemd_core_parse_dir(), via the public libsystemd_core_parse_file()
  * for a non-templated unit) and lives inside the global service registry
- * (@ref g_services) until it is replaced by a new libsystemd_scan() or the
+ * (@ref g_services) until it is replaced by a new libsystemd_core_scan() or the
  * module is unloaded (libsystemd_serviceapi_deinit()).
  */
 struct libsystemd_service
@@ -68,7 +69,7 @@ struct libsystemd_service
     Dmod_Pid_t pid;                     //!< PID of the process currently tracked for this unit, or <= 0 if never started/not running.
     Dmod_Pid_t last_pid;                //!< PID of the most recent run, retained after `pid` is released so status can tell "never started" from "exited"; <= 0 only if the unit has never run.
     dmosi_process_exit_callback_handle_t exit_callback_handle;  //!< Handle of the dmosi exit callback registered for the current run (see libsystemd_attach_exit_callback()), or NULL if none is registered (not currently running, or registration failed/unsupported).
-    char* source;                       //!< Mount point whose configuration directory the unit (or its template) comes from (see libsystemd_add_config_dir()), or NULL for the units directory of libsystemd_scan(). Owned copy.
+    char* source;                       //!< Mount point whose configuration directory the unit (or its template) comes from (see libsystemd_add_config_dir()), or NULL for the units directory of libsystemd_core_scan(). Owned copy.
 };
 
 /**
@@ -102,17 +103,17 @@ struct libsystemd_services
 };
 
 /**
- * @brief Global service registry populated by libsystemd_scan()
+ * @brief Global service registry populated by libsystemd_core_scan()
  *
  * Owns every `libsystemd_service_t` currently known to this module instance.
  * Allocated by libsystemd_serviceapi_init() (called automatically from dmod_init()
- * when the module is loaded), repopulated on every successful libsystemd_scan(),
+ * when the module is loaded), repopulated on every successful libsystemd_core_scan(),
  * and released by libsystemd_serviceapi_deinit() (called automatically from
  * dmod_deinit() when the module is unloaded).
  *
  * NULL before the module has finished initializing, or after it has been
- * deinitialized - every API entry point that reads it (libsystemd_start_service(),
- * libsystemd_stop_service(), libsystemd_status(), libsystemd_list()) tolerates that and
+ * deinitialized - every API entry point that reads it (libsystemd_core_start_service(),
+ * libsystemd_core_stop_service(), libsystemd_core_status(), libsystemd_core_list()) tolerates that and
  * reports "not found" rather than crashing.
  *
  * @note This module is not designed for concurrent access from multiple
@@ -123,64 +124,64 @@ struct libsystemd_services
 static libsystemd_services_t g_services = NULL;
 
 /**
- * @brief Units directory of the last successful libsystemd_scan(), or NULL
+ * @brief Units directory of the last successful libsystemd_core_scan(), or NULL
  *
- * Remembered purely so libsystemd_start_service() can resolve an on-demand
+ * Remembered purely so libsystemd_core_start_service() can resolve an on-demand
  * template instance (e.g. "getty@tty1", with no matching file ever having
  * been scanned) by looking for "<prefix>@.ini" in the same directory - see
  * libsystemd_instantiate_service_on_demand(). NULL before the first
- * successful libsystemd_scan(), or after libsystemd_serviceapi_deinit().
+ * successful libsystemd_core_scan(), or after libsystemd_serviceapi_deinit().
  */
 static char* g_units_dir = NULL;
 
 /**
- * @brief One device-class rule loaded by libsystemd_load_rules(), e.g. from `[class=tty]` / `start=getty@%name`
+ * @brief One device-class rule loaded by libsystemd_core_load_rules(), e.g. from `[class=tty]` / `start=getty@%name`
  */
 typedef struct
 {
     char* class_name;      //!< Device class this rule applies to (the part after "class=" in its `[class=...]` section name). Owned copy.
     char* start_template;  //!< Value of that section's "start" key (started when a device of the class appears), with "%name" substituted for the device name at match time, or NULL. Owned copy.
-    char* remove_template; //!< Value of that section's "remove" key (started when a device of the class goes away - see libsystemd_notify_device_removed()), "%name" substituted as above, or NULL. Owned copy.
+    char* remove_template; //!< Value of that section's "remove" key (started when a device of the class goes away - see libsystemd_core_notify_device_removed()), "%name" substituted as above, or NULL. Owned copy.
     char* source;          //!< Mount point of the configuration directory it comes from, or NULL (see libsystemd_service::source). Owned copy.
 } libsystemd_rule_t;
 
 /**
- * @brief Device-class rules loaded by the last successful libsystemd_load_rules(), or NULL
+ * @brief Device-class rules loaded by the last successful libsystemd_core_load_rules(), or NULL
  *
  * A plain dmlist of `libsystemd_rule_t*` entries (unlike @ref g_services,
  * there is no need for a public opaque wrapper type - rules are never handed
- * back to callers, only matched internally by libsystemd_notify_device_added()/
- * libsystemd_notify_device_removed()). NULL before the first successful
- * libsystemd_load_rules(), or after libsystemd_serviceapi_deinit().
+ * back to callers, only matched internally by libsystemd_core_notify_device_added()/
+ * libsystemd_core_notify_device_removed()). NULL before the first successful
+ * libsystemd_core_load_rules(), or after libsystemd_serviceapi_deinit().
  */
 static dmlist_context_t* g_rules = NULL;
 
 /**
- * @brief One device reported via libsystemd_notify_device_added() and not yet removed
+ * @brief One device reported via libsystemd_core_notify_device_added() and not yet removed
  */
 typedef struct
 {
-    char* device_class;  //!< Device class as reported to libsystemd_notify_device_added(). Owned copy.
-    char* device_name;   //!< Device name as reported to libsystemd_notify_device_added(). Owned copy.
-    char* user_value;    //!< Value as reported to libsystemd_notify_device_added(), substituted for `%v` on instantiation, or NULL if none was given. Owned copy.
+    char* device_class;  //!< Device class as reported to libsystemd_core_notify_device_added(). Owned copy.
+    char* device_name;   //!< Device name as reported to libsystemd_core_notify_device_added(). Owned copy.
+    char* user_value;    //!< Value as reported to libsystemd_core_notify_device_added(), substituted for `%v` on instantiation, or NULL if none was given. Owned copy.
 } libsystemd_device_t;
 
 /**
- * @brief Currently-known devices reported via libsystemd_notify_device_added(), or NULL
+ * @brief Currently-known devices reported via libsystemd_core_notify_device_added(), or NULL
  *
  * Drivers are typically loaded (and start reporting devices) before
- * libsystemd_scan()/libsystemd_load_rules() ever run, so
- * libsystemd_notify_device_added() cannot assume a matching rule - or even a
+ * libsystemd_core_scan()/libsystemd_core_load_rules() ever run, so
+ * libsystemd_core_notify_device_added() cannot assume a matching rule - or even a
  * units directory to resolve a template instance against - exists yet at the
  * time it is called. Every reported device is remembered here
  * (libsystemd_remember_device(), deduplicated by (class, name)) regardless of
  * whether it could be started immediately, and forgotten again
- * (libsystemd_forget_device()) by a matching libsystemd_notify_device_removed().
- * Both libsystemd_scan() and libsystemd_load_rules() replay every entry still
+ * (libsystemd_forget_device()) by a matching libsystemd_core_notify_device_removed().
+ * Both libsystemd_core_scan() and libsystemd_core_load_rules() replay every entry still
  * here against the current rules/units state afterwards
  * (libsystemd_replay_pending_devices()), so a device reported before either
  * one ran still ends up started once both are in place, regardless of call
- * order. NULL until the first libsystemd_notify_device_added() call, or after
+ * order. NULL until the first libsystemd_core_notify_device_added() call, or after
  * libsystemd_serviceapi_deinit().
  */
 static dmlist_context_t* g_devices = NULL;
@@ -198,7 +199,7 @@ static dmlist_context_t* g_devices = NULL;
  *
  * Added by libsystemd_add_config_dir() and removed by libsystemd_remove_config_dir() -
  * when a file system is mounted or unmounted (see the _mount_changed dif). Kept so
- * that a full reload (libsystemd_scan(), libsystemd_load_rules()) loads their units
+ * that a full reload (libsystemd_core_scan(), libsystemd_core_load_rules()) loads their units
  * and rules again instead of dropping them.
  */
 static dmlist_context_t* g_config_dirs = NULL;
@@ -217,6 +218,25 @@ static dmlist_context_t* g_config_dirs = NULL;
  * units). The fields of one service (pid, ...) are not guarded by it.
  */
 static dmosi_mutex_t g_registry_lock = NULL;
+
+/*
+ * The API of libsystemd.h is offered by the module libsystemd, which passes the calls on to the dif implemented at the end of
+ * this file. The functions it calls are defined further on.
+ */
+int libsystemd_core_start_service(const char* unit_name, const char* user_value);
+int libsystemd_core_stop_service(const char* unit_name);
+int libsystemd_core_notify_main_pid(const char* unit_name, Dmod_Pid_t pid);
+int libsystemd_core_set_stop_semaphore(dmosi_semaphore_t wakeup);
+bool libsystemd_core_stop_requested(void);
+int libsystemd_core_status(const char* unit_name, libsystemd_service_status_t* out_status);
+int libsystemd_core_list(libsystemd_visitor_t visitor, void* user_ptr);
+int libsystemd_core_scan(const char* path);
+int libsystemd_core_parse_file(const char* file_path, libsystemd_service_t* service);
+int libsystemd_core_parse_dir(const char* dir_path, libsystemd_services_t* services);
+int libsystemd_core_load_rules(const char* rules_dir);
+int libsystemd_core_notify_device_added(const char* device_class, const char* device_name, const char* user_value);
+int libsystemd_core_notify_device_removed(const char* device_class, const char* device_name);
+void libsystemd_core_mount_changed(const char* mount_point, bool mounted);
 
 static void libsystemd_lock(void)
 {
@@ -261,7 +281,7 @@ typedef struct
 } libsystemd_pass_ctx_t;
 
 /**
- * @brief Closure passed to libsystemd_list_visitor() while walking the service list for libsystemd_list()
+ * @brief Closure passed to libsystemd_list_visitor() while walking the service list for libsystemd_core_list()
  */
 typedef struct
 {
@@ -324,7 +344,7 @@ static void libsystemd_destroy_name_list(dmlist_context_t* list)
  * @par Example
  * @code
  * libsystemd_service_t service = NULL;
- * if (libsystemd_parse_file("/etc/services/foo.ini", &service) != 0) {
+ * if (libsystemd_core_parse_file("/etc/services/foo.ini", &service) != 0) {
  *     // parsing failed, nothing to destroy
  * } else if (some_validation_failed) {
  *     libsystemd_destroy_service(service);
@@ -380,12 +400,12 @@ static void libsystemd_destroy_service(libsystemd_service_t service)
  *
  * @note This does **not** stop any running processes associated with the
  *       services first - see libsystemd_stop_all_services(), which callers such
- *       as libsystemd_serviceapi_deinit() and libsystemd_scan() call beforehand.
+ *       as libsystemd_serviceapi_deinit() and libsystemd_core_scan() call beforehand.
  *
  * @par Example
  * @code
  * libsystemd_services_t parsed = NULL;
- * libsystemd_parse_dir("/etc/services", &parsed);
+ * libsystemd_core_parse_dir("/etc/services", &parsed);
  * // ... use parsed ...
  * libsystemd_destroy_services(parsed);
  * @endcode
@@ -542,9 +562,9 @@ static int libsystemd_compare_device(const void* data1, const void* data2)
  * that reports the same device more than once does not grow the registry
  * unbounded. Best-effort: if @ref g_devices cannot be created, or the new
  * entry cannot be allocated/pushed, the device is simply not remembered -
- * this does not fail the caller's libsystemd_notify_device_added(), it only
- * means the device will not be retried by a later libsystemd_scan()/
- * libsystemd_load_rules() call.
+ * this does not fail the caller's libsystemd_core_notify_device_added(), it only
+ * means the device will not be retried by a later libsystemd_core_scan()/
+ * libsystemd_core_load_rules() call.
  *
  * @param device_class Device class to remember (must not be NULL).
  * @param device_name  Device name to remember (must not be NULL).
@@ -598,9 +618,9 @@ static void libsystemd_remember_device(const char* device_class, const char* dev
 /**
  * @brief Forget a device previously remembered by libsystemd_remember_device()
  *
- * Called from libsystemd_notify_device_removed() so a device that is gone
- * for good is not resurrected by some later libsystemd_scan()/
- * libsystemd_load_rules() replay pass. A no-op if @ref g_devices is NULL or
+ * Called from libsystemd_core_notify_device_removed() so a device that is gone
+ * for good is not resurrected by some later libsystemd_core_scan()/
+ * libsystemd_core_load_rules() replay pass. A no-op if @ref g_devices is NULL or
  * the (class, name) pair was never remembered (e.g. it was reported, matched
  * a rule and started immediately, and is now being removed - it was still
  * remembered in that case too, so this covers it either way).
@@ -661,7 +681,7 @@ static int libsystemd_compare_by_unit_name(const void* data1, const void* data2)
  * @brief dmlist_find() comparator matching a service by its current main PID
  *
  * Counterpart of libsystemd_compare_by_unit_name() for the one lookup that
- * cannot go by name: libsystemd_notify_main_pid() called with a NULL unit
+ * cannot go by name: libsystemd_core_notify_main_pid() called with a NULL unit
  * name, where the caller identifies itself simply by being the unit's current
  * main process (see libsystemd_find_service_by_pid()).
  *
@@ -692,7 +712,7 @@ static int libsystemd_compare_by_pid(const void* data1, const void* data2)
  *
  * Intended for use with dmlist_sort(), which sorts ascending - services with
  * a smaller starting_order end up earlier in the list, which is exactly what
- * libsystemd_scan() relies on when it starts services in list order.
+ * libsystemd_core_scan() relies on when it starts services in list order.
  *
  * @param data1 First service, actually a `libsystemd_service_t` (`const struct libsystemd_service*`).
  * @param data2 Second service, actually a `libsystemd_service_t` (`const struct libsystemd_service*`).
@@ -702,7 +722,7 @@ static int libsystemd_compare_by_pid(const void* data1, const void* data2)
  * @retval >0 `data1` should be started after `data2`.
  *
  * @note Not meant to be called directly - pass it as the `compare_func`
- *       argument to dmlist_sort(), as done in libsystemd_scan().
+ *       argument to dmlist_sort(), as done in libsystemd_core_scan().
  */
 static int libsystemd_compare_by_starting_order(const void* data1, const void* data2)
 {
@@ -722,7 +742,7 @@ static int libsystemd_compare_by_starting_order(const void* data1, const void* d
  *
  * @note The returned pointer is borrowed from the registry - it stays valid
  *       until the registry is replaced/destroyed (e.g. by the next
- *       libsystemd_scan()), and must not be freed by the caller.
+ *       libsystemd_core_scan()), and must not be freed by the caller.
  *
  * @par Example
  * @code
@@ -748,7 +768,7 @@ static libsystemd_service_t libsystemd_find_service(libsystemd_services_t servic
 /**
  * @brief Look up a service in a registry by the PID it is currently tracking
  *
- * Used by libsystemd_notify_main_pid() to resolve "the unit the caller is the
+ * Used by libsystemd_core_notify_main_pid() to resolve "the unit the caller is the
  * main process of" without making every launcher unit thread its own unit name
  * through its argv - see that function.
  *
@@ -910,8 +930,8 @@ static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_s
  * callback is also what clears `service->pid` back to the "not running"
  * sentinel when a process exits on its own (see libsystemd_service_exit_callback()).
  * Without it, a `restart=no` unit kept a stale PID forever, so
- * libsystemd_status() reported a corpse as running and a later
- * libsystemd_stop_service() aimed dmosi_process_kill() at an ID that no longer
+ * libsystemd_core_status() reported a corpse as running and a later
+ * libsystemd_core_stop_service() aimed dmosi_process_kill() at an ID that no longer
  * belonged to it.
  *
  * Best-effort: silently does nothing if the PID no longer resolves, or if
@@ -924,7 +944,7 @@ static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_s
  *
  * @note Overwrites `service->exit_callback_handle` without unregistering a
  *       previous registration; callers that may already have one (e.g.
- *       libsystemd_notify_main_pid()) must detach it first.
+ *       libsystemd_core_notify_main_pid()) must detach it first.
  */
 static void libsystemd_attach_exit_callback(libsystemd_service_t service)
 {
@@ -944,7 +964,7 @@ static void libsystemd_attach_exit_callback(libsystemd_service_t service)
  *
  * Counterpart of libsystemd_attach_exit_callback(), shared by
  * libsystemd_stop_service_internal() (which must not let a "restart" policy
- * respawn a deliberately stopped unit) and libsystemd_notify_main_pid() (which
+ * respawn a deliberately stopped unit) and libsystemd_core_notify_main_pid() (which
  * moves supervision from the launcher process to the one it spawned).
  *
  * @param service Service to detach the callback from (must not be NULL).
@@ -1046,9 +1066,9 @@ static int libsystemd_stop_library_service_internal(libsystemd_service_t service
 /**
  * @brief Actually spawn a service's process, without looking it up by name first
  *
- * Shared by libsystemd_start_service() (which looks the service up by unit name
+ * Shared by libsystemd_core_start_service() (which looks the service up by unit name
  * first) and libsystemd_start_service_visitor() (which already has a direct
- * pointer while walking the registry in libsystemd_scan()), so the spawn logic
+ * pointer while walking the registry in libsystemd_core_scan()), so the spawn logic
  * itself lives in exactly one place. Also the sole place that (re-)registers
  * the restart-supervision exit callback, so an automatic restart
  * (libsystemd_service_exit_callback()) is supervised exactly the same way as
@@ -1062,14 +1082,14 @@ static int libsystemd_stop_library_service_internal(libsystemd_service_t service
  * `Dmod_SpawnModule()` - see the comment at its call site), passing
  * `service->argc`/`service->argv` and, if any stream redirections were parsed,
  * `&service->streams`. On success, records the returned PID in `service->pid`
- * so later libsystemd_stop_service()/libsystemd_status() calls can find the process.
+ * so later libsystemd_core_stop_service()/libsystemd_core_status() calls can find the process.
  *
  * Also registers libsystemd_service_exit_callback() on the newly spawned
  * process via libsystemd_attach_exit_callback(), so the unit's PID is released
  * when that process exits on its own and - if `service->restart_policy` calls
  * for it - the unit is restarted. See libsystemd_stop_service_internal() for
  * how a *deliberate* stop avoids triggering the restart, and
- * libsystemd_notify_main_pid() for how a launcher unit hands supervision over
+ * libsystemd_core_notify_main_pid() for how a launcher unit hands supervision over
  * to the process it spawned.
  *
  * @param service Service to start (must not be NULL).
@@ -1100,7 +1120,7 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
 
     // Dmod_RunModuleDetached(), not Dmod_SpawnModule(): the latter parents the new
     // process under whoever calls it (here, whichever unit's process happens to be
-    // running libsystemd_scan()/_notify_device_added() at the time - typically
+    // running libsystemd_core_scan()/_notify_device_added() at the time - typically
     // `systemd` itself during the initial boot pass). Every spawned module's main()
     // returning triggers Dmod_Exit() -> dmosi_process_kill() on itself, which
     // recursively kills its *entire* parented subtree - so a unit spawned via
@@ -1128,7 +1148,7 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
  *
  * Registered on every process a unit currently tracks (see
  * libsystemd_attach_exit_callback()), and unregistered before a deliberate
- * libsystemd_stop_service() kill (libsystemd_stop_service_internal()) - so this
+ * libsystemd_core_stop_service() kill (libsystemd_stop_service_internal()) - so this
  * only ever runs for a process that terminated on its own, never for one this
  * module killed itself. Releasing `service->pid` here is what keeps a
  * `restart=no` unit from carrying a stale PID once its process is gone.
@@ -1150,7 +1170,7 @@ static int libsystemd_start_service_internal(libsystemd_service_t service)
  *
  * @note Invoked from whatever context the dmosi backend detects process
  *       termination in, not necessarily the thread that called
- *       libsystemd_scan()/libsystemd_start_service()/libsystemd_stop_service().
+ *       libsystemd_core_scan()/libsystemd_core_start_service()/libsystemd_core_stop_service().
  *       Like the rest of this module (see @ref g_services), no locking is done
  *       here - a caller enabling "restart" from a multi-threaded environment
  *       must serialize its own calls into this module's API.
@@ -1189,7 +1209,7 @@ static void libsystemd_service_exit_callback(dmosi_process_t process, int exit_s
 /**
  * @brief dmlist_foreach() visitor that starts one service, logging (but not propagating) failures
  *
- * Used by libsystemd_scan() to start every service in the freshly sorted
+ * Used by libsystemd_core_scan() to start every service in the freshly sorted
  * registry in order. Failures are logged via DMOD_LOG_WARN() and otherwise
  * ignored, so one misconfigured/missing service does not prevent the rest of
  * the registry from starting.
@@ -1248,7 +1268,7 @@ static bool libsystemd_wait_for_exit(dmosi_process_id_t pid, uint32_t timeout_ms
  * @brief Ask a service's process to exit on its own, through a stop request
  *
  * Skipped (returns false at once) when the unit's `stop_timeout_ms` is 0, when
- * the process did not register with libsystemd_set_stop_semaphore(), and
+ * the process did not register with libsystemd_core_set_stop_semaphore(), and
  * when the process is the caller itself - waiting for our own exit could only
  * ever time out.
  *
@@ -1283,24 +1303,24 @@ static bool libsystemd_request_graceful_stop(libsystemd_service_t service)
 /**
  * @brief Actually stop a service's process, without looking it up by name first
  *
- * Shared by libsystemd_stop_service() (which looks the service up by unit name
+ * Shared by libsystemd_core_stop_service() (which looks the service up by unit name
  * first) and libsystemd_stop_all_services_visitor() (which already has a direct
  * pointer while walking a registry that is about to be replaced/torn down).
  *
  * Resolves `service->pid` to a live `dmosi_process_t`. If that process
- * registered for stop requests (libsystemd_set_stop_semaphore()), it is asked
+ * registered for stop requests (libsystemd_core_set_stop_semaphore()), it is asked
  * to exit on its own first and given up to the unit's `stop_timeout_ms`
  * (libsystemd_request_graceful_stop()) - this blocks the caller for at most
  * that long. Otherwise, or if it does not exit in time, it is killed via
  * `dmosi_process_kill()`. Always clears `service->pid` back to the "not
  * running" sentinel (-1) once the process is confirmed gone or killed, so a
- * subsequent libsystemd_start_service() call is never blocked by stale state.
+ * subsequent libsystemd_core_start_service() call is never blocked by stale state.
  *
  * If a restart-supervision exit callback is currently registered for this
  * service (see libsystemd_start_service_internal()), unregisters it *before*
  * killing the process - otherwise a "restart=always"/"restart=on-failure"
  * unit would immediately respawn itself in response to this deliberate stop,
- * which is never the intent of an explicit libsystemd_stop_service() call.
+ * which is never the intent of an explicit libsystemd_core_stop_service() call.
  *
  * @param service Service to stop (must not be NULL).
  *
@@ -1371,7 +1391,7 @@ static int libsystemd_stop_service_internal(libsystemd_service_t service)
  * @brief dmlist_foreach() visitor that stops one service if it currently looks like it is running
  *
  * Used by libsystemd_stop_all_services() to shut down every service in a
- * registry that is about to be discarded (a rescan via libsystemd_scan(), or
+ * registry that is about to be discarded (a rescan via libsystemd_core_scan(), or
  * module teardown via libsystemd_serviceapi_deinit()). Failures are ignored -
  * there is no registry left afterwards to report status through, and the
  * registry is being destroyed regardless.
@@ -1408,7 +1428,7 @@ static bool libsystemd_stop_all_services_visitor(void* data, void* user_data)
  *
  * @return Nothing.
  *
- * @note Called before a registry is discarded (see libsystemd_scan() and
+ * @note Called before a registry is discarded (see libsystemd_core_scan() and
  *       libsystemd_serviceapi_deinit()) so that replacing/unloading the service
  *       list never leaves orphaned, untracked processes running.
  *
@@ -1432,11 +1452,11 @@ static void libsystemd_stop_all_services(libsystemd_services_t services)
 /**
  * @brief Compute a service's current status from its tracked PID
  *
- * Shared by libsystemd_status() and libsystemd_list_visitor() so both report status
+ * Shared by libsystemd_core_status() and libsystemd_list_visitor() so both report status
  * identically. If the service has never been started (`last_pid <= 0`), reports
  * `DMOSI_PROCESS_STATE_CREATED` with a PID of 0. If it ran but its process is
  * gone - whether it exited on its own or was stopped through
- * libsystemd_stop_service() - reports `DMOSI_PROCESS_STATE_TERMINATED` with the
+ * libsystemd_core_stop_service() - reports `DMOSI_PROCESS_STATE_TERMINATED` with the
  * last known PID. Otherwise reports the live process's actual state and PID.
  *
  * A ::LIBSYSTEMD_SERVICE_TYPE_LIBRARY unit has no process/PID at all - its
@@ -1508,7 +1528,7 @@ static void libsystemd_fill_status(libsystemd_service_t service, libsystemd_serv
  * Builds a `libsystemd_service_info_t` (unit name, description, type, restart
  * policy and status, via libsystemd_fill_status()) for the current service and
  * forwards it to the user's visitor, propagating whatever the visitor returns
- * so libsystemd_list() can be stopped early exactly like dmlist_foreach()
+ * so libsystemd_core_list() can be stopped early exactly like dmlist_foreach()
  * itself supports.
  *
  * @param data      Service being visited, actually a `libsystemd_service_t`.
@@ -2066,7 +2086,7 @@ static char* libsystemd_build_unit_name(const char* prefix, const char* instance
  * The mount point the unit's configuration directory is on, without a
  * trailing '/', so "%m/bin/app.dmfc" is a path on that file system:
  * "/mnt/SD" for a unit from /mnt/SD/cfg/services, "" for one from the root
- * file system or from the units directory of libsystemd_scan() (@p source NULL).
+ * file system or from the units directory of libsystemd_core_scan() (@p source NULL).
  * Only the first libsystemd_mount_specifier_length() characters count.
  *
  * @param source Mount point (libsystemd_service::source), or NULL.
@@ -2152,7 +2172,7 @@ static char* libsystemd_substitute_mount_specifier(const char* value, const char
  *
  * Recognized specifiers: `%i`/`%I` (instance name), `%p` (template prefix),
  * `%n` (full instantiated unit name, "<prefix>@<instance>"), `%v` (caller-supplied
- * user value, see @ref libsystemd_notify_device_added/@ref libsystemd_start_service),
+ * user value, see @ref libsystemd_core_notify_device_added/@ref libsystemd_core_start_service),
  * `%m` (mount point the unit's configuration directory is on, see
  * libsystemd_mount_specifier_value()), `%%` (a literal `%`). An unrecognized
  * `%<char>` sequence (or a trailing `%` at the end of the string) is copied
@@ -2648,7 +2668,7 @@ static bool libsystemd_split_instance_name(const char* unit_name, char** out_pre
  * @brief Synthesize a service purely from a template, with no on-disk instance file
  *
  * Parses `<units_dir>/<prefix>@.ini` and expands `%i`/`%I`/`%p`/`%n`/`%v`/`%%`
- * for the given @p instance, exactly like libsystemd_parse_dir() would for an
+ * for the given @p instance, exactly like libsystemd_core_parse_dir() would for an
  * on-disk instance file - the difference is that no such file needs to
  * exist. This is the "systemctl start foo@bar" analog: unlike the directory
  * scan (which only starts instances that already have their own `*.ini`
@@ -2733,18 +2753,18 @@ static int libsystemd_instantiate_from_template(const char* units_dir, const cha
 /**
  * @brief Resolve a unit name that was not found in @ref g_services as an on-demand template instance
  *
- * Called from libsystemd_start_service() when @p unit_name isn't already
+ * Called from libsystemd_core_start_service() when @p unit_name isn't already
  * registered. If @p unit_name is "<prefix>@<instance>"-shaped
  * (libsystemd_split_instance_name()) and a units directory is known (@ref
- * g_units_dir, set by the last successful libsystemd_scan()), looks up
+ * g_units_dir, set by the last successful libsystemd_core_scan()), looks up
  * "<prefix>" in @ref g_services's template registry (populated by
  * libsystemd_parse_dir_walk() with the actual, possibly nested, directory
  * "<prefix>@.ini" was found in - the scan is recursive, so that directory is
  * not necessarily @ref g_units_dir itself) and, if found, instantiates it
  * (libsystemd_instantiate_from_template()) and adds it to @ref g_services so
  * it behaves exactly like any other unit from then on (found by
- * libsystemd_status()/libsystemd_stop_service()/libsystemd_list(), and not
- * re-instantiated on a later libsystemd_start_service() call).
+ * libsystemd_core_status()/libsystemd_core_stop_service()/libsystemd_core_list(), and not
+ * re-instantiated on a later libsystemd_core_start_service() call).
  *
  * @param unit_name  Unit name that was not found by libsystemd_find_service() (must not be NULL).
  * @param user_value Caller-supplied value substituted for `%v` in the template's keys, or NULL.
@@ -2828,15 +2848,15 @@ static int libsystemd_refresh_library_instance(libsystemd_service_t service, con
  * malformed `[class=]` with nothing after "class=" - is silently ignored, as
  * is a `[class=...]` section with no "start" key. A file that fails to parse
  * at all is logged via DMOD_LOG_WARN() and skipped, same as an unparseable
- * unit file in libsystemd_parse_dir().
+ * unit file in libsystemd_core_parse_dir().
  *
  * @param file_path Path to the rules file to parse (must not be NULL).
  * @param source    Mount point the rules come from (libsystemd_rule_t::source), or NULL.
  * @param rules     Registry to append newly parsed rules to (must not be NULL, already created).
  *
  * @return Nothing - failures (parse errors, individual allocation failures)
- *         are non-fatal to the overall libsystemd_load_rules() pass, exactly
- *         like a single bad unit file doesn't abort libsystemd_parse_dir().
+ *         are non-fatal to the overall libsystemd_core_load_rules() pass, exactly
+ *         like a single bad unit file doesn't abort libsystemd_core_parse_dir().
  */
 static void libsystemd_parse_rules_file(const char* file_path, const char* source, dmlist_context_t* rules)
 {
@@ -2980,7 +3000,7 @@ static int libsystemd_parse_rules_dir_walk(const char* rules_dir, const char* so
 /**
  * @brief Parse every ".ini"/".rules" file in a directory tree into a newly allocated rules registry
  *
- * The rules analog of libsystemd_parse_dir(): recursively walks @p rules_dir
+ * The rules analog of libsystemd_core_parse_dir(): recursively walks @p rules_dir
  * (libsystemd_parse_rules_dir_walk()) and calls libsystemd_parse_rules_file()
  * on every entry ending in ".ini" or ".rules" (libsystemd_has_rules_extension())
  * found anywhere in the tree. Any other entry is ignored, same as for a units
@@ -3102,8 +3122,8 @@ static bool libsystemd_collect_matching_rule_targets_visitor(void* data, void* u
  * first match - see libsystemd_collect_matching_rule_targets_visitor()) and,
  * for each one that matches, expands its "start" template's "%name"
  * placeholders with @p device_name (libsystemd_substitute_device_name()).
- * Shared by libsystemd_notify_device_added() and
- * libsystemd_notify_device_removed() - both resolve the exact same set of
+ * Shared by libsystemd_core_notify_device_added() and
+ * libsystemd_core_notify_device_removed() - both resolve the exact same set of
  * target unit names from the same rules, they just do different things with
  * them (start vs. stop).
  *
@@ -3172,9 +3192,9 @@ static int libsystemd_resolve_device_targets(const char* device_class, const cha
  * not logged. A device that *does* resolve but fails to start (e.g. its
  * template still doesn't exist in the current units directory either) is
  * logged, mirroring libsystemd_start_service_visitor()'s handling of a unit
- * that fails to spawn during libsystemd_scan(). `-EALREADY` (the device was
+ * that fails to spawn during libsystemd_core_scan(). `-EALREADY` (the device was
  * already started by an earlier replay pass or a direct
- * libsystemd_notify_device_added() call) is not logged - it is the normal
+ * libsystemd_core_notify_device_added() call) is not logged - it is the normal
  * steady state, not a failure.
  *
  * @param data      Device being retried, actually a `libsystemd_device_t*`.
@@ -3202,7 +3222,7 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
     char* target = (char*)dmlist_pop_front(targets);
     while (target != NULL)
     {
-        result = libsystemd_start_service(target, device->user_value);
+        result = libsystemd_core_start_service(target, device->user_value);
         if (result != 0 && result != -EALREADY)
         {
             DMOD_LOG_WARN("Failed to start '%s' for device (class=%s, name=%s) (%d)\n", target, device->device_class, device->device_name, result);
@@ -3218,13 +3238,13 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
 /**
  * @brief Retry starting every currently-remembered device against the current rules/units state
  *
- * Called at the end of both libsystemd_scan() and libsystemd_load_rules(),
+ * Called at the end of both libsystemd_core_scan() and libsystemd_core_load_rules(),
  * since either one can be what makes a previously-unresolvable device
- * (reported via libsystemd_notify_device_added() before rules were loaded,
+ * (reported via libsystemd_core_notify_device_added() before rules were loaded,
  * or before its template's units directory was scanned) resolvable. A device
  * that resolves and starts successfully stays in @ref g_devices - it is only
- * removed by a matching libsystemd_notify_device_removed() - so a later
- * libsystemd_scan()/libsystemd_load_rules() call simply finds it already
+ * removed by a matching libsystemd_core_notify_device_removed() - so a later
+ * libsystemd_core_scan()/libsystemd_core_load_rules() call simply finds it already
  * running (`-EALREADY`, not logged) and moves on.
  *
  * @return Nothing.
@@ -3271,7 +3291,7 @@ static void libsystemd_replay_pending_devices(void)
  *
  * Idempotent: if @ref g_services is already allocated, returns 0 immediately
  * without touching it. Called automatically by dmod_init() when the module is
- * loaded, and defensively by libsystemd_scan() in case it ever runs before
+ * loaded, and defensively by libsystemd_core_scan() in case it ever runs before
  * dmod_init() (e.g. from a test harness that calls API functions directly).
  *
  * @return 0 on success (including the "already initialized" case), or a
@@ -3344,7 +3364,7 @@ static int libsystemd_serviceapi_init(void)
  * @par Example
  * @code
  * libsystemd_serviceapi_deinit();
- * // g_services is now NULL again; libsystemd_start_service() etc. will report -ENOENT
+ * // g_services is now NULL again; libsystemd_core_start_service() etc. will report -ENOENT
  * @endcode
  */
 static void libsystemd_serviceapi_deinit(void)
@@ -3382,8 +3402,8 @@ static void libsystemd_serviceapi_deinit(void)
  * signature, and the loader calls it once right after loading the module and
  * before running its `main()`. This module uses it to allocate @ref g_services
  * via libsystemd_serviceapi_init(), so the registry is always ready before any
- * of libsystemd_scan()/libsystemd_start_service()/libsystemd_stop_service()/
- * libsystemd_status()/libsystemd_list() can possibly be called.
+ * of libsystemd_core_scan()/libsystemd_core_start_service()/libsystemd_core_stop_service()/
+ * libsystemd_core_status()/libsystemd_core_list() can possibly be called.
  *
  * @param Config Module configuration blob passed by the loader; unused by this module.
  *
@@ -3394,11 +3414,101 @@ static void libsystemd_serviceapi_deinit(void)
  * @note Not meant to be called directly by application code - it is invoked
  *       automatically by the DMOD loader.
  */
+
+/**
+ * @brief The dif of libsystemd.h: what the front (module libsystemd) passes on to the units
+ */
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_start_service, ( const char* unit_name, const char* user_value ))
+{
+    return libsystemd_core_start_service(unit_name, user_value);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_stop_service, ( const char* unit_name ))
+{
+    return libsystemd_core_stop_service(unit_name);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_notify_main_pid, ( const char* unit_name, Dmod_Pid_t pid ))
+{
+    return libsystemd_core_notify_main_pid(unit_name, pid);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_set_stop_semaphore, ( dmosi_semaphore_t wakeup ))
+{
+    return libsystemd_core_set_stop_semaphore(wakeup);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, bool, _impl_stop_requested, ( void ))
+{
+    return libsystemd_core_stop_requested();
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_status, ( const char* unit_name, libsystemd_service_status_t* out_status ))
+{
+    return libsystemd_core_status(unit_name, out_status);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_list, (libsystemd_visitor_t visitor, void* user_ptr))
+{
+    return libsystemd_core_list(visitor, user_ptr);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_scan, (const char* path))
+{
+    return libsystemd_core_scan(path);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_parse_file, ( const char* file_path, libsystemd_service_t* service ))
+{
+    return libsystemd_core_parse_file(file_path, service);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_parse_dir, ( const char* dir_path, libsystemd_services_t* services ))
+{
+    return libsystemd_core_parse_dir(dir_path, services);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_load_rules, (const char* rules_dir))
+{
+    return libsystemd_core_load_rules(rules_dir);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_notify_device_added, (const char* device_class, const char* device_name, const char* user_value))
+{
+    return libsystemd_core_notify_device_added(device_class, device_name, user_value);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, int, _impl_notify_device_removed, (const char* device_class, const char* device_name))
+{
+    return libsystemd_core_notify_device_removed(device_class, device_name);
+}
+
+dmod_libsystemd_dif_api_declaration(1.0, libsystemd_core, void, _impl_mount_changed, (const char* mount_point, bool mounted))
+{
+    libsystemd_core_mount_changed(mount_point, mounted);
+}
+
+static bool g_attached = false;
+
+dmod_libsystemd_core_api_declaration(1.0, bool, _is_ready, (void))
+{
+    return g_attached;
+}
+
 int dmod_init(const Dmod_Config_t* Config)
 {
     (void)Config;
 
-    return libsystemd_serviceapi_init();
+    int result = libsystemd_serviceapi_init();
+    if (result != 0)
+    {
+        return result;
+    }
+
+    // The front (module libsystemd) finds this module when a call comes, or when a service manager asks it to hand over the
+    // reports it kept (libsystemd_deliver_reports()): a module is found once it is enabled, which is after this function.
+    g_attached = true;
+    return result;
 }
 
 /**
@@ -3416,6 +3526,7 @@ int dmod_init(const Dmod_Config_t* Config)
  */
 int dmod_deinit(void)
 {
+    g_attached = false;
     libsystemd_serviceapi_deinit();
 
     return 0;
@@ -3425,7 +3536,7 @@ int dmod_deinit(void)
  * @brief Start a previously scanned service by unit name, instantiating it from a template on demand if needed
  *
  * Looks @p unit_name up in the global registry (@ref g_services, populated by
- * libsystemd_scan()) and, if found, spawns it via libsystemd_start_service_internal().
+ * libsystemd_core_scan()) and, if found, spawns it via libsystemd_start_service_internal().
  *
  * If @p unit_name is not already known, but is "<prefix>@<instance>"-shaped
  * and a matching "<prefix>@.ini" template exists in the last-scanned units
@@ -3433,12 +3544,12 @@ int dmod_deinit(void)
  * (libsystemd_instantiate_service_on_demand()) - this is the
  * `systemctl start foo@bar` analog: an instance does not need its own `*.ini`
  * file to be started, only its template does. The newly instantiated service
- * is added to the registry, so a later libsystemd_status()/
- * libsystemd_stop_service()/libsystemd_list() sees it exactly like any unit
- * that was already on disk at the last libsystemd_scan().
+ * is added to the registry, so a later libsystemd_core_status()/
+ * libsystemd_core_stop_service()/libsystemd_core_list() sees it exactly like any unit
+ * that was already on disk at the last libsystemd_core_scan().
  *
  * @param unit_name  Unit name to start (e.g. "webserver", or "getty@tty1" for
- *                     a template instance), as derived by libsystemd_parse_dir()
+ *                     a template instance), as derived by libsystemd_core_parse_dir()
  *                     from the ini file name, or synthesized as "<prefix>@<instance>".
  * @param user_value Optional caller-supplied value, substituted for `%v` in
  *                     the template's keys if @p unit_name is instantiated
@@ -3459,14 +3570,14 @@ int dmod_deinit(void)
  *
  * @par Example
  * @code
- * libsystemd_scan("/etc/services"); // only has getty@.ini, no getty@tty1.ini
- * int result = libsystemd_start_service("getty@tty1", NULL); // instantiated on the fly
+ * libsystemd_core_scan("/etc/services"); // only has getty@.ini, no getty@tty1.ini
+ * int result = libsystemd_core_start_service("getty@tty1", NULL); // instantiated on the fly
  * if (result != 0) {
  *     Dmod_Printf("failed to start getty@tty1: %d\n", result);
  * }
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_name, const char* user_value ))
+int libsystemd_core_start_service ( const char* unit_name, const char* user_value )
 {
     if (unit_name == NULL)
     {
@@ -3504,13 +3615,13 @@ dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_nam
  *
  * @par Example
  * @code
- * int result = libsystemd_stop_service("webserver");
+ * int result = libsystemd_core_stop_service("webserver");
  * if (result == -ESRCH) {
  *     // webserver was not running
  * }
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name ))
+int libsystemd_core_stop_service ( const char* unit_name )
 {
     if (unit_name == NULL)
     {
@@ -3533,8 +3644,8 @@ dmod_libsystemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name
  * something else up and then exits (dmtty's `console`, which binds a tty's
  * streams and starts `$DMOD_SHELL` on it) must hand its identity over to the
  * process it spawned, or libsystemd would keep tracking the launcher - a PID
- * that is gone moments later. After this call, libsystemd_status() reports the
- * adopted process, libsystemd_stop_service() kills *it*, and its exit (not the
+ * that is gone moments later. After this call, libsystemd_core_status() reports the
+ * adopted process, libsystemd_core_stop_service() kills *it*, and its exit (not the
  * launcher's) is what drives the unit's "restart" policy.
  *
  * The launcher must spawn the adopted process detached
@@ -3569,12 +3680,12 @@ dmod_libsystemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name
  * // inside a launcher unit, after spawning the real payload detached:
  * int pid = Dmod_RunModuleDetached("dmell", 0, NULL, &streams);
  * if (pid > 0) {
- *     libsystemd_notify_main_pid(NULL, (Dmod_Pid_t)pid);
+ *     libsystemd_core_notify_main_pid(NULL, (Dmod_Pid_t)pid);
  * }
  * return 0;   // launcher exits; the unit lives on as the payload
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _notify_main_pid, ( const char* unit_name, Dmod_Pid_t pid ))
+int libsystemd_core_notify_main_pid ( const char* unit_name, Dmod_Pid_t pid )
 {
     if (pid <= 0)
     {
@@ -3650,12 +3761,12 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_main_pid, ( const char* unit_n
  * @par Example
  * @code
  * libsystemd_service_status_t status;
- * if (libsystemd_status("webserver", &status) == 0) {
+ * if (libsystemd_core_status("webserver", &status) == 0) {
  *     Dmod_Printf("webserver pid=%u state=%d\n", status.pid, status.state);
  * }
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _status, ( const char* unit_name, libsystemd_service_status_t* out_status ))
+int libsystemd_core_status ( const char* unit_name, libsystemd_service_status_t* out_status )
 {
     if (unit_name == NULL || out_status == NULL)
     {
@@ -3677,7 +3788,7 @@ dmod_libsystemd_api_declaration(1.0, int, _status, ( const char* unit_name, libs
  * @brief Visit every service currently in the global registry
  *
  * Walks the global registry (@ref g_services) in its current order (the
- * dependency-resolved start order after libsystemd_scan(), unless the registry
+ * dependency-resolved start order after libsystemd_core_scan(), unless the registry
  * is empty/uninitialized) and calls @p visitor once per service with a
  * `libsystemd_service_info_t` describing it, until either the registry is
  * exhausted or @p visitor returns false.
@@ -3698,10 +3809,10 @@ dmod_libsystemd_api_declaration(1.0, int, _status, ( const char* unit_name, libs
  *     return true; // keep going
  * }
  *
- * libsystemd_list(print_service, NULL);
+ * libsystemd_core_list(print_service, NULL);
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, void* user_ptr))
+int libsystemd_core_list (libsystemd_visitor_t visitor, void* user_ptr)
 {
     if (visitor == NULL)
     {
@@ -3726,7 +3837,7 @@ dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, 
  *
  * The full pipeline described for this module:
  * 1. Ensures the registry exists (libsystemd_serviceapi_init(), idempotent).
- * 2. Parses every "*.ini" file in @p path into a fresh registry (libsystemd_parse_dir()).
+ * 2. Parses every "*.ini" file in @p path into a fresh registry (libsystemd_core_parse_dir()).
  * 3. Resolves each service's starting_order from its "requires"/"after"
  *    dependencies (libsystemd_resolve_starting_order()).
  * 4. Sorts the fresh registry by starting_order (dmlist_sort() with
@@ -3736,15 +3847,15 @@ dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, 
  *    never leaves the old generation's processes running untracked.
  * 6. Installs the fresh, sorted registry as the new @ref g_services, and
  *    remembers @p path as @ref g_units_dir for later on-demand template
- *    instantiation (see libsystemd_start_service()) - best-effort, a failure
+ *    instantiation (see libsystemd_core_start_service()) - best-effort, a failure
  *    to remember it does not fail the scan.
  * 7. Starts every service in the new registry, in order
  *    (libsystemd_start_service_visitor() via dmlist_foreach()) - failures for
  *    individual services are logged and do not abort the scan.
  * 8. Retries every still-pending device reported via
- *    libsystemd_notify_device_added() (libsystemd_replay_pending_devices()) -
+ *    libsystemd_core_notify_device_added() (libsystemd_replay_pending_devices()) -
  *    a device reported before this units directory was ever scanned (drivers
- *    are typically loaded before libsystemd_scan() runs) may only now be able
+ *    are typically loaded before libsystemd_core_scan() runs) may only now be able
  *    to resolve its template instance.
  *
  * @param path Directory to scan for "*.ini" unit files (e.g. "/etc/services").
@@ -3754,7 +3865,7 @@ dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, 
  * @retval -EINVAL @p path was NULL.
  * @retval -ENOMEM Registry (re-)initialization or parsing failed to allocate memory.
  * @retval -ENOENT @p path does not exist / cannot be opened.
- * @retval <0      Any other negative value forwarded from libsystemd_parse_dir().
+ * @retval <0      Any other negative value forwarded from libsystemd_core_parse_dir().
  *
  * @note Calling this again later is a full reload: unit files that disappeared
  *       since the last scan are dropped, and every service - even ones whose
@@ -3764,13 +3875,13 @@ dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, 
  *
  * @par Example
  * @code
- * int result = libsystemd_scan("/etc/services");
+ * int result = libsystemd_core_scan("/etc/services");
  * if (result != 0) {
  *     Dmod_Printf("service scan failed: %d\n", result);
  * }
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
+int libsystemd_core_scan (const char* path)
 {
     if (path == NULL)
     {
@@ -3786,7 +3897,7 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
     }
 
     libsystemd_services_t parsed = NULL;
-    result = libsystemd_parse_dir(path, &parsed);
+    result = libsystemd_core_parse_dir(path, &parsed);
     if (result != 0)
     {
         return result;
@@ -3847,17 +3958,17 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
  * start=dhcpd@%name
  * @endcode
  *
- * These rules are consulted by libsystemd_notify_device_added()/
- * libsystemd_notify_device_removed() to turn a `(device_class, device_name)`
+ * These rules are consulted by libsystemd_core_notify_device_added()/
+ * libsystemd_core_notify_device_removed() to turn a `(device_class, device_name)`
  * pair reported at runtime (e.g. by a `dmtty`/`dmdevfs`-style driver) into a
  * unit name to start/stop - "%name" in a "start" template is replaced with
- * the reported device name. This is independent of libsystemd_scan(): rules
+ * the reported device name. This is independent of libsystemd_core_scan(): rules
  * and units are loaded separately.
  *
  * After the new rules are installed, every still-pending device reported via
- * libsystemd_notify_device_added() before now is retried against them
+ * libsystemd_core_notify_device_added() before now is retried against them
  * (libsystemd_replay_pending_devices()) - drivers commonly report devices
- * before libsystemd_load_rules() has ever run (they are typically loaded
+ * before libsystemd_core_load_rules() has ever run (they are typically loaded
  * before services are), so this is what makes a device reported early still
  * end up started once its rule is finally loaded.
  *
@@ -3873,11 +3984,11 @@ dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
  *
  * @par Example
  * @code
- * libsystemd_scan("/etc/dmsystem/units");
- * libsystemd_load_rules("/etc/dmsystem/rules");
+ * libsystemd_core_scan("/etc/dmsystem/units");
+ * libsystemd_core_load_rules("/etc/dmsystem/rules");
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
+int libsystemd_core_load_rules (const char* rules_dir)
 {
     if (rules_dir == NULL)
     {
@@ -3911,20 +4022,20 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
  * @brief Notify libsystemd that a device of a given class appeared, starting every rule that matches it
  *
  * Resolves `(device_class, device_name)` to every target unit name via the
- * rules loaded by the last libsystemd_load_rules() call
+ * rules loaded by the last libsystemd_core_load_rules() call
  * (libsystemd_resolve_device_targets() - not just the first rule that
  * matches @p device_class, since more than one rules file may independently
  * define a `[class=...]` section for the same class) and starts each one
- * (libsystemd_start_service() - which transparently instantiates it from a
+ * (libsystemd_core_start_service() - which transparently instantiates it from a
  * template on demand if it is not already registered, e.g. "getty@tty1" from
  * a "getty@.ini" template).
  *
  * The device is remembered (libsystemd_remember_device()) regardless of
  * whether it could be resolved/started right now - drivers are typically
- * loaded (and start reporting devices) before libsystemd_scan()/
- * libsystemd_load_rules() ever run, so there may be no matching rule, or no
+ * loaded (and start reporting devices) before libsystemd_core_scan()/
+ * libsystemd_core_load_rules() ever run, so there may be no matching rule, or no
  * units directory to resolve a template against, yet. A later
- * libsystemd_scan()/libsystemd_load_rules() call retries it
+ * libsystemd_core_scan()/libsystemd_core_load_rules() call retries it
  * (libsystemd_replay_pending_devices()), so this call's return value only
  * reflects whether the device could be started *right now* - a non-zero
  * result here does not mean the device was dropped.
@@ -3935,7 +4046,7 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
  *                        rule's "start" template (e.g. "tty1") (must not be NULL).
  * @param user_value   Optional caller-supplied value, substituted for `%v` in
  *                        each resolved unit's own template keys if it is
- *                        instantiated on demand (see libsystemd_start_service()) -
+ *                        instantiated on demand (see libsystemd_core_start_service()) -
  *                        pass NULL if not needed. Remembered alongside the
  *                        device so a later replay (see below) still has it.
  *
@@ -3944,10 +4055,10 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
  * @retval -EINVAL @p device_class or @p device_name was NULL.
  * @retval -ENOENT No rules have been loaded yet, no rule currently matches
  *                   @p device_class, or the resolved unit could not be found/
- *                   instantiated yet (see libsystemd_start_service()) - in every
+ *                   instantiated yet (see libsystemd_core_start_service()) - in every
  *                   case, the device is still remembered for a later retry.
  * @retval -ENOMEM Allocation failed while resolving a target or instantiating it.
- * @retval <0      Any other negative value forwarded from libsystemd_start_service() -
+ * @retval <0      Any other negative value forwarded from libsystemd_core_start_service() -
  *                   if more than one rule matched and only some of them failed
  *                   to start, this is the first failure encountered (in
  *                   rule-load order); every matching rule is still attempted
@@ -3955,11 +4066,11 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
  *
  * @par Example
  * @code
- * libsystemd_notify_device_added("tty", "tty1", "/dev/ttyS1"); // no rules loaded yet - remembered, returns -ENOENT
- * libsystemd_load_rules("/etc/dmsystem/rules");  // [class=tty] start=getty@%name - replays it, starts "getty@tty1"
+ * libsystemd_core_notify_device_added("tty", "tty1", "/dev/ttyS1"); // no rules loaded yet - remembered, returns -ENOENT
+ * libsystemd_core_load_rules("/etc/dmsystem/rules");  // [class=tty] start=getty@%name - replays it, starts "getty@tty1"
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* device_class, const char* device_name, const char* user_value))
+int libsystemd_core_notify_device_added (const char* device_class, const char* device_name, const char* user_value)
 {
     if (device_class == NULL || device_name == NULL)
     {
@@ -3981,7 +4092,7 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
     char* target = (char*)dmlist_pop_front(targets);
     while (target != NULL)
     {
-        int target_result = libsystemd_start_service(target, user_value);
+        int target_result = libsystemd_core_start_service(target, user_value);
         if (target_result != 0 && first_error == 0)
         {
             first_error = target_result;
@@ -3998,13 +4109,13 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
  * @brief Notify libsystemd that a device of a given class disappeared, stopping every rule that matches it
  *
  * Resolves `(device_class, device_name)` to every target unit name exactly
- * like libsystemd_notify_device_added() does - the same rules, the same
+ * like libsystemd_core_notify_device_added() does - the same rules, the same
  * "%name" substitution, the same resulting unit names - and stops each one
- * (libsystemd_stop_service()) instead of starting it.
+ * (libsystemd_core_stop_service()) instead of starting it.
  *
  * The device is also forgotten (libsystemd_forget_device()), regardless of
  * whether it could be resolved/stopped right now, so it is not resurrected
- * by some later libsystemd_scan()/libsystemd_load_rules() replay pass (e.g.
+ * by some later libsystemd_core_scan()/libsystemd_core_load_rules() replay pass (e.g.
  * a device added, then removed again before any matching rule was ever
  * loaded, must not still get started once one finally is).
  *
@@ -4026,10 +4137,10 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
  *
  * @par Example
  * @code
- * libsystemd_notify_device_removed("tty", "tty1"); // stops "getty@tty1"
+ * libsystemd_core_notify_device_removed("tty", "tty1"); // stops "getty@tty1"
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* device_class, const char* device_name))
+int libsystemd_core_notify_device_removed (const char* device_class, const char* device_name)
 {
     if (device_class == NULL || device_name == NULL)
     {
@@ -4066,7 +4177,7 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* d
         char* target = (char*)dmlist_pop_front(targets);
         while (target != NULL)
         {
-            int target_result = libsystemd_stop_service(target);
+            int target_result = libsystemd_core_stop_service(target);
             if (target_result != 0 && first_error == 0)
             {
                 first_error = target_result;
@@ -4086,9 +4197,9 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* d
         char* target = (char*)dmlist_pop_front(targets);
         while (target != NULL)
         {
-            int target_result = libsystemd_start_service(target, user_value);
+            int target_result = libsystemd_core_start_service(target, user_value);
             libsystemd_service_status_t status;
-            if (target_result == 0 && libsystemd_status(target, &status) == 0 && status.pid > 0)
+            if (target_result == 0 && libsystemd_core_status(target, &status) == 0 && status.pid > 0)
             {
                 if (!libsystemd_wait_for_exit((dmosi_process_id_t)status.pid, LIBSYSTEMD_REMOVE_WAIT_MS))
                 {
@@ -4173,9 +4284,9 @@ static char* libsystemd_mount_device_name(const char* mount_point)
  * The call comes in the thread that mounts or unmounts. On a mount the configuration comes first, so the device
  * is matched against the rules that came with it. On an unmount the "remove" units are done first (they, and the
  * units a rule started, may still need files of the file system - an unmount does not go on until they are done,
- * see libsystemd_notify_device_removed()), and the units of the configuration directory stop last.
+ * see libsystemd_core_notify_device_removed()), and the units of the configuration directory stop last.
  */
-dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const char* mount_point, bool mounted) )
+void libsystemd_core_mount_changed(const char* mount_point, bool mounted)
 {
     if (mount_point == NULL)
     {
@@ -4198,11 +4309,11 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
         {
             DMOD_LOG_WARN("Cannot load the configuration directory of '%s' (%d)\n", mount_point, result);
         }
-        libsystemd_notify_device_added(LIBSYSTEMD_MOUNT_CLASS, name, mount_point);
+        libsystemd_core_notify_device_added(LIBSYSTEMD_MOUNT_CLASS, name, mount_point);
     }
     else
     {
-        libsystemd_notify_device_removed(LIBSYSTEMD_MOUNT_CLASS, name);
+        libsystemd_core_notify_device_removed(LIBSYSTEMD_MOUNT_CLASS, name);
         libsystemd_remove_config_dir(mount_point);
     }
     Dmod_Free(name);
@@ -4211,9 +4322,9 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
 /**
  * @brief Parse a single ".ini" unit file into a newly allocated service, optionally merged with a template
  *
- * Shared implementation behind both the public libsystemd_parse_file() (which
+ * Shared implementation behind both the public libsystemd_core_parse_file() (which
  * always passes @p template_path/@p prefix/@p instance as NULL - a plain,
- * non-templated parse) and libsystemd_parse_dir()'s handling of
+ * non-templated parse) and libsystemd_core_parse_dir()'s handling of
  * ::LIBSYSTEMD_UNIT_INSTANCE files.
  *
  * When @p template_path is non-NULL, it is parsed into the same `dmini`
@@ -4231,7 +4342,7 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
  * "stdin"/"stdout"/"stderr"/"stdlog" (optional, stream redirections), and
  * "requires"/"after" (optional, dependency name lists) into a fresh
  * `libsystemd_service_t`. Does **not** set `unit_name` or `starting_order` -
- * those are the caller's responsibility (see libsystemd_parse_dir()). Does
+ * those are the caller's responsibility (see libsystemd_core_parse_dir()). Does
  * not touch the global registry.
  *
  * @param file_path     Path to the ".ini" file to parse (must not be NULL).
@@ -4314,7 +4425,7 @@ static int libsystemd_parse_unit_internal(const char* file_path, const char* tem
  *
  * Thin wrapper around libsystemd_parse_unit_internal() with no template - see
  * that function for the full behavior. Kept as the public entry point so
- * templated instance parsing (only reachable from libsystemd_parse_dir(),
+ * templated instance parsing (only reachable from libsystemd_core_parse_dir(),
  * which knows a file's `<prefix>@.ini` template path and instance name)
  * stays an internal implementation detail.
  *
@@ -4333,14 +4444,14 @@ static int libsystemd_parse_unit_internal(const char* file_path, const char* tem
  * @par Example
  * @code
  * libsystemd_service_t service = NULL;
- * int result = libsystemd_parse_file("/etc/services/webserver.ini", &service);
+ * int result = libsystemd_core_parse_file("/etc/services/webserver.ini", &service);
  * if (result == 0) {
  *     // service->exec, service->argc/argv, service->streams, ... are populated
  *     libsystemd_destroy_service(service); // if not handed off to a registry
  * }
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, libsystemd_service_t* service ))
+int libsystemd_core_parse_file ( const char* file_path, libsystemd_service_t* service )
 {
     return libsystemd_parse_unit_internal(file_path, NULL, NULL, NULL, NULL, service);
 }
@@ -4348,10 +4459,10 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, 
 /**
  * @brief Recursively walk one directory, parsing every ".ini" unit file into @p services
  *
- * Worker behind libsystemd_parse_dir(): opens @p dir_path and, for each entry:
+ * Worker behind libsystemd_core_parse_dir(): opens @p dir_path and, for each entry:
  * - a subdirectory (other than "." / "..") is walked recursively, so unit
  *   files may be organized into nested directories under the units directory;
- * - a ".ini" file is parsed exactly as documented on libsystemd_parse_dir().
+ * - a ".ini" file is parsed exactly as documented on libsystemd_core_parse_dir().
  *
  * @param dir_path Directory to scan (recursively).
  * @param source   Mount point the units come from (libsystemd_service::source), or NULL.
@@ -4490,7 +4601,7 @@ static int libsystemd_parse_dir_walk(const char* dir_path, const char* source, l
  * subdirectories that fail to open, are logged via DMOD_LOG_WARN() and
  * skipped rather than aborting the whole scan.
  * Does not resolve `starting_order`, sort, or start anything - see
- * libsystemd_scan() for the full pipeline built on top of this function.
+ * libsystemd_core_scan() for the full pipeline built on top of this function.
  *
  * @param dir_path Directory to scan, recursively (e.g. "/etc/services").
  * @param services Receives the newly allocated registry on success (must not be NULL).
@@ -4509,19 +4620,19 @@ static int libsystemd_parse_dir_walk(const char* dir_path, const char* source, l
  * @par Example
  * @code
  * libsystemd_services_t services = NULL;
- * int result = libsystemd_parse_dir("/etc/services", &services);
+ * int result = libsystemd_core_parse_dir("/etc/services", &services);
  * if (result == 0) {
  *     // services now owns every parsed unit; hand it to g_services or destroy it
  * }
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, libsystemd_services_t* services ))
+int libsystemd_core_parse_dir ( const char* dir_path, libsystemd_services_t* services )
 {
     return libsystemd_parse_dir_from(dir_path, NULL, services);
 }
 
 /**
- * @brief libsystemd_parse_dir() for the units of a mount point's configuration directory
+ * @brief libsystemd_core_parse_dir() for the units of a mount point's configuration directory
  *
  * Every unit and template parsed gets @p source (see libsystemd_service::source),
  * which `%m` expands to.
@@ -4530,7 +4641,7 @@ dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, li
  * @param source   Mount point the units come from, or NULL.
  * @param services Receives the newly allocated registry on success (must not be NULL).
  *
- * @return As libsystemd_parse_dir().
+ * @return As libsystemd_core_parse_dir().
  */
 static int libsystemd_parse_dir_from(const char* dir_path, const char* source, libsystemd_services_t* services)
 {
@@ -4637,7 +4748,7 @@ static bool libsystemd_is_from(const char* source, const char* mount_point)
  * @brief Add the units and templates of `<mount_point>/cfg/services` to @ref g_services, without starting them
  *
  * A unit or template whose name is taken already - by the units directory of
- * libsystemd_scan() or by a mount point loaded before - is logged and ignored:
+ * libsystemd_core_scan() or by a mount point loaded before - is logged and ignored:
  * the first one stays.
  *
  * @retval 0       The directory was read (possibly with no units in it).
@@ -4749,7 +4860,7 @@ static int libsystemd_merge_config_dir_rules(const char* mount_point)
 }
 
 /**
- * @brief Add the units of every loaded configuration directory again - after libsystemd_scan() replaced @ref g_services
+ * @brief Add the units of every loaded configuration directory again - after libsystemd_core_scan() replaced @ref g_services
  */
 static void libsystemd_merge_config_dirs_units(void)
 {
@@ -4761,7 +4872,7 @@ static void libsystemd_merge_config_dirs_units(void)
 }
 
 /**
- * @brief Add the rules of every loaded configuration directory again - after libsystemd_load_rules() replaced @ref g_rules
+ * @brief Add the rules of every loaded configuration directory again - after libsystemd_core_load_rules() replaced @ref g_rules
  */
 static void libsystemd_merge_config_dirs_rules(void)
 {
@@ -4777,7 +4888,7 @@ static void libsystemd_merge_config_dirs_rules(void)
  *
  * Their starting_order is resolved against the whole registry (a unit may come
  * after one of the firmware's), but the registry itself is not reordered - this
- * may run while libsystemd_scan() is walking it (see libsystemd_add_config_dir()).
+ * may run while libsystemd_core_scan() is walking it (see libsystemd_add_config_dir()).
  *
  * @param mount_point Mount point whose units are started.
  */
@@ -4832,8 +4943,8 @@ static void libsystemd_destroy_config_dirs(void)
  *
  * A mount point may have a configuration directory with the same layout as the
  * firmware's own: units in `<mount_point>/cfg/services` and device rules in
- * `<mount_point>/cfg/rules`. They are added to what libsystemd_scan() and
- * libsystemd_load_rules() loaded - nothing is reloaded or restarted - and the
+ * `<mount_point>/cfg/rules`. They are added to what libsystemd_core_scan() and
+ * libsystemd_core_load_rules() loaded - nothing is reloaded or restarted - and the
  * new units are started, in their dependency order. A unit or template whose
  * name is taken already is logged and ignored: the first one stays.
  *
@@ -4846,15 +4957,15 @@ static void libsystemd_destroy_config_dirs(void)
  *
  * Called by the _mount_changed dif when a file system is mounted (libsystemd
  * does not depend on dmvfs). The configuration directory of the root file system
- * is the units directory of libsystemd_scan() itself, so it is not loaded twice.
- * Safe to call from a unit libsystemd_scan() is starting: the units already
+ * is the units directory of libsystemd_core_scan() itself, so it is not loaded twice.
+ * Safe to call from a unit libsystemd_core_scan() is starting: the units already
  * there keep their place, the new ones are appended.
  *
  * @param mount_point Mount point of the file system (e.g. "/mnt/SD").
  *
  * @retval 0         Loaded.
  * @retval -EINVAL   @p mount_point is NULL.
- * @retval -EALREADY Loaded already, or it is the units directory of libsystemd_scan().
+ * @retval -EALREADY Loaded already, or it is the units directory of libsystemd_core_scan().
  * @retval -ENOENT   Neither `cfg/services` nor `cfg/rules` is there - nothing is loaded.
  * @retval -ENOMEM   Allocation failed.
  *

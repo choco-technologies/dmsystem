@@ -1,5 +1,6 @@
 #include "dmod.h"
 #include "libsystemd.h"
+#include "libsystemd_core.h"
 #include <errno.h>
 #include <string.h>
 
@@ -257,6 +258,16 @@ static int cmd_restart(const char* unit_name)
  */
 int main(int argc, char *argv[])
 {
+    // The units are in libsystemd_core (libsystemd only passes the calls on to it)
+    if (!libsystemd_core_is_ready())
+    {
+        Dmod_Printf("%s: libsystemd_core is not loaded\n", (argc > 0) ? argv[0] : "service");
+        return -ENODEV;
+    }
+
+    // What the devices and mounts reported before this point is given to the units now
+    libsystemd_deliver_reports();
+
     if (argc < 2)
     {
         print_usage((argc > 0) ? argv[0] : "service");

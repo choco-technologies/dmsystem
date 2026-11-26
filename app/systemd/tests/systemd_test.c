@@ -1,6 +1,7 @@
 #define DMOD_ENABLE_REGISTRATION ON
 #include "dmod_test.h"
 #include "libsystemd.h"
+#include "libsystemd_core.h"
 #include <errno.h>
 
 /**
@@ -14,5 +15,6 @@
  */
 DMOD_TEST_STEP(links_against_libsystemd_api)
 {
+    DMOD_TEST_EXPECT(libsystemd_core_is_ready());
     DMOD_TEST_EXPECT_EQ(libsystemd_status(NULL, NULL), -EINVAL);
 }

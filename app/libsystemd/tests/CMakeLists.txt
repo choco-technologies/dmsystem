@@ -6,6 +6,7 @@ set(DMOD_PRIORITY           0)
 
 add_subdirectory(stoppable)
 add_subdirectory(lifecycle)
+add_subdirectory(early)
 
 dmod_add_test(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
     libsystemd_test.c
@@ -20,6 +21,7 @@ dmod_link_modules(${DMOD_MODULE_NAME}
 
 target_link_libraries(${DMOD_MODULE_NAME}
     libsystemd_if
+    libsystemd_core_if
     dmtestlibrary_if
     )
 

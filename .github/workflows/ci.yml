@@ -32,9 +32,12 @@ jobs:
           ls -lh build/dmf/
           test -f build/dmf/libsystemd.dmf
           test -f build/dmf/libsystemd_version.txt
+          test -f build/dmf/libsystemd_core.dmf
+          test -f build/dmf/libsystemd_core_version.txt
           test -f build/dmf/systemd.dmf
           test -f build/dmf/service.dmf
           test -f build/dmf/test_libsystemd.dmf
+          test -f build/dmf/test_libsystemd_early.dmf
           test -f build/dmf/test_systemd.dmf
           test -f build/dmf/test_service.dmf
           echo "Module files present"
@@ -47,6 +50,10 @@ jobs:
           # checks that their own build/link wiring against libsystemd works.
           dmf-get -d ./build/dmf/test_libsystemd-local.dmd -y
           dmod_loader build/dmf/test_libsystemd.dmf
+          # test_libsystemd_early needs only the front (libsystemd) and loads libsystemd_core itself, as the boot does
+          dmf-get -d ./build/dmf/libsystemd_core-local.dmd -y
+          dmf-get -d ./build/dmf/test_libsystemd_early-local.dmd -y
+          dmod_loader build/dmf/test_libsystemd_early.dmf
           dmf-get -d ./build/dmf/test_systemd-local.dmd -y
           dmod_loader build/dmf/test_systemd.dmf
           dmf-get -d ./build/dmf/test_service-local.dmd -y

@@ -18,20 +18,15 @@ set(DMOD_MAL_IMPLS          )
 
 #
 #   dmod_add_library - create a library module
-#   it has the same signature as add_library
-#   and can be used in the same way after the creation
-#   (for example, to link libraries)
 #
-# This is a Library (not an Application): it holds the shared unit registry
-# and scan/start/stop/status/list logic, so that it can be enabled as a
-# required module by multiple Application front-ends (systemd, service) and
-# by its own tests - only Library modules can be enabled as a dependency of
-# another module (see Dmod_Enable in the dmod core).
+# libsystemd is the front of the libsystemd API: the whole API (libsystemd.h) and the reports that come before the
+# implementation is there, in a few hundred bytes of code. The implementation (units, rules, supervision) is the module
+# libsystemd_core (../libsystemd_core), which is loaded with the first service manager, implements the dif of libsystemd.h and calls
+# libsystemd_deliver_reports(). Modules that only report devices (dmdevfs, dmtty, ...) need nothing but this one - and it is the one
+# that has to be early in the boot, in the memory that is there then.
 #
 dmod_add_library(${DMOD_MODULE_NAME} ${DMOD_MODULE_VERSION}
-    # List of source files - can include C and C++ files
-    src/serviceapi.c
-    src/stoprequest.c
+    src/libsystemd.c
 )
 
 target_include_directories(${DMOD_MODULE_NAME}_if
@@ -39,11 +34,8 @@ target_include_directories(${DMOD_MODULE_NAME}_if
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         )
 
-# To depend on another module's headers, use:
 # dmfsi: the _mount_changed dif libsystemd implements (reports mounts as device events) - a header only
 dmod_link_modules(${DMOD_MODULE_NAME}
-    dmlist
-    dmini
     dmosi
     dmfsi
 )
