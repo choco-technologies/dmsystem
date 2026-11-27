@@ -20,6 +20,7 @@
 #include <string.h>
 #include "dmosi.h"
 #include "dmfsi.h"
+#include "dmlist.h"
 
 /**
  * @brief What was reported before the implementation was attached
@@ -34,7 +35,6 @@ typedef enum
 
 typedef struct libsystemd_report
 {
-    struct libsystemd_report*   next;
     libsystemd_report_kind_t    kind;
     char*                       device_class;   //!< NULL for a mount
     char*                       name;           //!< device name, or the mount point
@@ -49,9 +49,7 @@ typedef struct libsystemd_report
 static dmosi_mutex_t                g_lock          = NULL;     //!< guards the rest (held while the list or a flag changes, never during a call)
 static bool                         g_ready         = false;    //!< the implementation took the reports: calls are passed on
 static bool                         g_delivering    = false;    //!< the reports are being given to the implementation
-static libsystemd_report_t*         g_head          = NULL;     //!< the reports kept, the oldest first
-static libsystemd_report_t*         g_tail          = NULL;
-static size_t                       g_count         = 0;
+static dmlist_context_t*            g_reports       = NULL;     //!< the reports kept (libsystemd_report_t*), the oldest first
 
 static void lock(void)   { if (g_lock != NULL) { dmosi_mutex_lock(g_lock); } }
 static void unlock(void) { if (g_lock != NULL) { dmosi_mutex_unlock(g_lock); } }
@@ -90,61 +88,47 @@ static libsystemd_report_t* report_create(libsystemd_report_kind_t kind, const c
 /** @brief Take the first report off the list (the lock held), NULL when there is none */
 static libsystemd_report_t* report_pop(void)
 {
-    libsystemd_report_t* report = g_head;
-    if (report != NULL)
-    {
-        g_head = report->next;
-        if (g_head == NULL)
-        {
-            g_tail = NULL;
-        }
-        g_count--;
-        report->next = NULL;
-    }
-    return report;
+    return (libsystemd_report_t*)dmlist_pop_front(g_reports);
 }
 
-static void report_push(libsystemd_report_t* report)
+/** @brief Put the report at the end of the list (the lock held); it is destroyed when there is no room for it */
+static bool report_push(libsystemd_report_t* report)
 {
-    if (g_tail != NULL)
+    if (!dmlist_push_back(g_reports, report))
     {
-        g_tail->next = report;
+        report_destroy(report);
+        return false;
     }
-    else
+    return true;
+}
+
+/** @brief The same kind, class and name (the class is NULL for a mount) - what the list is searched by */
+static int report_compare(const void* a, const void* b)
+{
+    const libsystemd_report_t* x = (const libsystemd_report_t*)a;
+    const libsystemd_report_t* y = (const libsystemd_report_t*)b;
+    if (x->kind != y->kind || strcmp(x->name, y->name) != 0)
     {
-        g_head = report;
+        return 1;
     }
-    g_tail = report;
-    g_count++;
+    if (x->device_class == NULL || y->device_class == NULL)
+    {
+        return (x->device_class == y->device_class) ? 0 : 1;
+    }
+    return strcmp(x->device_class, y->device_class);
 }
 
 /** @brief Find the report of the device in the list (the lock held): the same kind, class and name */
-static libsystemd_report_t** report_find(libsystemd_report_kind_t kind, const char* device_class, const char* name)
+static libsystemd_report_t* report_find(libsystemd_report_kind_t kind, const char* device_class, const char* name)
 {
-    for (libsystemd_report_t** link = &g_head; *link != NULL; link = &(*link)->next)
-    {
-        libsystemd_report_t* report = *link;
-        if (report->kind == kind && strcmp(report->name, name) == 0 && strcmp(report->device_class, device_class) == 0)
-        {
-            return link;
-        }
-    }
-    return NULL;
+    libsystemd_report_t key = { .kind = kind, .device_class = (char*)device_class, .name = (char*)name };
+    return (libsystemd_report_t*)dmlist_find(g_reports, &key, report_compare);
 }
 
-static void report_unlink(libsystemd_report_t** link)
+/** @brief Take the report out of the list and free it (the lock held) */
+static void report_drop(libsystemd_report_t* report)
 {
-    libsystemd_report_t* report = *link;
-    *link = report->next;
-    if (g_tail == report)
-    {
-        g_tail = NULL;
-        for (libsystemd_report_t* last = g_head; last != NULL; last = last->next)
-        {
-            g_tail = last;
-        }
-    }
-    g_count--;
+    dmlist_remove(g_reports, report, report_compare);
     report_destroy(report);
 }
 
@@ -201,10 +185,10 @@ static int device_report_keep(libsystemd_report_kind_t kind, const char* device_
     int result = 0;
     if (kind == LIBSYSTEMD_REPORT_REMOVED)
     {
-        libsystemd_report_t** added = report_find(LIBSYSTEMD_REPORT_ADDED, device_class, name);
+        libsystemd_report_t* added = report_find(LIBSYSTEMD_REPORT_ADDED, device_class, name);
         if (added != NULL)
         {
-            report_unlink(added);
+            report_drop(added);
             unlock();
             return 0;
         }
@@ -215,9 +199,9 @@ static int device_report_keep(libsystemd_report_kind_t kind, const char* device_
         return 0;
     }
 
-    if (g_count >= LIBSYSTEMD_REPORTS_MAX)
+    if (dmlist_size(g_reports) >= LIBSYSTEMD_REPORTS_MAX)
     {
-        DMOD_LOG_WARN("libsystemd: %u reports are kept and nothing takes them - '%s/%s' is lost\n", (unsigned)g_count, device_class, name);
+        DMOD_LOG_WARN("libsystemd: %u reports are kept and nothing takes them - '%s/%s' is lost\n", (unsigned)dmlist_size(g_reports), device_class, name);
         unlock();
         return -ENOMEM;
     }
@@ -227,9 +211,9 @@ static int device_report_keep(libsystemd_report_kind_t kind, const char* device_
     {
         result = -ENOMEM;
     }
-    else
+    else if (!report_push(report))
     {
-        report_push(report);
+        result = -ENOMEM;
     }
     unlock();
     return result;
@@ -303,15 +287,11 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
 
     lock();
     libsystemd_report_t* report = NULL;
-    if (g_count < LIBSYSTEMD_REPORTS_MAX)
+    if (dmlist_size(g_reports) < LIBSYSTEMD_REPORTS_MAX)
     {
         report = report_create(mounted ? LIBSYSTEMD_REPORT_MOUNTED : LIBSYSTEMD_REPORT_UNMOUNTED, NULL, mount_point, NULL);
     }
-    if (report != NULL)
-    {
-        report_push(report);
-    }
-    else
+    if (report == NULL || !report_push(report))
     {
         DMOD_LOG_WARN("libsystemd: the %s of '%s' is lost (no room for the report)\n", mounted ? "mount" : "unmount", mount_point);
     }
@@ -440,8 +420,9 @@ dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
 int dmod_init(const Dmod_Config_t* Config)
 {
     (void)Config;
-    g_lock = dmosi_mutex_create(true);
-    return (g_lock != NULL) ? 0 : -ENOMEM;
+    g_lock    = dmosi_mutex_create(true);
+    g_reports = dmlist_create();
+    return (g_lock != NULL && g_reports != NULL) ? 0 : -ENOMEM;
 }
 
 int dmod_deinit(void)
@@ -454,6 +435,8 @@ int dmod_deinit(void)
         report_destroy(report);
         report = report_pop();
     }
+    dmlist_destroy(g_reports);
+    g_reports = NULL;
     unlock();
     if (g_lock != NULL)
     {
