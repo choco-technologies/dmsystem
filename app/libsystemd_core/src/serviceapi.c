@@ -314,11 +314,11 @@ static void libsystemd_destroy_name_list(dmlist_context_t* list)
         return;
     }
 
-    char* name = (char*)dmlist_pop_front(list);
+    char* name = dmlist_pop_front(list);
     while (name != NULL)
     {
         Dmod_Free(name);
-        name = (char*)dmlist_pop_front(list);
+        name = dmlist_pop_front(list);
     }
 
     dmlist_destroy(list);
@@ -430,14 +430,14 @@ static void libsystemd_destroy_services(libsystemd_services_t services)
 
     if (services->templates != NULL)
     {
-        libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_pop_front(services->templates);
+        libsystemd_template_t* tmpl = dmlist_pop_front(services->templates);
         while (tmpl != NULL)
         {
             Dmod_Free(tmpl->prefix);
             Dmod_Free(tmpl->dir_path);
             Dmod_Free(tmpl->source);
             Dmod_Free(tmpl);
-            tmpl = (libsystemd_template_t*)dmlist_pop_front(services->templates);
+            tmpl = dmlist_pop_front(services->templates);
         }
         dmlist_destroy(services->templates);
     }
@@ -475,7 +475,7 @@ static void libsystemd_destroy_rules(dmlist_context_t* rules)
         return;
     }
 
-    libsystemd_rule_t* rule = (libsystemd_rule_t*)dmlist_pop_front(rules);
+    libsystemd_rule_t* rule = dmlist_pop_front(rules);
     while (rule != NULL)
     {
         Dmod_Free(rule->class_name);
@@ -483,7 +483,7 @@ static void libsystemd_destroy_rules(dmlist_context_t* rules)
         Dmod_Free(rule->remove_template);
         Dmod_Free(rule->source);
         Dmod_Free(rule);
-        rule = (libsystemd_rule_t*)dmlist_pop_front(rules);
+        rule = dmlist_pop_front(rules);
     }
 
     dmlist_destroy(rules);
@@ -503,14 +503,14 @@ static void libsystemd_destroy_devices(dmlist_context_t* devices)
         return;
     }
 
-    libsystemd_device_t* device = (libsystemd_device_t*)dmlist_pop_front(devices);
+    libsystemd_device_t* device = dmlist_pop_front(devices);
     while (device != NULL)
     {
         Dmod_Free(device->device_class);
         Dmod_Free(device->device_name);
         Dmod_Free(device->user_value);
         Dmod_Free(device);
-        device = (libsystemd_device_t*)dmlist_pop_front(devices);
+        device = dmlist_pop_front(devices);
     }
 
     dmlist_destroy(devices);
@@ -635,7 +635,7 @@ static void libsystemd_forget_device(const char* device_class, const char* devic
     libsystemd_lock();
     libsystemd_device_key_t key = { .device_class = device_class, .device_name = device_name };
     libsystemd_device_t* device = (g_devices != NULL)
-        ? (libsystemd_device_t*)dmlist_find(g_devices, &key, libsystemd_compare_device) : NULL;
+        ? dmlist_find(g_devices, &key, libsystemd_compare_device) : NULL;
     if (device != NULL)
     {
         dmlist_remove(g_devices, &key, libsystemd_compare_device);
@@ -2787,7 +2787,7 @@ static libsystemd_service_t libsystemd_instantiate_service_on_demand(const char*
         return NULL;
     }
 
-    libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_find(g_services->templates, prefix, libsystemd_compare_template_by_prefix);
+    libsystemd_template_t* tmpl = dmlist_find(g_services->templates, prefix, libsystemd_compare_template_by_prefix);
     if (tmpl == NULL)
     {
         Dmod_Free(prefix);
@@ -3049,11 +3049,11 @@ static void libsystemd_destroy_targets(dmlist_context_t* targets)
         return;
     }
 
-    char* target = (char*)dmlist_pop_front(targets);
+    char* target = dmlist_pop_front(targets);
     while (target != NULL)
     {
         Dmod_Free(target);
-        target = (char*)dmlist_pop_front(targets);
+        target = dmlist_pop_front(targets);
     }
 
     dmlist_destroy(targets);
@@ -3219,7 +3219,7 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
 
     /* More than one rule may match the same class (see
      * libsystemd_resolve_device_targets()) - replay every one of them. */
-    char* target = (char*)dmlist_pop_front(targets);
+    char* target = dmlist_pop_front(targets);
     while (target != NULL)
     {
         result = libsystemd_core_start_service(target, device->user_value);
@@ -3228,7 +3228,7 @@ static bool libsystemd_replay_device_visitor(void* data, void* user_data)
             DMOD_LOG_WARN("Failed to start '%s' for device (class=%s, name=%s) (%d)\n", target, device->device_class, device->device_name, result);
         }
         Dmod_Free(target);
-        target = (char*)dmlist_pop_front(targets);
+        target = dmlist_pop_front(targets);
     }
     dmlist_destroy(targets);
 
@@ -3262,7 +3262,7 @@ static void libsystemd_replay_pending_devices(void)
     size_t count = (g_devices != NULL) ? dmlist_size(g_devices) : 0;
     for (size_t i = 0; i < count; i++)
     {
-        const libsystemd_device_t* device = (const libsystemd_device_t*)dmlist_get(g_devices, i);
+        const libsystemd_device_t* device = dmlist_get(g_devices, i);
         libsystemd_device_t* copy = Dmod_Malloc(sizeof(libsystemd_device_t));
         if (copy == NULL)
         {
@@ -4089,7 +4089,7 @@ int libsystemd_core_notify_device_added (const char* device_class, const char* d
     }
 
     int first_error = 0;
-    char* target = (char*)dmlist_pop_front(targets);
+    char* target = dmlist_pop_front(targets);
     while (target != NULL)
     {
         int target_result = libsystemd_core_start_service(target, user_value);
@@ -4098,7 +4098,7 @@ int libsystemd_core_notify_device_added (const char* device_class, const char* d
             first_error = target_result;
         }
         Dmod_Free(target);
-        target = (char*)dmlist_pop_front(targets);
+        target = dmlist_pop_front(targets);
     }
     dmlist_destroy(targets);
 
@@ -4155,7 +4155,7 @@ int libsystemd_core_notify_device_removed (const char* device_class, const char*
     {
         libsystemd_device_key_t key = { .device_class = device_class, .device_name = device_name };
         const libsystemd_device_t* device = (g_devices != NULL)
-            ? (const libsystemd_device_t*)dmlist_find(g_devices, &key, libsystemd_compare_device) : NULL;
+            ? dmlist_find(g_devices, &key, libsystemd_compare_device) : NULL;
         if (device != NULL && device->user_value != NULL)
         {
             user_value = Dmod_StrDup(device->user_value);
@@ -4174,7 +4174,7 @@ int libsystemd_core_notify_device_removed (const char* device_class, const char*
     }
     else
     {
-        char* target = (char*)dmlist_pop_front(targets);
+        char* target = dmlist_pop_front(targets);
         while (target != NULL)
         {
             int target_result = libsystemd_core_stop_service(target);
@@ -4183,7 +4183,7 @@ int libsystemd_core_notify_device_removed (const char* device_class, const char*
                 first_error = target_result;
             }
             Dmod_Free(target);
-            target = (char*)dmlist_pop_front(targets);
+            target = dmlist_pop_front(targets);
         }
         dmlist_destroy(targets);
     }
@@ -4194,7 +4194,7 @@ int libsystemd_core_notify_device_removed (const char* device_class, const char*
     targets = NULL;
     if (libsystemd_resolve_device_targets(device_class, device_name, true, &targets) == 0)
     {
-        char* target = (char*)dmlist_pop_front(targets);
+        char* target = dmlist_pop_front(targets);
         while (target != NULL)
         {
             int target_result = libsystemd_core_start_service(target, user_value);
@@ -4213,7 +4213,7 @@ int libsystemd_core_notify_device_removed (const char* device_class, const char*
                               target, device_class, device_name, target_result);
             }
             Dmod_Free(target);
-            target = (char*)dmlist_pop_front(targets);
+            target = dmlist_pop_front(targets);
         }
         dmlist_destroy(targets);
     }
@@ -4787,7 +4787,7 @@ static int libsystemd_merge_config_dir_units(const char* mount_point)
         service = (libsystemd_service_t)dmlist_pop_front(parsed->services);
     }
 
-    libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_pop_front(parsed->templates);
+    libsystemd_template_t* tmpl = dmlist_pop_front(parsed->templates);
     while (tmpl != NULL)
     {
         bool taken = dmlist_find(g_services->templates, tmpl->prefix, libsystemd_compare_template_by_prefix) != NULL;
@@ -4803,7 +4803,7 @@ static int libsystemd_merge_config_dir_units(const char* mount_point)
             Dmod_Free(tmpl->source);
             Dmod_Free(tmpl);
         }
-        tmpl = (libsystemd_template_t*)dmlist_pop_front(parsed->templates);
+        tmpl = dmlist_pop_front(parsed->templates);
     }
 
     libsystemd_destroy_services(parsed);
@@ -4840,7 +4840,7 @@ static int libsystemd_merge_config_dir_rules(const char* mount_point)
         return 0;
     }
 
-    libsystemd_rule_t* rule = (libsystemd_rule_t*)dmlist_pop_front(parsed);
+    libsystemd_rule_t* rule = dmlist_pop_front(parsed);
     while (rule != NULL)
     {
         if (!dmlist_push_back(g_rules, rule))
@@ -4852,7 +4852,7 @@ static int libsystemd_merge_config_dir_rules(const char* mount_point)
             Dmod_Free(rule);
             result = -ENOMEM;
         }
-        rule = (libsystemd_rule_t*)dmlist_pop_front(parsed);
+        rule = dmlist_pop_front(parsed);
     }
     dmlist_destroy(parsed);
 
@@ -4867,7 +4867,7 @@ static void libsystemd_merge_config_dirs_units(void)
     size_t count = (g_config_dirs != NULL) ? dmlist_size(g_config_dirs) : 0;
     for (size_t i = 0; i < count; i++)
     {
-        libsystemd_merge_config_dir_units((const char*)dmlist_get(g_config_dirs, i));
+        libsystemd_merge_config_dir_units(dmlist_get(g_config_dirs, i));
     }
 }
 
@@ -4879,7 +4879,7 @@ static void libsystemd_merge_config_dirs_rules(void)
     size_t count = (g_config_dirs != NULL) ? dmlist_size(g_config_dirs) : 0;
     for (size_t i = 0; i < count; i++)
     {
-        libsystemd_merge_config_dir_rules((const char*)dmlist_get(g_config_dirs, i));
+        libsystemd_merge_config_dir_rules(dmlist_get(g_config_dirs, i));
     }
 }
 
@@ -4928,11 +4928,11 @@ static void libsystemd_destroy_config_dirs(void)
         return;
     }
 
-    char* mount_point = (char*)dmlist_pop_front(g_config_dirs);
+    char* mount_point = dmlist_pop_front(g_config_dirs);
     while (mount_point != NULL)
     {
         Dmod_Free(mount_point);
-        mount_point = (char*)dmlist_pop_front(g_config_dirs);
+        mount_point = dmlist_pop_front(g_config_dirs);
     }
     dmlist_destroy(g_config_dirs);
     g_config_dirs = NULL;
@@ -5066,7 +5066,7 @@ static int libsystemd_remove_config_dir(const char* mount_point)
     }
 
     libsystemd_lock();
-    char* entry = (g_config_dirs != NULL) ? (char*)dmlist_find(g_config_dirs, mount_point, libsystemd_compare_string) : NULL;
+    char* entry = (g_config_dirs != NULL) ? dmlist_find(g_config_dirs, mount_point, libsystemd_compare_string) : NULL;
     if (entry == NULL)
     {
         libsystemd_unlock();
@@ -5092,7 +5092,7 @@ static int libsystemd_remove_config_dir(const char* mount_point)
 
         for (size_t i = dmlist_size(g_services->templates); i-- > 0; )
         {
-            libsystemd_template_t* tmpl = (libsystemd_template_t*)dmlist_get(g_services->templates, i);
+            libsystemd_template_t* tmpl = dmlist_get(g_services->templates, i);
             if (!libsystemd_is_from(tmpl->source, entry))
             {
                 continue;
@@ -5107,7 +5107,7 @@ static int libsystemd_remove_config_dir(const char* mount_point)
 
     for (size_t i = (g_rules != NULL) ? dmlist_size(g_rules) : 0; i-- > 0; )
     {
-        libsystemd_rule_t* rule = (libsystemd_rule_t*)dmlist_get(g_rules, i);
+        libsystemd_rule_t* rule = dmlist_get(g_rules, i);
         if (!libsystemd_is_from(rule->source, entry))
         {
             continue;

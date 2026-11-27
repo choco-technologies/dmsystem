@@ -47,6 +47,7 @@ typedef struct libsystemd_report
 #define LIBSYSTEMD_REPORTS_MAX  64u
 
 static dmosi_mutex_t                g_lock          = NULL;     //!< guards the rest (held while the list or a flag changes, never during a call)
+static Dmod_Context_t*              g_impl          = NULL;     //!< the module that implements the dif (kept while it is valid and enabled)
 static bool                         g_ready         = false;    //!< the implementation took the reports: calls are passed on
 static bool                         g_delivering    = false;    //!< the reports are being given to the implementation
 static dmlist_context_t*            g_reports       = NULL;     //!< the reports kept (libsystemd_report_t*), the oldest first
@@ -88,7 +89,7 @@ static libsystemd_report_t* report_create(libsystemd_report_kind_t kind, const c
 /** @brief Take the first report off the list (the lock held), NULL when there is none */
 static libsystemd_report_t* report_pop(void)
 {
-    return (libsystemd_report_t*)dmlist_pop_front(g_reports);
+    return dmlist_pop_front(g_reports);
 }
 
 /** @brief Put the report at the end of the list (the lock held); it is destroyed when there is no room for it */
@@ -122,7 +123,7 @@ static int report_compare(const void* a, const void* b)
 static libsystemd_report_t* report_find(libsystemd_report_kind_t kind, const char* device_class, const char* name)
 {
     libsystemd_report_t key = { .kind = kind, .device_class = (char*)device_class, .name = (char*)name };
-    return (libsystemd_report_t*)dmlist_find(g_reports, &key, report_compare);
+    return dmlist_find(g_reports, &key, report_compare);
 }
 
 /** @brief Take the report out of the list and free it (the lock held) */
@@ -133,18 +134,32 @@ static void report_drop(libsystemd_report_t* report)
 }
 
 /**
- * @brief The function of the dif the implementation offers, NULL when the calls are not passed on (yet, or any more)
+ * @brief The function of the dif the implementation (libsystemd_core) offers, NULL when there is none
  *
- * The implementation is found when the call comes: a module that is not loaded cannot be called, and the reports are kept again.
+ * The module that implements the dif is kept (g_impl): while its context is valid and the module is enabled, the function is
+ * taken from it. The modules are searched again only when it is not (it was unloaded, or it was not there yet).
  */
 static void* impl_function(const char* signature)
 {
-    Dmod_Context_t* impl = Dmod_GetNextDifModule(signature, NULL);
-    return (impl != NULL) ? Dmod_GetDifFunction(impl, signature) : NULL;
+    lock();
+    Dmod_Context_t* impl = g_impl;
+    unlock();
+
+    void* function = (impl != NULL) ? Dmod_GetDifFunction(impl, signature) : NULL;
+    if (function == NULL)
+    {
+        impl = Dmod_GetNextDifModule(signature, NULL);
+        function = (impl != NULL) ? Dmod_GetDifFunction(impl, signature) : NULL;
+        lock();
+        g_impl = impl;
+        unlock();
+    }
+    return function;
 }
 
 static int deliver_reports(void);
 
+/** @brief The same, but only once the implementation took the reports: before it the calls are kept (or refused) */
 static void* ready_function(const char* signature)
 {
     lock();
@@ -158,6 +173,7 @@ static void* ready_function(const char* signature)
     void* function = impl_function(signature);
     if (function == NULL)
     {
+        // The implementation is gone: what is reported from now on is kept again
         lock();
         g_ready = false;
         unlock();
@@ -233,7 +249,7 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
             // Kept for the implementation: the same answer as "no rule is loaded yet"
             return (kept == 0) ? -ENOENT : kept;
         }
-        dmod_libsystemd_impl_notify_device_added_t function = (dmod_libsystemd_impl_notify_device_added_t)ready_function(dmod_libsystemd_impl_notify_device_added_sig);
+        dmod_libsystemd_impl_notify_device_added_t function = ready_function(dmod_libsystemd_impl_notify_device_added_sig);
         if (function != NULL)
         {
             return function(device_class, device_name, user_value);
@@ -255,7 +271,7 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* d
         {
             return (kept == 0) ? -ENOENT : kept;
         }
-        dmod_libsystemd_impl_notify_device_removed_t function = (dmod_libsystemd_impl_notify_device_removed_t)ready_function(dmod_libsystemd_impl_notify_device_removed_sig);
+        dmod_libsystemd_impl_notify_device_removed_t function = ready_function(dmod_libsystemd_impl_notify_device_removed_sig);
         if (function != NULL)
         {
             return function(device_class, device_name);
@@ -273,7 +289,7 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
         return;
     }
 
-    dmod_libsystemd_impl_mount_changed_t function = (dmod_libsystemd_impl_mount_changed_t)ready_function(dmod_libsystemd_impl_mount_changed_sig);
+    dmod_libsystemd_impl_mount_changed_t function = ready_function(dmod_libsystemd_impl_mount_changed_sig);
     if (function != NULL)
     {
         function(mount_point, mounted);
@@ -315,9 +331,9 @@ static void report_deliver(const libsystemd_sink_t* sink, const libsystemd_repor
 static int deliver_reports(void)
 {
     libsystemd_sink_t sink;
-    sink.added         = (dmod_libsystemd_impl_notify_device_added_t)impl_function(dmod_libsystemd_impl_notify_device_added_sig);
-    sink.removed       = (dmod_libsystemd_impl_notify_device_removed_t)impl_function(dmod_libsystemd_impl_notify_device_removed_sig);
-    sink.mount_changed = (dmod_libsystemd_impl_mount_changed_t)impl_function(dmod_libsystemd_impl_mount_changed_sig);
+    sink.added         = impl_function(dmod_libsystemd_impl_notify_device_added_sig);
+    sink.removed       = impl_function(dmod_libsystemd_impl_notify_device_removed_sig);
+    sink.mount_changed = impl_function(dmod_libsystemd_impl_mount_changed_sig);
     if (sink.added == NULL || sink.removed == NULL || sink.mount_changed == NULL)
     {
         return -ENODEV;
@@ -359,67 +375,67 @@ dmod_libsystemd_api_declaration(1.0, int, _deliver_reports, (void))
  */
 dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_name, const char* user_value ))
 {
-    dmod_libsystemd_impl_start_service_t impl = (dmod_libsystemd_impl_start_service_t)ready_function(dmod_libsystemd_impl_start_service_sig);
+    dmod_libsystemd_impl_start_service_t impl = ready_function(dmod_libsystemd_impl_start_service_sig);
     return (impl != NULL) ? impl(unit_name, user_value) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name ))
 {
-    dmod_libsystemd_impl_stop_service_t impl = (dmod_libsystemd_impl_stop_service_t)ready_function(dmod_libsystemd_impl_stop_service_sig);
+    dmod_libsystemd_impl_stop_service_t impl = ready_function(dmod_libsystemd_impl_stop_service_sig);
     return (impl != NULL) ? impl(unit_name) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _notify_main_pid, ( const char* unit_name, Dmod_Pid_t pid ))
 {
-    dmod_libsystemd_impl_notify_main_pid_t impl = (dmod_libsystemd_impl_notify_main_pid_t)ready_function(dmod_libsystemd_impl_notify_main_pid_sig);
+    dmod_libsystemd_impl_notify_main_pid_t impl = ready_function(dmod_libsystemd_impl_notify_main_pid_sig);
     return (impl != NULL) ? impl(unit_name, pid) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _set_stop_semaphore, ( dmosi_semaphore_t wakeup ))
 {
-    dmod_libsystemd_impl_set_stop_semaphore_t impl = (dmod_libsystemd_impl_set_stop_semaphore_t)ready_function(dmod_libsystemd_impl_set_stop_semaphore_sig);
+    dmod_libsystemd_impl_set_stop_semaphore_t impl = ready_function(dmod_libsystemd_impl_set_stop_semaphore_sig);
     return (impl != NULL) ? impl(wakeup) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, bool, _stop_requested, ( void ))
 {
-    dmod_libsystemd_impl_stop_requested_t impl = (dmod_libsystemd_impl_stop_requested_t)ready_function(dmod_libsystemd_impl_stop_requested_sig);
+    dmod_libsystemd_impl_stop_requested_t impl = ready_function(dmod_libsystemd_impl_stop_requested_sig);
     return (impl != NULL) ? impl() : false;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _status, ( const char* unit_name, libsystemd_service_status_t* out_status ))
 {
-    dmod_libsystemd_impl_status_t impl = (dmod_libsystemd_impl_status_t)ready_function(dmod_libsystemd_impl_status_sig);
+    dmod_libsystemd_impl_status_t impl = ready_function(dmod_libsystemd_impl_status_sig);
     return (impl != NULL) ? impl(unit_name, out_status) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, void* user_ptr))
 {
-    dmod_libsystemd_impl_list_t impl = (dmod_libsystemd_impl_list_t)ready_function(dmod_libsystemd_impl_list_sig);
+    dmod_libsystemd_impl_list_t impl = ready_function(dmod_libsystemd_impl_list_sig);
     return (impl != NULL) ? impl(visitor, user_ptr) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
 {
-    dmod_libsystemd_impl_scan_t impl = (dmod_libsystemd_impl_scan_t)ready_function(dmod_libsystemd_impl_scan_sig);
+    dmod_libsystemd_impl_scan_t impl = ready_function(dmod_libsystemd_impl_scan_sig);
     return (impl != NULL) ? impl(path) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, libsystemd_service_t* service ))
 {
-    dmod_libsystemd_impl_parse_file_t impl = (dmod_libsystemd_impl_parse_file_t)ready_function(dmod_libsystemd_impl_parse_file_sig);
+    dmod_libsystemd_impl_parse_file_t impl = ready_function(dmod_libsystemd_impl_parse_file_sig);
     return (impl != NULL) ? impl(file_path, service) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, libsystemd_services_t* services ))
 {
-    dmod_libsystemd_impl_parse_dir_t impl = (dmod_libsystemd_impl_parse_dir_t)ready_function(dmod_libsystemd_impl_parse_dir_sig);
+    dmod_libsystemd_impl_parse_dir_t impl = ready_function(dmod_libsystemd_impl_parse_dir_sig);
     return (impl != NULL) ? impl(dir_path, services) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
 {
-    dmod_libsystemd_impl_load_rules_t impl = (dmod_libsystemd_impl_load_rules_t)ready_function(dmod_libsystemd_impl_load_rules_sig);
+    dmod_libsystemd_impl_load_rules_t impl = ready_function(dmod_libsystemd_impl_load_rules_sig);
     return (impl != NULL) ? impl(rules_dir) : -ENODEV;
 }
 
@@ -435,6 +451,7 @@ int dmod_deinit(void)
 {
     lock();
     g_ready = false;
+    g_impl  = NULL;
     libsystemd_report_t* report = report_pop();
     while (report != NULL)
     {

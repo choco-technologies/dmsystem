@@ -41,7 +41,7 @@ DMOD_TEST_STEP(front_keeps_reports_until_the_core_takes_them)
 
     // The mount (the dif dmvfs calls): kept as well
     dmod_dmfsi_mount_changed_t mount_changed =
-        (dmod_dmfsi_mount_changed_t)Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig);
+        Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig);
     DMOD_TEST_EXPECT_NOT_NULL(mount_changed);
     if (mount_changed != NULL)
     {

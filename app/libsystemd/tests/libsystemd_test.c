@@ -1046,7 +1046,7 @@ static bool find_description_visitor(const libsystemd_service_info_t* info, void
 static void call_mount_changed(const char* mount_point, bool mounted)
 {
     dmod_dmfsi_mount_changed_t mount_changed =
-        (dmod_dmfsi_mount_changed_t)Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig);
+        Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig);
     if (mount_changed != NULL)
     {
         mount_changed(mount_point, mounted);
