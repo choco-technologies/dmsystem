@@ -219,11 +219,6 @@ static int device_report_keep(libsystemd_report_kind_t kind, const char* device_
     return result;
 }
 
-/** @brief Pass a call on to the implementation, or answer NO_IMPL when it is not there */
-#define LIBSYSTEMD_PASS_ON(NAME, NO_IMPL, ...)                                              \
-    dmod_libsystemd_impl_##NAME##_t function = (dmod_libsystemd_impl_##NAME##_t)ready_function(dmod_libsystemd_impl_##NAME##_sig); \
-    return (function != NULL) ? function(__VA_ARGS__) : (NO_IMPL)
-
 dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* device_class, const char* device_name, const char* user_value))
 {
     if (device_class == NULL || device_name == NULL)
@@ -364,57 +359,68 @@ dmod_libsystemd_api_declaration(1.0, int, _deliver_reports, (void))
  */
 dmod_libsystemd_api_declaration(1.0, int, _start_service, ( const char* unit_name, const char* user_value ))
 {
-    LIBSYSTEMD_PASS_ON(start_service, -ENODEV, unit_name, user_value);
+    dmod_libsystemd_impl_start_service_t impl = (dmod_libsystemd_impl_start_service_t)ready_function(dmod_libsystemd_impl_start_service_sig);
+    return (impl != NULL) ? impl(unit_name, user_value) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _stop_service, ( const char* unit_name ))
 {
-    LIBSYSTEMD_PASS_ON(stop_service, -ENODEV, unit_name);
+    dmod_libsystemd_impl_stop_service_t impl = (dmod_libsystemd_impl_stop_service_t)ready_function(dmod_libsystemd_impl_stop_service_sig);
+    return (impl != NULL) ? impl(unit_name) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _notify_main_pid, ( const char* unit_name, Dmod_Pid_t pid ))
 {
-    LIBSYSTEMD_PASS_ON(notify_main_pid, -ENODEV, unit_name, pid);
+    dmod_libsystemd_impl_notify_main_pid_t impl = (dmod_libsystemd_impl_notify_main_pid_t)ready_function(dmod_libsystemd_impl_notify_main_pid_sig);
+    return (impl != NULL) ? impl(unit_name, pid) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _set_stop_semaphore, ( dmosi_semaphore_t wakeup ))
 {
-    LIBSYSTEMD_PASS_ON(set_stop_semaphore, -ENODEV, wakeup);
+    dmod_libsystemd_impl_set_stop_semaphore_t impl = (dmod_libsystemd_impl_set_stop_semaphore_t)ready_function(dmod_libsystemd_impl_set_stop_semaphore_sig);
+    return (impl != NULL) ? impl(wakeup) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, bool, _stop_requested, ( void ))
 {
-    LIBSYSTEMD_PASS_ON(stop_requested, false);
+    dmod_libsystemd_impl_stop_requested_t impl = (dmod_libsystemd_impl_stop_requested_t)ready_function(dmod_libsystemd_impl_stop_requested_sig);
+    return (impl != NULL) ? impl() : false;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _status, ( const char* unit_name, libsystemd_service_status_t* out_status ))
 {
-    LIBSYSTEMD_PASS_ON(status, -ENODEV, unit_name, out_status);
+    dmod_libsystemd_impl_status_t impl = (dmod_libsystemd_impl_status_t)ready_function(dmod_libsystemd_impl_status_sig);
+    return (impl != NULL) ? impl(unit_name, out_status) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _list, (libsystemd_visitor_t visitor, void* user_ptr))
 {
-    LIBSYSTEMD_PASS_ON(list, -ENODEV, visitor, user_ptr);
+    dmod_libsystemd_impl_list_t impl = (dmod_libsystemd_impl_list_t)ready_function(dmod_libsystemd_impl_list_sig);
+    return (impl != NULL) ? impl(visitor, user_ptr) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _scan, (const char* path))
 {
-    LIBSYSTEMD_PASS_ON(scan, -ENODEV, path);
+    dmod_libsystemd_impl_scan_t impl = (dmod_libsystemd_impl_scan_t)ready_function(dmod_libsystemd_impl_scan_sig);
+    return (impl != NULL) ? impl(path) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _parse_file, ( const char* file_path, libsystemd_service_t* service ))
 {
-    LIBSYSTEMD_PASS_ON(parse_file, -ENODEV, file_path, service);
+    dmod_libsystemd_impl_parse_file_t impl = (dmod_libsystemd_impl_parse_file_t)ready_function(dmod_libsystemd_impl_parse_file_sig);
+    return (impl != NULL) ? impl(file_path, service) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _parse_dir, ( const char* dir_path, libsystemd_services_t* services ))
 {
-    LIBSYSTEMD_PASS_ON(parse_dir, -ENODEV, dir_path, services);
+    dmod_libsystemd_impl_parse_dir_t impl = (dmod_libsystemd_impl_parse_dir_t)ready_function(dmod_libsystemd_impl_parse_dir_sig);
+    return (impl != NULL) ? impl(dir_path, services) : -ENODEV;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _load_rules, (const char* rules_dir))
 {
-    LIBSYSTEMD_PASS_ON(load_rules, -ENODEV, rules_dir);
+    dmod_libsystemd_impl_load_rules_t impl = (dmod_libsystemd_impl_load_rules_t)ready_function(dmod_libsystemd_impl_load_rules_sig);
+    return (impl != NULL) ? impl(rules_dir) : -ENODEV;
 }
 
 int dmod_init(const Dmod_Config_t* Config)
