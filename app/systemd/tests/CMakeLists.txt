@@ -18,4 +18,5 @@ dmod_link_modules(${DMOD_MODULE_NAME}
 # `_if` interface target instead of dmod_link_modules().
 target_link_libraries(${DMOD_MODULE_NAME}
     libsystemd_if
+    libsystemd_core_if
     )

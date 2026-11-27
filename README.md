@@ -7,15 +7,16 @@ Linux.
 
 ## Modules in this repository
 
-This repository builds three DMOD modules out of `app/`:
+This repository builds four DMOD modules out of `app/`:
 
 | Module | Type | Role |
 |--------|------|------|
-| [`libsystemd`](app/libsystemd) | Library | Owns the unit registry and all the logic: parsing unit files, resolving `requires`/`after` order, starting/stopping/querying units. See [app/libsystemd/docs](app/libsystemd/docs) for its API. |
+| [`libsystemd`](app/libsystemd) | Library | The front of the API (`libsystemd.h`): a few hundred bytes of code. It keeps the reports of devices and mounts that come before `libsystemd_core` is loaded and passes every call on to it afterwards. This is what the modules that report devices (`dmdevfs`, `dmtty`, ...) need, early in the boot. See [app/libsystemd/docs](app/libsystemd/docs) for the API. |
+| [`libsystemd_core`](app/libsystemd_core) | Library | Owns the unit registry and all the logic: parsing unit files, resolving `requires`/`after` order, starting/stopping/querying units, the rules and the devices. Required by `systemd` and `service`, so it is loaded with the first service manager - later than the front, which is where it can go to the external RAM when a board has it. Implements the dif of `libsystemd.h` and takes the reports `libsystemd` kept (`libsystemd_deliver_reports()`). |
 | [`systemd`](app/systemd) | Application | Thin daemon entry point: takes a units directory, calls into `libsystemd` to scan and start everything. |
 | [`service`](app/service) | Application | Thin `systemctl`/`service`-alike CLI for inspecting and controlling the units `libsystemd` is currently tracking. |
 
-`libsystemd` has to be a **Library** module, not an Application: DMOD's
+`libsystemd` and `libsystemd_core` have to be **Library** modules, not Applications: DMOD's
 loader only allows a Library to be enabled as another module's required
 dependency (`Dmod_Enable` rejects anything else - see
 `dmod/src/system/dmod_system.c`), and both `systemd` and `service` - plus

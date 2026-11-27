@@ -2,6 +2,7 @@
 #define DMOD_ENABLE_REGISTRATION ON
 #include "dmod_test.h"
 #include "libsystemd.h"
+#include "libsystemd_core.h"
 #include "dmtestlibrary.h"
 #include "dmfsi.h"
 #include "dmosi.h"
@@ -64,6 +65,11 @@ static bool stop_after_first_visitor(const libsystemd_service_info_t* info, void
     int* visits = (int*)user_ptr;
     (*visits)++;
     return false;
+}
+
+DMOD_TEST_STEP(core_is_loaded)
+{
+    DMOD_TEST_EXPECT(libsystemd_core_is_ready());
 }
 
 DMOD_TEST_STEP(parse_file_rejects_null_arguments)
@@ -1040,7 +1046,7 @@ static bool find_description_visitor(const libsystemd_service_info_t* info, void
 static void call_mount_changed(const char* mount_point, bool mounted)
 {
     dmod_dmfsi_mount_changed_t mount_changed =
-        (dmod_dmfsi_mount_changed_t)Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig);
+        Dmod_GetDifFunction(Dmod_GetModuleContext("libsystemd"), dmod_dmfsi_mount_changed_sig);
     if (mount_changed != NULL)
     {
         mount_changed(mount_point, mounted);

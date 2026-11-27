@@ -11,7 +11,7 @@
 /**
  * @brief One process's registration for stop requests
  *
- * Created by libsystemd_set_stop_semaphore() for the calling process and
+ * Created by libsystemd_core_set_stop_semaphore() for the calling process and
  * removed when that process unregisters (NULL semaphore), when it terminates
  * (process exit callback, see libsystemd_stoprequest_process_exited()), or
  * when the module is unloaded.
@@ -21,7 +21,7 @@ typedef struct
     uint32_t magic;                                     //!< ::LIBSYSTEMD_STOPREQUEST_MAGIC while registered.
     dmosi_process_id_t pid;                             //!< Process that registered.
     dmosi_semaphore_t wakeup;                           //!< Posted once per stop request.
-    bool stop_requested;                                //!< Set by a stop request, read by libsystemd_stop_requested().
+    bool stop_requested;                                //!< Set by a stop request, read by libsystemd_core_stop_requested().
     dmosi_process_exit_callback_handle_t exit_handle;   //!< Exit callback that drops this entry when the process terminates.
 } libsystemd_stoprequest_t;
 
@@ -252,12 +252,12 @@ bool libsystemd_stoprequest_send(dmosi_process_id_t pid)
 /**
  * @brief Register (or clear) the semaphore that wakes the calling process on a stop request
  *
- * By default libsystemd_stop_service() ends a unit with dmosi_process_kill():
+ * By default libsystemd_core_stop_service() ends a unit with dmosi_process_kill():
  * the process's threads are deleted wherever they happen to be, so a lock the
  * service holds at that moment (a driver's I/O lock, a filesystem's
  * metadata) stays held forever. A process that registers here is asked
  * first instead: libsystemd sets its "stop requested" flag
- * (libsystemd_stop_requested()), posts @p wakeup once, then waits up to the
+ * (libsystemd_core_stop_requested()), posts @p wakeup once, then waits up to the
  * unit's `stop_timeout_ms` for the process to exit on its own (return from
  * main()), and only kills it if it has not.
  *
@@ -266,7 +266,7 @@ bool libsystemd_stoprequest_send(dmosi_process_id_t pid)
  * once the timeout expires.
  *
  * The registration belongs to the calling process - whatever unit tracks it
- * as its main PID (including one adopted via libsystemd_notify_main_pid()).
+ * as its main PID (including one adopted via libsystemd_core_notify_main_pid()).
  * It is dropped automatically when the process terminates. Registering again
  * replaces the semaphore and keeps a stop request already received.
  *
@@ -281,17 +281,17 @@ bool libsystemd_stoprequest_send(dmosi_process_id_t pid)
  *
  * @par Example
  * @code
- * libsystemd_set_stop_semaphore(wakeup);
- * while (!libsystemd_stop_requested()) {
+ * libsystemd_core_set_stop_semaphore(wakeup);
+ * while (!libsystemd_core_stop_requested()) {
  *     dmosi_semaphore_wait(wakeup, 1, -1);
  *     ...
  * }
- * libsystemd_set_stop_semaphore(NULL);
+ * libsystemd_core_set_stop_semaphore(NULL);
  * dmosi_semaphore_destroy(wakeup);
  * return 0;
  * @endcode
  */
-dmod_libsystemd_api_declaration(1.0, int, _set_stop_semaphore, ( dmosi_semaphore_t wakeup ))
+int libsystemd_core_set_stop_semaphore ( dmosi_semaphore_t wakeup )
 {
     dmosi_process_id_t pid = 0;
     dmosi_process_t self = libsystemd_stoprequest_self(&pid);
@@ -328,12 +328,12 @@ dmod_libsystemd_api_declaration(1.0, int, _set_stop_semaphore, ( dmosi_semaphore
  * @brief Whether a stop was requested for the calling process
  *
  * Check it in the service's main loop, after waking up on the semaphore
- * registered with libsystemd_set_stop_semaphore().
+ * registered with libsystemd_core_set_stop_semaphore().
  *
- * @retval true  libsystemd_stop_service() asked the calling process to stop.
+ * @retval true  libsystemd_core_stop_service() asked the calling process to stop.
  * @retval false No stop was requested, or the caller never registered.
  */
-dmod_libsystemd_api_declaration(1.0, bool, _stop_requested, ( void ))
+bool libsystemd_core_stop_requested ( void )
 {
     dmosi_process_id_t pid = 0;
     if (libsystemd_stoprequest_self(&pid) == NULL || g_stoprequests_lock == NULL)

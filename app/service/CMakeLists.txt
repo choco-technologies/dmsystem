@@ -46,6 +46,7 @@ dmod_link_modules(${DMOD_MODULE_NAME}
 # published modules).
 target_link_libraries(${DMOD_MODULE_NAME}
     libsystemd_if
+    libsystemd_core_if
     )
 
 add_subdirectory(tests)
