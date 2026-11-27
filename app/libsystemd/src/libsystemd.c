@@ -182,57 +182,54 @@ static void* ready_function(const char* signature)
 }
 
 /**
- * @brief Keep a report of a device, unless the implementation is there by now
+ * @brief Put a report of a device on the list (the lock held)
  *
  * A device removed while the report of its adding is still kept cancels it: with no rules there was nothing to do for it,
  * and the implementation forgets such a device the same way.
  *
- * @return 1 the implementation is there: pass the call on, 0 kept (or dropped), -ENOMEM
+ * @return 0 kept (or dropped), -ENOMEM
  */
-static int device_report_keep(libsystemd_report_kind_t kind, const char* device_class, const char* name, const char* value)
+static int device_report_store(libsystemd_report_kind_t kind, const char* device_class, const char* name, const char* value)
 {
-    lock();
-    if (g_ready)
+    libsystemd_report_t* added = report_find(LIBSYSTEMD_REPORT_ADDED, device_class, name);
+    if (kind == LIBSYSTEMD_REPORT_REMOVED && added != NULL)
     {
-        unlock();
-        return 1;
+        report_drop(added);
+        return 0;
     }
-
-    int result = 0;
-    if (kind == LIBSYSTEMD_REPORT_REMOVED)
+    if (kind == LIBSYSTEMD_REPORT_ADDED && added != NULL)
     {
-        libsystemd_report_t* added = report_find(LIBSYSTEMD_REPORT_ADDED, device_class, name);
-        if (added != NULL)
-        {
-            report_drop(added);
-            unlock();
-            return 0;
-        }
-    }
-    else if (report_find(LIBSYSTEMD_REPORT_ADDED, device_class, name) != NULL)
-    {
-        unlock();
         return 0;
     }
 
     if (dmlist_size(g_reports) >= LIBSYSTEMD_REPORTS_MAX)
     {
         DMOD_LOG_WARN("libsystemd: %u reports are kept and nothing takes them - '%s/%s' is lost\n", (unsigned)dmlist_size(g_reports), device_class, name);
-        unlock();
         return -ENOMEM;
     }
 
     libsystemd_report_t* report = report_create(kind, device_class, name, value);
-    if (report == NULL)
-    {
-        result = -ENOMEM;
-    }
-    else if (!report_push(report))
-    {
-        result = -ENOMEM;
-    }
+    return (report != NULL && report_push(report)) ? 0 : -ENOMEM;
+}
+
+/**
+ * @brief Keep a report of a device for the implementation, and the answer for the caller
+ *
+ * The same answer as "no rule is loaded yet" (-ENOENT). When the implementation took the reports while this one was being kept,
+ * it is given this one too, so it does not wait for the next time.
+ */
+static int device_report_keep(libsystemd_report_kind_t kind, const char* device_class, const char* name, const char* value)
+{
+    lock();
+    int result = device_report_store(kind, device_class, name, value);
+    bool ready = g_ready;
     unlock();
-    return result;
+
+    if (ready)
+    {
+        deliver_reports();
+    }
+    return (result == 0) ? -ENOENT : result;
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* device_class, const char* device_name, const char* user_value))
@@ -241,21 +238,12 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_added, (const char* dev
     {
         return -EINVAL;
     }
-    for (;;)
+    dmod_libsystemd_impl_notify_device_added_t function = ready_function(dmod_libsystemd_impl_notify_device_added_sig);
+    if (function != NULL)
     {
-        int kept = device_report_keep(LIBSYSTEMD_REPORT_ADDED, device_class, device_name, user_value);
-        if (kept != 1)
-        {
-            // Kept for the implementation: the same answer as "no rule is loaded yet"
-            return (kept == 0) ? -ENOENT : kept;
-        }
-        dmod_libsystemd_impl_notify_device_added_t function = ready_function(dmod_libsystemd_impl_notify_device_added_sig);
-        if (function != NULL)
-        {
-            return function(device_class, device_name, user_value);
-        }
-        // The implementation was unloaded: keep the report (the loop asks again)
+        return function(device_class, device_name, user_value);
     }
+    return device_report_keep(LIBSYSTEMD_REPORT_ADDED, device_class, device_name, user_value);
 }
 
 dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* device_class, const char* device_name))
@@ -264,19 +252,12 @@ dmod_libsystemd_api_declaration(1.0, int, _notify_device_removed, (const char* d
     {
         return -EINVAL;
     }
-    for (;;)
+    dmod_libsystemd_impl_notify_device_removed_t function = ready_function(dmod_libsystemd_impl_notify_device_removed_sig);
+    if (function != NULL)
     {
-        int kept = device_report_keep(LIBSYSTEMD_REPORT_REMOVED, device_class, device_name, NULL);
-        if (kept != 1)
-        {
-            return (kept == 0) ? -ENOENT : kept;
-        }
-        dmod_libsystemd_impl_notify_device_removed_t function = ready_function(dmod_libsystemd_impl_notify_device_removed_sig);
-        if (function != NULL)
-        {
-            return function(device_class, device_name);
-        }
+        return function(device_class, device_name);
     }
+    return device_report_keep(LIBSYSTEMD_REPORT_REMOVED, device_class, device_name, NULL);
 }
 
 /**
@@ -306,7 +287,13 @@ dmod_dmfsi_dif_api_declaration( 1.0, libsystemd, void, _mount_changed, (const ch
     {
         DMOD_LOG_WARN("libsystemd: the %s of '%s' is lost (no room for the report)\n", mounted ? "mount" : "unmount", mount_point);
     }
+    bool ready = g_ready;
     unlock();
+
+    if (ready)
+    {
+        deliver_reports();
+    }
 }
 
 /** @brief The functions of the dif the implementation offers, found for the delivery of the reports */
